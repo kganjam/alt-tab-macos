@@ -206,7 +206,7 @@ class Window {
     }
 
     func focus() {
-        let fightParallelsReRaise = isOutboundFromParallelsCoherence()
+        let sourceCoherenceWid = outboundParallelsCoherenceSourceWid()
         if let altTabWindow = altTabWindow() {
             App.shared.activate(ignoringOtherApps: true)
             altTabWindow.makeKeyAndOrderFront(nil)
@@ -219,7 +219,7 @@ class Window {
             } else {
                 application.runningApplication.activate(options: .activateAllWindows)
             }
-            if fightParallelsReRaise { scheduleParallelsReRaiseFight() }
+            if let sourceCoherenceWid { scheduleParallelsReRaiseOverride(sourceCoherenceWid) }
             Windows.previewSelectedWindowIfNeeded()
         } else if isParallelsCoherenceWindow {
             focusParallelsCoherenceWindow()
@@ -234,7 +234,7 @@ class Window {
                 _SLPSSetFrontProcessWithOptions(&psn, self.cgWindowId!, SLPSMode.userGenerated.rawValue)
                 self.makeKeyWindow(&psn)
                 try? self.axUiElement!.focusWindow()
-                if fightParallelsReRaise { self.scheduleParallelsReRaiseFight() }
+                if let sourceCoherenceWid { self.scheduleParallelsReRaiseOverride(sourceCoherenceWid) }
                 DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
                     Windows.previewSelectedWindowIfNeeded()
                 }
@@ -242,32 +242,34 @@ class Window {
         }
     }
 
-    /// True when we're focusing a non-Parallels target while the currently
-    /// frontmost app is a Parallels Coherence app — i.e. the scenario where
-    /// Parallels will try to re-raise its Coherence window on top of our target.
-    private func isOutboundFromParallelsCoherence() -> Bool {
+    /// If we're focusing a non-Parallels target while a Parallels Coherence app
+    /// is currently frontmost, returns the source Coherence window's CGWindowID
+    /// so the caller can later order the target above it. Returns nil otherwise.
+    private func outboundParallelsCoherenceSourceWid() -> CGWindowID? {
         guard !application.isParallelsCoherence,
               let prevPid = Applications.frontmostPid, prevPid != application.pid,
-              let prevApp = (Applications.list.first { $0.pid == prevPid }) else { return false }
-        return prevApp.isParallelsCoherence
+              let prevApp = (Applications.list.first { $0.pid == prevPid }),
+              prevApp.isParallelsCoherence,
+              let sourceWid = prevApp.focusedWindow?.cgWindowId else { return nil }
+        return sourceWid
     }
 
-    /// After AltTab focuses a macOS window that was occluded by a Parallels
-    /// Coherence window, Parallels re-raises its Coherence window on top
-    /// because its integration mirrors macOS z-order. Fight it by re-issuing
-    /// `kAXRaiseAction` on the target a few times over ~500ms. Each iteration
-    /// re-checks that the user hasn't AltTab'd away to a different app so we
-    /// don't hijack a newer switch in progress.
-    private func scheduleParallelsReRaiseFight() {
-        let ticks = [80, 160, 240, 340, 460]
-        for delayMs in ticks {
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
-                guard let self, Applications.frontmostPid == self.application.pid else { return }
-                BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
-                    guard let self else { return }
-                    try? self.axUiElement!.focusWindow()
-                }
-            }
+    /// Parallels' Coherence integration re-raises its Windows window on top of
+    /// our target shortly after the focus change (it mirrors macOS z-order into
+    /// the Windows guest, then back out). Repeatedly calling `kAXRaiseAction`
+    /// to fight that works but flickers — each raise triggers a re-composition.
+    ///
+    /// Instead, after a short delay (long enough for Parallels to finish its
+    /// one-shot re-raise), call `CGSOrderWindow` to write the z-order directly:
+    /// place the target above the source Coherence window. That's a single
+    /// atomic window-server operation, no app activation, no flash. Gate on
+    /// `Applications.frontmostPid` so a subsequent AltTab before the delay
+    /// fires doesn't snap back to a stale target.
+    private func scheduleParallelsReRaiseOverride(_ sourceWid: CGWindowID) {
+        guard let targetWid = cgWindowId else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(150)) { [weak self] in
+            guard let self, Applications.frontmostPid == self.application.pid else { return }
+            CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, sourceWid)
         }
     }
 
