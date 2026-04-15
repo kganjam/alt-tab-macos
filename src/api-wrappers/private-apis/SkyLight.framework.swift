@@ -155,19 +155,15 @@ func CGSCopySpacesForWindows(_ cid: CGSConnectionID, _ mask: CGSSpaceMask.RawVal
 @_silgen_name("CGSGetWindowLevel") @discardableResult
 func CGSGetWindowLevel(_ cid: CGSConnectionID, _ wid: CGWindowID, _ level: UnsafeMutablePointer<CGWindowLevel>) -> CGError
 
-enum CGSWindowOrderingMode: Int32 {
-    case below = -1
-    case out = 0
-    case above = 1
-}
-
-/// Places `wid` above/below `relativeToWid` in the window server's z-order.
-/// Pass `relativeToWid == 0` with `.above` to place `wid` at the top of z-order.
-/// Unlike `kAXRaiseAction`, this does not cause app activation or a
-/// re-composition flash — the window server just rewrites the order.
+/// sets the window server z-level of a window owned by any process. Unlike
+/// `NSWindow.level` (which only works for your own windows), this writes
+/// directly through the window server. Levels above `kCGNormalWindowLevel`
+/// float above standard windows; the enforcement is done by the window
+/// server, so other apps cannot draw over a higher-level window at the
+/// compositor level.
 /// * macOS 10.10+
-@_silgen_name("CGSOrderWindow") @discardableResult
-func CGSOrderWindow(_ cid: CGSConnectionID, _ wid: CGWindowID, _ place: CGSWindowOrderingMode.RawValue, _ relativeToWid: CGWindowID) -> CGError
+@_silgen_name("CGSSetWindowLevel") @discardableResult
+func CGSSetWindowLevel(_ cid: CGSConnectionID, _ wid: CGWindowID, _ level: CGWindowLevel) -> CGError
 
 /// returns status of the checkbox in System Preferences > Security & Privacy > Privacy > Screen Recording
 /// returns 1 if checked or 0 if unchecked; also prompts the user the first time if unchecked

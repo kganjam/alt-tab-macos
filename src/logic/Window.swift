@@ -255,21 +255,27 @@ class Window {
     }
 
     /// Parallels' Coherence integration re-raises its Windows window on top of
-    /// our target shortly after the focus change (it mirrors macOS z-order into
-    /// the Windows guest, then back out). Repeatedly calling `kAXRaiseAction`
-    /// to fight that works but flickers — each raise triggers a re-composition.
+    /// our target shortly after the focus change — and does so more than once,
+    /// so a one-shot `CGSOrderWindow` is unreliable. Instead, boost the target
+    /// window's server-level above the Coherence window's level for a short
+    /// pin window (500ms), then restore the original level. While pinned, the
+    /// window server enforces z-order at the compositor level, so Parallels
+    /// cannot draw on top no matter how many times it raises its window.
     ///
-    /// Instead, after a short delay (long enough for Parallels to finish its
-    /// one-shot re-raise), call `CGSOrderWindow` to write the z-order directly:
-    /// place the target above the source Coherence window. That's a single
-    /// atomic window-server operation, no app activation, no flash. Gate on
-    /// `Applications.frontmostPid` so a subsequent AltTab before the delay
-    /// fires doesn't snap back to a stale target.
+    /// The restore is scheduled unconditionally so the target window can't
+    /// get stuck at an elevated level if the user AltTabs again mid-pin.
     private func scheduleParallelsReRaiseOverride(_ sourceWid: CGWindowID) {
         guard let targetWid = cgWindowId else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(150)) { [weak self] in
-            guard let self, Applications.frontmostPid == self.application.pid else { return }
-            CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, sourceWid)
+        var sourceLevel: CGWindowLevel = 0
+        CGSGetWindowLevel(CGS_CONNECTION, sourceWid, &sourceLevel)
+        var originalTargetLevel: CGWindowLevel = 0
+        CGSGetWindowLevel(CGS_CONNECTION, targetWid, &originalTargetLevel)
+        // Pin above the source Coherence level. Stay below the floating window
+        // level (3) when possible so we don't accidentally cover tooltips/panels.
+        let pinLevel = max(sourceLevel, originalTargetLevel) + 1
+        CGSSetWindowLevel(CGS_CONNECTION, targetWid, pinLevel)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) {
+            CGSSetWindowLevel(CGS_CONNECTION, targetWid, originalTargetLevel)
         }
     }
 
