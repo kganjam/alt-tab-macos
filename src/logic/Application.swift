@@ -22,15 +22,15 @@ class Application: NSObject {
     var debugId: String
     /// Parallels Desktop publishes each Coherence (Windows) app as its own macOS
     /// process with a bundle id like `com.parallels.winapp.<hash>.<vm-uuid>`.
-    /// Parallels then mirrors macOS focus/z-order into the Windows guest, which
+    /// Parallels mirrors macOS focus/z-order into the Windows guest, which
     /// fights AltTab in two ways:
     ///   1. Focusing a Coherence window via SLPS event injection triggers a
     ///      bounce back (handled in `Window.focusParallelsCoherenceWindow`).
-    ///   2. Focusing a macOS window when the previous frontmost was a Coherence
-    ///      window: macOS activates the target, but Parallels immediately
-    ///      re-raises its Coherence window on top (menubar shows the target,
-    ///      pixels still show Windows). Workaround: hide the source Coherence
-    ///      app, so Parallels has no window to raise.
+    ///   2. Focusing a macOS window while a Coherence window was frontmost:
+    ///      macOS activates the target, but Parallels immediately re-raises
+    ///      its Coherence window on top (menubar shows the target, pixels
+    ///      still show Windows). Handled by re-raising the target a few
+    ///      times over ~500ms so our raise beats Parallels' final raise.
     var isParallelsCoherence: Bool {
         bundleIdentifier?.hasPrefix("com.parallels.winapp.") == true
     }

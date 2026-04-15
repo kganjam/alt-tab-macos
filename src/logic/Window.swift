@@ -206,7 +206,7 @@ class Window {
     }
 
     func focus() {
-        hidePreviousParallelsCoherenceAppIfNeeded()
+        let fightParallelsReRaise = isOutboundFromParallelsCoherence()
         if let altTabWindow = altTabWindow() {
             App.shared.activate(ignoringOtherApps: true)
             altTabWindow.makeKeyAndOrderFront(nil)
@@ -219,6 +219,7 @@ class Window {
             } else {
                 application.runningApplication.activate(options: .activateAllWindows)
             }
+            if fightParallelsReRaise { scheduleParallelsReRaiseFight() }
             Windows.previewSelectedWindowIfNeeded()
         } else if isParallelsCoherenceWindow {
             focusParallelsCoherenceWindow()
@@ -233,6 +234,7 @@ class Window {
                 _SLPSSetFrontProcessWithOptions(&psn, self.cgWindowId!, SLPSMode.userGenerated.rawValue)
                 self.makeKeyWindow(&psn)
                 try? self.axUiElement!.focusWindow()
+                if fightParallelsReRaise { self.scheduleParallelsReRaiseFight() }
                 DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
                     Windows.previewSelectedWindowIfNeeded()
                 }
@@ -240,17 +242,33 @@ class Window {
         }
     }
 
-    /// When focusing a non-Parallels window while a Parallels Coherence app is the
-    /// current frontmost, macOS activates the target but Parallels immediately
-    /// re-raises its Coherence window on top. The menubar shows the target app,
-    /// but the target window only flashes briefly and is occluded by the Windows
-    /// window. Hiding the source Parallels Coherence app before activating the
-    /// target leaves Parallels with no window to raise.
-    private func hidePreviousParallelsCoherenceAppIfNeeded() {
-        guard let prevPid = Applications.frontmostPid, prevPid != application.pid,
-              let prevApp = (Applications.list.first { $0.pid == prevPid }),
-              prevApp.isParallelsCoherence, !application.isParallelsCoherence else { return }
-        prevApp.runningApplication.hide()
+    /// True when we're focusing a non-Parallels target while the currently
+    /// frontmost app is a Parallels Coherence app — i.e. the scenario where
+    /// Parallels will try to re-raise its Coherence window on top of our target.
+    private func isOutboundFromParallelsCoherence() -> Bool {
+        guard !application.isParallelsCoherence,
+              let prevPid = Applications.frontmostPid, prevPid != application.pid,
+              let prevApp = (Applications.list.first { $0.pid == prevPid }) else { return false }
+        return prevApp.isParallelsCoherence
+    }
+
+    /// After AltTab focuses a macOS window that was occluded by a Parallels
+    /// Coherence window, Parallels re-raises its Coherence window on top
+    /// because its integration mirrors macOS z-order. Fight it by re-issuing
+    /// `kAXRaiseAction` on the target a few times over ~500ms. Each iteration
+    /// re-checks that the user hasn't AltTab'd away to a different app so we
+    /// don't hijack a newer switch in progress.
+    private func scheduleParallelsReRaiseFight() {
+        let ticks = [80, 160, 240, 340, 460]
+        for delayMs in ticks {
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
+                guard let self, Applications.frontmostPid == self.application.pid else { return }
+                BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+                    guard let self else { return }
+                    try? self.axUiElement!.focusWindow()
+                }
+            }
+        }
     }
 
     /// Focus path for Parallels Coherence windows. Avoids `_SLPSSetFrontProcessWithOptions`
