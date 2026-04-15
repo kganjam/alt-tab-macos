@@ -27,15 +27,7 @@ class Window {
     var isMinimized = false
     var isOnAllSpaces = false
     var isWindowlessApp: Bool { get { cgWindowId == nil } }
-    /// Parallels Desktop publishes each Windows Coherence app as its own macOS app with
-    /// a bundle id like `com.parallels.winapp.<hash>.<vm-uuid>`. The Parallels integration
-    /// watches AX/SkyLight focus events and mirrors them into the Windows guest, so the
-    /// SLPS private-event "makeKeyWindow" trick used in `focus()` fights Parallels and
-    /// causes the selected window to bounce back to the previously-focused Coherence
-    /// window. For these apps we stick to public AX + NSRunningApplication APIs.
-    var isParallelsCoherenceWindow: Bool {
-        application.bundleIdentifier?.hasPrefix("com.parallels.winapp.") == true
-    }
+    var isParallelsCoherenceWindow: Bool { application.isParallelsCoherence }
     var position: CGPoint?
     var size: CGSize?
     var spaceIds = [CGSSpaceID.max]
@@ -214,6 +206,7 @@ class Window {
     }
 
     func focus() {
+        hidePreviousParallelsCoherenceAppIfNeeded()
         if let altTabWindow = altTabWindow() {
             App.shared.activate(ignoringOtherApps: true)
             altTabWindow.makeKeyAndOrderFront(nil)
@@ -245,6 +238,19 @@ class Window {
                 }
             }
         }
+    }
+
+    /// When focusing a non-Parallels window while a Parallels Coherence app is the
+    /// current frontmost, macOS activates the target but Parallels immediately
+    /// re-raises its Coherence window on top. The menubar shows the target app,
+    /// but the target window only flashes briefly and is occluded by the Windows
+    /// window. Hiding the source Parallels Coherence app before activating the
+    /// target leaves Parallels with no window to raise.
+    private func hidePreviousParallelsCoherenceAppIfNeeded() {
+        guard let prevPid = Applications.frontmostPid, prevPid != application.pid,
+              let prevApp = (Applications.list.first { $0.pid == prevPid }),
+              prevApp.isParallelsCoherence, !application.isParallelsCoherence else { return }
+        prevApp.runningApplication.hide()
     }
 
     /// Focus path for Parallels Coherence windows. Avoids `_SLPSSetFrontProcessWithOptions`
