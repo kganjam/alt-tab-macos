@@ -206,7 +206,6 @@ class Window {
     }
 
     func focus() {
-        let sourceCoherenceWid = outboundParallelsCoherenceSourceWid()
         if let altTabWindow = altTabWindow() {
             App.shared.activate(ignoringOtherApps: true)
             altTabWindow.makeKeyAndOrderFront(nil)
@@ -219,10 +218,11 @@ class Window {
             } else {
                 application.runningApplication.activate(options: .activateAllWindows)
             }
-            if let sourceCoherenceWid { scheduleParallelsReRaiseOverride(sourceCoherenceWid) }
             Windows.previewSelectedWindowIfNeeded()
         } else if isParallelsCoherenceWindow {
             focusParallelsCoherenceWindow()
+        } else if isOutboundFromParallelsCoherence() {
+            focusMacOsWindowOverParallelsCoherence()
         } else {
             // macOS bug: when switching to a System Preferences window in another space, it switches to that space,
             // but quickly switches back to another window in that space
@@ -234,7 +234,6 @@ class Window {
                 _SLPSSetFrontProcessWithOptions(&psn, self.cgWindowId!, SLPSMode.userGenerated.rawValue)
                 self.makeKeyWindow(&psn)
                 try? self.axUiElement!.focusWindow()
-                if let sourceCoherenceWid { self.scheduleParallelsReRaiseOverride(sourceCoherenceWid) }
                 DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
                     Windows.previewSelectedWindowIfNeeded()
                 }
@@ -242,40 +241,37 @@ class Window {
         }
     }
 
-    /// If we're focusing a non-Parallels target while a Parallels Coherence app
-    /// is currently frontmost, returns the source Coherence window's CGWindowID
-    /// so the caller can later order the target above it. Returns nil otherwise.
-    private func outboundParallelsCoherenceSourceWid() -> CGWindowID? {
+    /// True when a Parallels Coherence app is currently frontmost and we're
+    /// focusing a non-Parallels target. The SLPS `makeKeyWindow` fake-event
+    /// trick normally used in `focus()` appears to confuse Parallels' event
+    /// mirror — it reads the synthetic events as a click back on the source
+    /// Coherence window and immediately re-raises. Avoid that path entirely.
+    private func isOutboundFromParallelsCoherence() -> Bool {
         guard !application.isParallelsCoherence,
               let prevPid = Applications.frontmostPid, prevPid != application.pid,
-              let prevApp = (Applications.list.first { $0.pid == prevPid }),
-              prevApp.isParallelsCoherence,
-              let sourceWid = prevApp.focusedWindow?.cgWindowId else { return nil }
-        return sourceWid
+              let prevApp = (Applications.list.first { $0.pid == prevPid }) else { return false }
+        return prevApp.isParallelsCoherence
     }
 
-    /// Parallels' Coherence integration re-raises its Windows window on top of
-    /// our target shortly after the focus change — and does so more than once,
-    /// so a one-shot `CGSOrderWindow` is unreliable. Instead, boost the target
-    /// window's server-level above the Coherence window's level for a short
-    /// pin window (500ms), then restore the original level. While pinned, the
-    /// window server enforces z-order at the compositor level, so Parallels
-    /// cannot draw on top no matter how many times it raises its window.
-    ///
-    /// The restore is scheduled unconditionally so the target window can't
-    /// get stuck at an elevated level if the user AltTabs again mid-pin.
-    private func scheduleParallelsReRaiseOverride(_ sourceWid: CGWindowID) {
-        guard let targetWid = cgWindowId else { return }
-        var sourceLevel: CGWindowLevel = 0
-        CGSGetWindowLevel(CGS_CONNECTION, sourceWid, &sourceLevel)
-        var originalTargetLevel: CGWindowLevel = 0
-        CGSGetWindowLevel(CGS_CONNECTION, targetWid, &originalTargetLevel)
-        // Pin above the source Coherence level. Stay below the floating window
-        // level (3) when possible so we don't accidentally cover tooltips/panels.
-        let pinLevel = max(sourceLevel, originalTargetLevel) + 1
-        CGSSetWindowLevel(CGS_CONNECTION, targetWid, pinLevel)
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) {
-            CGSSetWindowLevel(CGS_CONNECTION, targetWid, originalTargetLevel)
+    /// Parallels Coherence → macOS window: drop the SLPS private-API path
+    /// entirely. First switch the foreground app via the standard
+    /// `NSRunningApplication.activate` — this updates the menubar to the
+    /// target app cleanly without posting fake input events. Then, after a
+    /// short delay for activation to settle, raise the specific target window
+    /// within that app via `kAXRaiseAction`. No SLPS event injection, no
+    /// window-level pinning — just the two public operations the user
+    /// described: switch foreground app, then raise window.
+    private func focusMacOsWindowOverParallelsCoherence() {
+        application.runningApplication.activate(options: .activateAllWindows)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(60)) { [weak self] in
+            guard let self else { return }
+            BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+                guard let self else { return }
+                try? self.axUiElement!.focusWindow()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
+                Windows.previewSelectedWindowIfNeeded()
+            }
         }
     }
 
