@@ -22,6 +22,13 @@ class App: AppCenterApplication {
     static var appIsBeingUsed = false
     static var shortcutIndex = 0
     static var forceDoNothingOnRelease = false
+    /// Captured at the start of each AltTab session so that focus() can tell
+    /// which app was REALLY in the foreground when the user hit Alt-Tab — not
+    /// whatever is frontmost by the time `focus()` runs. Showing the
+    /// `TilesPanel` (a `canBecomeKey` NSPanel) can flip `Applications.frontmostPid`
+    /// to AltTab's own pid, which breaks the Parallels Coherence outbound
+    /// detection that relies on the real source app's bundle identifier.
+    static var sessionSourcePid: pid_t?
     private static var isFirstSummon = true
     private static var isVeryFirstSummon = true
     private static var pendingShowSettingsWindow = false
@@ -57,6 +64,11 @@ class App: AppCenterApplication {
         Logger.info { "appIsBeingUsed:\(appIsBeingUsed)" }
         guard appIsBeingUsed else { return } // already hidden
         appIsBeingUsed = false
+        // note: `sessionSourcePid` is intentionally NOT cleared here because
+        // `focusSelectedWindow` calls `hideUi(true)` immediately BEFORE
+        // `window.focus()`, and the focus path still needs the source pid to
+        // detect Parallels Coherence outbound switches. The pid is overwritten
+        // on the next session start in `showUiOrCycleSelection`.
         isFirstSummon = true
         forceDoNothingOnRelease = false
         UsageStats.resetSession()
@@ -298,6 +310,13 @@ class App: AppCenterApplication {
     static func showUiOrCycleSelection(_ shortcutIndex: Int, _ forceDoNothingOnRelease_: Bool) {
         forceDoNothingOnRelease = forceDoNothingOnRelease_
         Logger.debug { "isFirstSummon:\(isFirstSummon) shortcutIndex:\(shortcutIndex)" }
+        // Capture the REAL source app before the TilesPanel shows and possibly
+        // steals key-window status. Needed for the Parallels Coherence outbound
+        // fix — otherwise `Applications.frontmostPid` reads as AltTab's own pid
+        // by the time `Window.focus()` runs.
+        if !appIsBeingUsed {
+            sessionSourcePid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        }
         appIsBeingUsed = true
         UsageStats.recordTrigger(shortcutIndex)
         if isFirstSummon || shortcutIndex != App.shortcutIndex {

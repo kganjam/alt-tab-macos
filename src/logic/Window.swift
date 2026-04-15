@@ -241,16 +241,22 @@ class Window {
         }
     }
 
-    /// True when a Parallels Coherence app is currently frontmost and we're
-    /// focusing a non-Parallels target. The SLPS `makeKeyWindow` fake-event
-    /// trick normally used in `focus()` appears to confuse Parallels' event
-    /// mirror — it reads the synthetic events as a click back on the source
-    /// Coherence window and immediately re-raises. Avoid that path entirely.
+    /// True when a Parallels Coherence app was the foreground app when the
+    /// user pressed Alt-Tab and we're focusing a non-Parallels target.
+    ///
+    /// We consult `App.sessionSourcePid` (captured at the very start of the
+    /// AltTab session) rather than the live `Applications.frontmostPid`.
+    /// Reason: once the `TilesPanel` is shown it can become key and flip
+    /// the live frontmost to AltTab itself, hiding the real source app
+    /// from this check — which breaks the fix for slow/visible AltTab
+    /// invocations while leaving fast ones intact. Fall back to the live
+    /// pid only if the session snapshot is missing.
     private func isOutboundFromParallelsCoherence() -> Bool {
-        guard !application.isParallelsCoherence,
-              let prevPid = Applications.frontmostPid, prevPid != application.pid,
-              let prevApp = (Applications.list.first { $0.pid == prevPid }) else { return false }
-        return prevApp.isParallelsCoherence
+        guard !application.isParallelsCoherence else { return false }
+        let sourcePid = App.sessionSourcePid ?? Applications.frontmostPid
+        guard let sourcePid, sourcePid != application.pid,
+              let sourceApp = (Applications.list.first { $0.pid == sourcePid }) else { return false }
+        return sourceApp.isParallelsCoherence
     }
 
     /// Parallels Coherence → macOS window: drop the SLPS private-API path
