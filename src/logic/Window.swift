@@ -27,6 +27,15 @@ class Window {
     var isMinimized = false
     var isOnAllSpaces = false
     var isWindowlessApp: Bool { get { cgWindowId == nil } }
+    /// Parallels Desktop publishes each Windows Coherence app as its own macOS app with
+    /// a bundle id like `com.parallels.winapp.<hash>.<vm-uuid>`. The Parallels integration
+    /// watches AX/SkyLight focus events and mirrors them into the Windows guest, so the
+    /// SLPS private-event "makeKeyWindow" trick used in `focus()` fights Parallels and
+    /// causes the selected window to bounce back to the previously-focused Coherence
+    /// window. For these apps we stick to public AX + NSRunningApplication APIs.
+    var isParallelsCoherenceWindow: Bool {
+        application.bundleIdentifier?.hasPrefix("com.parallels.winapp.") == true
+    }
     var position: CGPoint?
     var size: CGSize?
     var spaceIds = [CGSSpaceID.max]
@@ -218,6 +227,8 @@ class Window {
                 application.runningApplication.activate(options: .activateAllWindows)
             }
             Windows.previewSelectedWindowIfNeeded()
+        } else if isParallelsCoherenceWindow {
+            focusParallelsCoherenceWindow()
         } else {
             // macOS bug: when switching to a System Preferences window in another space, it switches to that space,
             // but quickly switches back to another window in that space
@@ -232,6 +243,22 @@ class Window {
                 DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
                     Windows.previewSelectedWindowIfNeeded()
                 }
+            }
+        }
+    }
+
+    /// Focus path for Parallels Coherence windows. Avoids `_SLPSSetFrontProcessWithOptions`
+    /// and the SLPS "makeKeyWindow" fake-event trick: Parallels mirrors macOS focus into
+    /// the Windows guest, and those private events confuse the mirror, causing a visible
+    /// bounce back to the previously-focused Coherence window. Using only
+    /// `NSRunningApplication.activate` + `kAXRaiseAction` lets Parallels sync cleanly.
+    private func focusParallelsCoherenceWindow() {
+        application.runningApplication.activate(options: .activateAllWindows)
+        BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+            guard let self else { return }
+            try? self.axUiElement!.focusWindow()
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
+                Windows.previewSelectedWindowIfNeeded()
             }
         }
     }
