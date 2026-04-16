@@ -279,29 +279,22 @@ class Window {
     /// `kAXRaiseAction` on the specific target window. The AX raise
     /// handles the "correct window within the app" selection; the level
     /// pin handles the visual stack.
+    /// Coherence → macOS. Pin BEFORE activate so the target is visually on
+    /// top from the very start — one clean jump instead of a flicker gap
+    /// where Parallels could briefly re-raise during the poll window.
     private func focusMacOsWindowOverParallelsCoherence() {
+        pinTargetLevelTemporarily()
         application.runningApplication.activate(options: [])
-        pollForTargetAppFrontmostThenPinAndRaise(attempt: 0)
+        pollForTargetAppFrontmostAndRaise(attempt: 0)
     }
 
     private static let parallelsOutboundPollAttempts = 40 // 40 × 10ms = 400ms budget
     private static let parallelsOutboundPollIntervalMs = 10
     private static let parallelsOutboundSettleMs = 140
-    /// After activate(), poll until frontmost flips to the target, THEN:
-    ///   1. Pin the target to kCGFloatingWindowLevel so Parallels can't
-    ///      visually cover it during the settle window.
-    ///   2. Wait 140ms for Parallels' one-shot re-raise reaction to finish.
-    ///   3. Fire kAXRaiseAction on the specific target window.
-    ///   4. Restore the target's original level after 1s.
-    ///
-    /// Level-pinning AFTER the frontmost flip (not before activate) avoids
-    /// a visual jump: the normal app-switch animation plays out first,
-    /// then the pin silently locks z-order.
-    private func pollForTargetAppFrontmostThenPinAndRaise(attempt: Int) {
+    private func pollForTargetAppFrontmostAndRaise(attempt: Int) {
         let targetPid = application.pid
         let targetIsFrontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPid
         if targetIsFrontmost || attempt >= Window.parallelsOutboundPollAttempts {
-            pinTargetLevelTemporarily()
             DispatchQueue.main.asyncAfter(
                 deadline: .now() + .milliseconds(Window.parallelsOutboundSettleMs)
             ) { [weak self] in
@@ -319,7 +312,7 @@ class Window {
         DispatchQueue.main.asyncAfter(
             deadline: .now() + .milliseconds(Window.parallelsOutboundPollIntervalMs)
         ) { [weak self] in
-            self?.pollForTargetAppFrontmostThenPinAndRaise(attempt: attempt + 1)
+            self?.pollForTargetAppFrontmostAndRaise(attempt: attempt + 1)
         }
     }
 
@@ -334,21 +327,20 @@ class Window {
         }
     }
 
-    /// Focus path for Parallels Coherence windows (macOS → Coherence direction).
-    /// Parallels WANTS focus on its own Coherence window so there's no re-raise
-    /// fight. Use the stock SLPS path (`_SLPSSetFrontProcessWithOptions` +
-    /// `makeKeyWindow` + `kAXRaiseAction`) for a single atomic transition with
-    /// minimal flicker. `makeKeyWindow` only conflicts when the SOURCE is a
-    /// Coherence window and the TARGET is a macOS app; here the direction is
-    /// reversed so it's safe.
+    /// Focus path for Parallels Coherence windows (macOS → Coherence or
+    /// Coherence → Coherence). Avoids the SLPS path (`makeKeyWindow`
+    /// synthetic events) which can cause flicker even when Parallels is the
+    /// target. Instead: pin the target above normal windows, activate the
+    /// app cleanly, then raise the specific window after a short settle.
     private func focusParallelsCoherenceWindow() {
-        BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+        pinTargetLevelTemporarily()
+        application.runningApplication.activate(options: [])
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(60)) { [weak self] in
             guard let self else { return }
-            var psn = ProcessSerialNumber()
-            GetProcessForPID(self.application.pid, &psn)
-            _SLPSSetFrontProcessWithOptions(&psn, self.cgWindowId!, SLPSMode.userGenerated.rawValue)
-            self.makeKeyWindow(&psn)
-            try? self.axUiElement!.focusWindow()
+            BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+                guard let self else { return }
+                try? self.axUiElement!.focusWindow()
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
                 Windows.previewSelectedWindowIfNeeded()
             }
