@@ -368,7 +368,10 @@ class Window {
         application.focusedWindow = self
         Applications.frontmostPid = application.pid
         let source = sessionSourceWindow()
+        NSLog("ALTTAB manualUpdate: target=\(self.debugId ?? "?") source=\(source?.debugId ?? "nil") sessionSourcePid=\(App.sessionSourcePid?.description ?? "nil")")
         Windows.setTargetAndSourceAsMostRecent(target: self, source: source)
+        let top = Windows.list.sorted { $0.lastFocusOrder < $1.lastFocusOrder }.prefix(5)
+        NSLog("ALTTAB list-after-manualUpdate: \(top.map { "\($0.lastFocusOrder):\($0.debugId ?? "?")" }.joined(separator: " | "))")
     }
 
     /// Looks up the Window the user was focused on when this AltTab

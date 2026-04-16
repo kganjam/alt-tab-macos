@@ -322,17 +322,14 @@ class App: AppCenterApplication {
         // fix — otherwise `Applications.frontmostPid` reads as AltTab's own pid
         // by the time `Window.focus()` runs.
         if !appIsBeingUsed {
-            // Prefer Applications.frontmostPid (updated in-process by my
-            // manualUpdate after Par transitions, and by AX events
-            // otherwise) over NSWorkspace.frontmostApplication — the
-            // latter can lag tens of ms behind SLPS-initiated focus
-            // changes, causing rapid alt-tabs to see stale pids.
             let newSourcePid = Applications.frontmostPid
                 ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
+            NSLog("ALTTAB session-start: newSourcePid=\(newSourcePid?.description ?? "nil") sessionSourcePid=\(sessionSourcePid?.description ?? "nil") previousSessionSourcePid=\(previousSessionSourcePid?.description ?? "nil")")
             if newSourcePid != sessionSourcePid {
                 previousSessionSourcePid = sessionSourcePid
                 sessionSourcePid = newSourcePid
             }
+            NSLog("ALTTAB after-rotate: sessionSourcePid=\(sessionSourcePid?.description ?? "nil") previousSessionSourcePid=\(previousSessionSourcePid?.description ?? "nil")")
             Windows.normalizeFocusOrderAtSessionStart(
                 currentPid: sessionSourcePid,
                 previousPid: previousSessionSourcePid)
