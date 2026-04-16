@@ -349,15 +349,28 @@ class App: AppCenterApplication {
             Diagnostics.log("SESSION", "new session shortcutIndex=\(shortcutIndex)")
             Diagnostics.logFrontmostSignals("session-start pre")
             Diagnostics.logTrackedRecency("session-start pre")
+            // Prefer the LIVE AX-based source of truth: current frontmost
+            // app + its focused window. This is kept current by
+            // AccessibilityEvents for mac→mac transitions AND by our
+            // manualUpdate for Parallels transitions. Fall back to
+            // lastFocusedTargetWid only if the live path returns nil.
+            //
+            // Bug that motivated this order: lastFocusedTargetWid is
+            // only set by our Parallels-involved paths. After a pure
+            // mac→mac AltTab, the Par-era wid lingered; using it as
+            // "current source" at next session start caused normalize
+            // to promote the wrong window to position 0.
             let newSourceWid: CGWindowID? = {
+                if let pid = Applications.frontmostPid,
+                   let app = (Applications.list.first { $0.pid == pid }),
+                   let focused = app.focusedWindow {
+                    return focused.cgWindowId
+                }
                 if let wid = lastFocusedTargetWid,
                    Windows.list.contains(where: { $0.cgWindowId == wid }) {
                     return wid
                 }
-                guard let pid = Applications.frontmostPid,
-                      let app = (Applications.list.first { $0.pid == pid }),
-                      let focused = app.focusedWindow else { return nil }
-                return focused.cgWindowId
+                return nil
             }()
             if newSourceWid != sessionSourceWid {
                 previousSessionSourceWid = sessionSourceWid
