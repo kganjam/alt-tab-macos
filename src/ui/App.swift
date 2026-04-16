@@ -32,6 +32,14 @@ class App: AppCenterApplication {
     /// window the user was on before they alt-tabbed to the current
     /// foreground. Used to set position 1 in the switcher list.
     static var previousSessionSourceWid: CGWindowID?
+    /// The last target wid we focused via our own AltTab transition.
+    /// This is the ground truth for "which window is currently
+    /// foreground" — more reliable than `Applications.frontmostPid`
+    /// (which can be flipped by delayed Parallels AX events after our
+    /// guard expires) or NSWorkspace (which lags). Used at session
+    /// start to decide the current frontmost window when other signals
+    /// disagree.
+    static var lastFocusedTargetWid: CGWindowID?
     /// Mirror of `sessionSourceWid` as a pid, exposed as before for the
     /// existing Parallels-outbound detection which only needs to know
     /// the source app. Kept in sync via rotation.
@@ -326,11 +334,16 @@ class App: AppCenterApplication {
         // fix — otherwise `Applications.frontmostPid` reads as AltTab's own pid
         // by the time `Window.focus()` runs.
         if !appIsBeingUsed {
-            // Determine the currently-foreground WINDOW (not app). Needed
-            // so that switching between two windows of the same app
-            // (same pid) rotates correctly — the pid check doesn't
-            // distinguish them.
+            // Determine the currently-foreground WINDOW. Prefer our own
+            // `lastFocusedTargetWid` (ground truth from our last AltTab
+            // transition — can't be corrupted by stale AX events) if the
+            // window still exists in the list; otherwise fall back to
+            // Applications.frontmostPid → focusedWindow.
             let newSourceWid: CGWindowID? = {
+                if let wid = lastFocusedTargetWid,
+                   Windows.list.contains(where: { $0.cgWindowId == wid }) {
+                    return wid
+                }
                 guard let pid = Applications.frontmostPid,
                       let app = (Applications.list.first { $0.pid == pid }),
                       let focused = app.focusedWindow else { return nil }

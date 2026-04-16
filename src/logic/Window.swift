@@ -337,15 +337,24 @@ class Window {
         GetProcessForPID(application.pid, &psn)
         _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
         CGSReenableUpdate(CGS_CONNECTION)
-        // Fire Cocoa activation AFTER the atomic visual transition.
-        // Required for Parallels: its Coherence integration listens to
-        // NSApplicationDidBecomeActive to forward keyboard events into
-        // the Windows guest. SLPS alone is a bare window-server call
-        // that bypasses Cocoa's lifecycle — without activate(), the
-        // target window visually comes to front but the Windows app
-        // inside doesn't receive keystrokes.
         application.runningApplication.activate(options: [])
         manuallyUpdateFocusOrderForParallelsTransition()
+        // Explicitly tell the target app (via AX) WHICH of its windows
+        // should be the focused/main one, AND raise that window. For
+        // multi-window apps like OneNote under Parallels, activate()
+        // alone makes the app active but doesn't disambiguate between
+        // e.g. Soup vs Trading — Parallels defaults to whichever was
+        // most recently key on the Windows side, which may not match
+        // our intended target. Setting kAXFocusedWindow + raising the
+        // specific window is what signals Parallels' event mirror to
+        // route keyboard to THIS specific Coherence window.
+        BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+            guard let self, let appAx = self.application.axUiElement,
+                  let selfAx = self.axUiElement else { return }
+            try? appAx.setAttribute(kAXFocusedWindowAttribute, selfAx)
+            try? appAx.setAttribute(kAXMainWindowAttribute, selfAx)
+            try? selfAx.focusWindow()
+        }
     }
 
     /// SLPS-with-wid is a direct window-server call that doesn't reliably
@@ -367,6 +376,7 @@ class Window {
         Windows.armAltTabFocusGuard(for: self)
         application.focusedWindow = self
         Applications.frontmostPid = application.pid
+        App.lastFocusedTargetWid = cgWindowId
         let source = sessionSourceWindow()
         Windows.setTargetAndSourceAsMostRecent(target: self, source: source)
     }
