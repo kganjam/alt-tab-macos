@@ -21,7 +21,7 @@ class Windows {
     /// updates for any window OTHER than this target.
     static var altTabFocusTarget: Window?
     static var altTabFocusTargetUntil: CFAbsoluteTime = 0
-    static let altTabFocusGuardMs: Double = 400
+    static let altTabFocusGuardMs: Double = 2000
 
     static func armAltTabFocusGuard(for target: Window) {
         altTabFocusTarget = target

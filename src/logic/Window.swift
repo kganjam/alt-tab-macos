@@ -344,17 +344,27 @@ class Window {
     /// fires a brief spurious focus-changed for whatever window was
     /// previously key in that app, BEFORE the real target arrives.
     ///
-    /// Two-part fix:
+    /// Three-part fix:
     ///   1. Arm a guard so `AccessibilityEvents.focusedWindowChanged`
     ///      ignores updates for any window other than our target for
-    ///      ~400ms. Spurious "previously-key" events get dropped.
+    ///      ~2s. Spurious events get dropped.
     ///   2. Immediately promote the target ourselves via
     ///      `updateLastFocusOrder` + sync `application.focusedWindow`.
     ///      This is the same bookkeeping the AX handler would do.
+    ///   3. Re-assert the target's recency position at +200ms and
+    ///      +500ms. If a spurious event somehow slipped through the
+    ///      guard (rare timing edge cases), these re-assertions correct
+    ///      the recency list before the user's next AltTab.
     private func manuallyUpdateFocusOrderForParallelsTransition() {
         Windows.armAltTabFocusGuard(for: self)
         application.focusedWindow = self
         _ = Windows.updateLastFocusOrder(self)
+        for delayMs in [200, 500] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
+                guard let self, self.lastFocusOrder != 0 else { return }
+                _ = Windows.updateLastFocusOrder(self)
+            }
+        }
     }
 
     /// The CGWindowID of the source app's focused window at the moment the
