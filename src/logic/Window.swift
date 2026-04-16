@@ -206,6 +206,7 @@ class Window {
     }
 
     func focus() {
+        let outboundFromCoherence = isOutboundFromParallelsCoherence()
         if let altTabWindow = altTabWindow() {
             App.shared.activate(ignoringOtherApps: true)
             altTabWindow.makeKeyAndOrderFront(nil)
@@ -221,8 +222,6 @@ class Window {
             Windows.previewSelectedWindowIfNeeded()
         } else if isParallelsCoherenceWindow {
             focusParallelsCoherenceWindow()
-        } else if isOutboundFromParallelsCoherence() {
-            focusMacOsWindowOverParallelsCoherence()
         } else {
             // macOS bug: when switching to a System Preferences window in another space, it switches to that space,
             // but quickly switches back to another window in that space
@@ -232,7 +231,19 @@ class Window {
                 var psn = ProcessSerialNumber()
                 GetProcessForPID(self.application.pid, &psn)
                 _SLPSSetFrontProcessWithOptions(&psn, self.cgWindowId!, SLPSMode.userGenerated.rawValue)
-                self.makeKeyWindow(&psn)
+                // Skip `makeKeyWindow` (the Hammerspoon SLPS event-injection
+                // trick) when the previous foreground app was a Parallels
+                // Coherence window: Parallels' event mirror interprets those
+                // synthetic event records as a click on the source Coherence
+                // window and immediately re-raises it, covering our target.
+                // `_SLPSSetFrontProcessWithOptions` already targets the
+                // specific CGWindowID, and `kAXRaiseAction` below raises
+                // within the target app — the makeKeyWindow step only exists
+                // to help apps that don't cleanly pick up key status from
+                // SLPS alone, and isn't needed for most well-behaved apps.
+                if !outboundFromCoherence {
+                    self.makeKeyWindow(&psn)
+                }
                 try? self.axUiElement!.focusWindow()
                 DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
                     Windows.previewSelectedWindowIfNeeded()
@@ -243,42 +254,16 @@ class Window {
 
     /// True when a Parallels Coherence app was the foreground app when the
     /// user pressed Alt-Tab and we're focusing a non-Parallels target.
-    ///
-    /// We consult `App.sessionSourcePid` (captured at the very start of the
-    /// AltTab session) rather than the live `Applications.frontmostPid`.
-    /// Reason: once the `TilesPanel` is shown it can become key and flip
-    /// the live frontmost to AltTab itself, hiding the real source app
-    /// from this check — which breaks the fix for slow/visible AltTab
-    /// invocations while leaving fast ones intact. Fall back to the live
-    /// pid only if the session snapshot is missing.
+    /// Consults `App.sessionSourcePid` (captured at the very start of the
+    /// AltTab session) rather than the live `Applications.frontmostPid`,
+    /// because showing the `TilesPanel` can flip the live frontmost to
+    /// AltTab's own pid and hide the real source from this check.
     private func isOutboundFromParallelsCoherence() -> Bool {
         guard !application.isParallelsCoherence else { return false }
         let sourcePid = App.sessionSourcePid ?? Applications.frontmostPid
         guard let sourcePid, sourcePid != application.pid,
               let sourceApp = (Applications.list.first { $0.pid == sourcePid }) else { return false }
         return sourceApp.isParallelsCoherence
-    }
-
-    /// Parallels Coherence → macOS window: drop the SLPS private-API path
-    /// entirely. First switch the foreground app via the standard
-    /// `NSRunningApplication.activate` — this updates the menubar to the
-    /// target app cleanly without posting fake input events. Then, after a
-    /// short delay for activation to settle, raise the specific target window
-    /// within that app via `kAXRaiseAction`. No SLPS event injection, no
-    /// window-level pinning — just the two public operations the user
-    /// described: switch foreground app, then raise window.
-    private func focusMacOsWindowOverParallelsCoherence() {
-        application.runningApplication.activate(options: .activateAllWindows)
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(60)) { [weak self] in
-            guard let self else { return }
-            BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
-                guard let self else { return }
-                try? self.axUiElement!.focusWindow()
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
-                Windows.previewSelectedWindowIfNeeded()
-            }
-        }
     }
 
     /// Focus path for Parallels Coherence windows. Avoids `_SLPSSetFrontProcessWithOptions`
