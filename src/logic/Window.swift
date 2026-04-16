@@ -338,26 +338,27 @@ class Window {
         }
     }
 
-    /// Pin the target window to kCGScreenSaverWindowLevel (1000) — the
-    /// highest usable level — to guarantee it draws above everything
-    /// while Parallels' Coherence integration settles. Restore after
-    /// 700ms, but do the restore ATOMICALLY:
-    ///   1. Pause compositing
-    ///   2. Order target above source (so when level drops, z-order at
-    ///      level 0 has target above source)
-    ///   3. Drop target's level back to original
-    ///   4. Resume compositing
-    /// Without the explicit ordering at restore time, if Parallels had
-    /// raised its source Coherence window to the top of the level-0
-    /// stack during the 700ms pin, the target visibly falls behind it
-    /// when its level drops back to 0.
+    /// Pin the target window to kCGScreenSaverWindowLevel (1000) so it
+    /// draws above everything while Parallels' Coherence integration
+    /// settles. Restore after 3s — deliberately long so the restore
+    /// happens well after any user-perceived transition, not during it.
+    /// The restore is atomic (order target above source + drop level,
+    /// under CGSDisableUpdate) so if Parallels raised its source
+    /// Coherence window to the top of level-0 during the pin, the drop
+    /// doesn't show a z-order flip.
+    ///
+    /// Downside of a longer pin: if the user alt-tabs again within 3s,
+    /// the previously-pinned window would stay on top above the new
+    /// target. Mitigation is that the next focus() call pins the NEW
+    /// target higher (same level, but ordered above), so the user-visible
+    /// "currently selected" window stays correct.
     private func pinTargetLevelTemporarily(sourceWid: CGWindowID?) {
         guard let targetWid = cgWindowId else { return }
         var originalLevel: CGWindowLevel = 0
         CGSGetWindowLevel(CGS_CONNECTION, targetWid, &originalLevel)
         let kCGScreenSaverWindowLevel: CGWindowLevel = 1000
         CGSSetWindowLevel(CGS_CONNECTION, targetWid, kCGScreenSaverWindowLevel)
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(700)) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(3000)) {
             CGSDisableUpdate(CGS_CONNECTION)
             if let sourceWid {
                 CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, sourceWid)
