@@ -300,7 +300,6 @@ class Window {
     /// well-behaved macOS app.
     private func focusMacOsWindowOverParallelsCoherence() {
         Diagnostics.log("FOCUS", "enter focusMacOsWindowOverParallelsCoherence target=\(debugId ?? "?")")
-        Diagnostics.logSystemZOrder("before Par→mac")
         Diagnostics.logFrontmostSignals("before Par→mac")
         guard let targetWid = cgWindowId else { return }
         // Arm guard BEFORE SLPS fires so any AX focus-changed event the
@@ -342,8 +341,6 @@ class Window {
     /// (e.g. Terminal).
     private func atomicallyPinAndActivate() {
         Diagnostics.log("FOCUS", "enter atomicallyPinAndActivate target=\(debugId ?? "?")")
-        Diagnostics.logSystemZOrder("before atomicPinActivate")
-        Diagnostics.logFrontmostSignals("before atomicPinActivate")
         guard let targetWid = cgWindowId else { return }
         Windows.armAltTabFocusGuard(for: self)
         let sourceWid = previouslyFrontmostWindowId()
@@ -353,10 +350,18 @@ class Window {
         GetProcessForPID(application.pid, &psn)
         _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
         makeKeyWindow(&psn)
-        try? axUiElement?.focusWindow()
         CGSReenableUpdate(CGS_CONNECTION)
         application.runningApplication.activate(options: [])
         manuallyUpdateFocusOrderForParallelsTransition()
+        // AX raise is synchronous IPC into the target app. For Parallels
+        // Coherence windows, that IPC goes through Parallels' guest tools
+        // into the actual Windows app, which can block for seconds if the
+        // Windows app is busy. Run it on the background AX queue so it
+        // can't freeze the main thread / cursor.
+        BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+            guard let self else { return }
+            try? self.axUiElement?.focusWindow()
+        }
     }
 
     /// SLPS-with-wid is a direct window-server call that doesn't reliably
@@ -383,16 +388,14 @@ class Window {
         Diagnostics.log("MANUAL", "manualUpdate target=\(debugId ?? "?") source=\(source?.debugId ?? "nil")")
         Windows.setTargetAndSourceAsMostRecent(target: self, source: source)
         Diagnostics.logTrackedRecency("after manualUpdate")
-        // Schedule delayed captures to observe z-order AFTER any async
-        // reactions (Parallels re-raise, Cocoa activation pipeline).
-        for delay in [50, 200, 600, 1500] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
-                guard let self else { return }
-                Diagnostics.logSystemZOrder("post-manualUpdate +\(delay)ms")
-                Diagnostics.logFrontmostSignals("post-manualUpdate +\(delay)ms")
-                Diagnostics.logTrackedRecency("post-manualUpdate +\(delay)ms")
-                _ = self.cgWindowId  // keep reference alive
-            }
+        // Single delayed capture at +800ms — enough to observe any
+        // delayed Parallels reaction, minimal overhead.
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(800)) { [weak self] in
+            guard let self else { return }
+            Diagnostics.logSystemZOrder("post-manualUpdate +800ms")
+            Diagnostics.logFrontmostSignals("post-manualUpdate +800ms")
+            Diagnostics.logTrackedRecency("post-manualUpdate +800ms")
+            _ = self.cgWindowId
         }
     }
 

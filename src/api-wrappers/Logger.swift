@@ -143,15 +143,25 @@ class Diagnostics {
 
     static func startContinuousMonitoring() {
         guard enabled else { return }
+        // Default: OFF. Monitor only runs when explicitly enabled with
+        // a positive interval via `diagnosticsMonitorMs`. The periodic
+        // CGWindowListCopyWindowInfo call + string formatting was a
+        // measurable contributor to main-thread stalls.
         let intervalMs = UserDefaults.standard.integer(forKey: monitorIntervalKey)
-        let effectiveMs = intervalMs > 0 ? intervalMs : 2000 // default 2s
-        if intervalMs < 0 { return }
-        stopContinuousMonitoring()
-        monitorTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(effectiveMs) / 1000.0, repeats: true) { _ in
-            logSystemZOrder("tick")
-            logTrackedRecency("tick")
+        guard intervalMs > 0 else {
+            log("INIT", "continuous monitoring OFF (default). Enable: defaults write com.lwouis.alt-tab-macos diagnosticsMonitorMs -int 2000")
+            return
         }
-        log("INIT", "continuous monitoring started, interval=\(effectiveMs)ms. Disable: defaults write com.lwouis.alt-tab-macos diagnosticsMonitorMs -int -1")
+        stopContinuousMonitoring()
+        // Run captures on a background queue so they don't block main.
+        let workQueue = DispatchQueue.global(qos: .utility)
+        monitorTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(intervalMs) / 1000.0, repeats: true) { _ in
+            workQueue.async {
+                logSystemZOrder("tick")
+                DispatchQueue.main.async { logTrackedRecency("tick") }
+            }
+        }
+        log("INIT", "continuous monitoring started, interval=\(intervalMs)ms")
     }
 
     static func stopContinuousMonitoring() {
