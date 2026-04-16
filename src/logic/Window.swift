@@ -329,8 +329,6 @@ class Window {
     /// both the level pin and the SLPS call so they land in one frame.
     private func atomicallyPinAndActivate() {
         guard let targetWid = cgWindowId else { return }
-        // Arm guard BEFORE SLPS so any Cocoa-activation AX focus event
-        // arrives on main with the suppression filter already in place.
         Windows.armAltTabFocusGuard(for: self)
         let sourceWid = previouslyFrontmostWindowId()
         CGSDisableUpdate(CGS_CONNECTION)
@@ -339,6 +337,14 @@ class Window {
         GetProcessForPID(application.pid, &psn)
         _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
         CGSReenableUpdate(CGS_CONNECTION)
+        // Fire Cocoa activation AFTER the atomic visual transition.
+        // Required for Parallels: its Coherence integration listens to
+        // NSApplicationDidBecomeActive to forward keyboard events into
+        // the Windows guest. SLPS alone is a bare window-server call
+        // that bypasses Cocoa's lifecycle — without activate(), the
+        // target window visually comes to front but the Windows app
+        // inside doesn't receive keystrokes.
+        application.runningApplication.activate(options: [])
         manuallyUpdateFocusOrderForParallelsTransition()
     }
 
