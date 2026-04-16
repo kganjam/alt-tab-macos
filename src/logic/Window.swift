@@ -495,13 +495,16 @@ class Window {
         guard let targetWid = cgWindowId else { return }
         var originalLevel: CGWindowLevel = 0
         CGSGetWindowLevel(CGS_CONNECTION, targetWid, &originalLevel)
-        let kCGFloatingWindowLevel: CGWindowLevel = 3
-        CGSSetWindowLevel(CGS_CONNECTION, targetWid, kCGFloatingWindowLevel)
+        // Pin to kCGModalPanelWindowLevel (8) rather than kCGFloatingWindowLevel (3).
+        // Parallels pins its Coherence windows at L3 and has a timer-driven
+        // self-activation that kicks in ~800-1500ms after any focus change,
+        // bringing OneNote back to front within L3. Pinning target at L8
+        // keeps it visually above Parallels' entire L3 tier regardless of
+        // how many times Parallels re-activates. L8 is still Cocoa-
+        // interactive (modal panel class) so keyboard routing works.
+        CGSSetWindowLevel(CGS_CONNECTION, targetWid, 8)
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(3000)) {
             CGSDisableUpdate(CGS_CONNECTION)
-            if let sourceWid {
-                CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, sourceWid)
-            }
             CGSSetWindowLevel(CGS_CONNECTION, targetWid, originalLevel)
             CGSReenableUpdate(CGS_CONNECTION)
         }
