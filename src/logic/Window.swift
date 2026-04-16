@@ -351,9 +351,16 @@ class Window {
     /// The source is looked up from `App.sessionSourcePid` (captured
     /// before the TilesPanel showed, so it reflects the real pre-
     /// session foreground app, not AltTab itself).
+    ///
+    /// Also updates `Applications.frontmostPid` to the target's pid so
+    /// the next AltTab session reads a fresh value — `NSWorkspace` and
+    /// AX notifications can lag behind our SLPS-initiated change by
+    /// many ms, and a stale value causes session-start normalize to
+    /// use the wrong "current" pid.
     private func manuallyUpdateFocusOrderForParallelsTransition() {
         Windows.armAltTabFocusGuard(for: self)
         application.focusedWindow = self
+        Applications.frontmostPid = application.pid
         let source = sessionSourceWindow()
         Windows.setTargetAndSourceAsMostRecent(target: self, source: source)
     }

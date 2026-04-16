@@ -322,21 +322,17 @@ class App: AppCenterApplication {
         // fix — otherwise `Applications.frontmostPid` reads as AltTab's own pid
         // by the time `Window.focus()` runs.
         if !appIsBeingUsed {
-            // Rotate: previous session's source → previousSessionSourcePid,
-            // current frontmost → sessionSourcePid. Only rotate if frontmost
-            // actually changed (so repeated hotkey presses from the same app
-            // don't lose the genuine prior source).
-            let newSourcePid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            // Prefer Applications.frontmostPid (updated in-process by my
+            // manualUpdate after Par transitions, and by AX events
+            // otherwise) over NSWorkspace.frontmostApplication — the
+            // latter can lag tens of ms behind SLPS-initiated focus
+            // changes, causing rapid alt-tabs to see stale pids.
+            let newSourcePid = Applications.frontmostPid
+                ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
             if newSourcePid != sessionSourcePid {
                 previousSessionSourcePid = sessionSourcePid
                 sessionSourcePid = newSourcePid
             }
-            // Safety net: normalize recency before switcher opens. Position
-            // 0 = current frontmost window, position 1 = previous session's
-            // source window (the window the user was on before switching
-            // to current). Any spurious drift in between sessions gets
-            // overwritten so the switcher always shows the correct
-            // current+next pair.
             Windows.normalizeFocusOrderAtSessionStart(
                 currentPid: sessionSourcePid,
                 previousPid: previousSessionSourcePid)
