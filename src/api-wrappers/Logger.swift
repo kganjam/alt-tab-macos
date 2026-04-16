@@ -130,7 +130,11 @@ class Diagnostics {
 
     static func logSystemZOrder(_ label: String) {
         guard enabled else { return }
-        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        // Query ALL windows (not just .optionOnScreenOnly) so we can see
+        // targets that are on a different Space. Flag with [s=N] = on
+        // active space indicator so we can tell if the target is even
+        // visible on the current Space.
+        let options: CGWindowListOption = [.excludeDesktopElements]
         guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return }
         let filtered = info.filter { w in
             let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
@@ -143,18 +147,17 @@ class Diagnostics {
                let width = bounds["Width"] as? Double, width < 40 { return false }
             return true
         }
-        let top = filtered.prefix(6).map { (w: [String: Any]) -> String in
+        let top = filtered.prefix(8).map { (w: [String: Any]) -> String in
             let owner = (w[kCGWindowOwnerName as String] as? String) ?? "?"
             let name = (w[kCGWindowName as String] as? String) ?? ""
             let wid = (w[kCGWindowNumber as String] as? Int) ?? 0
             let layer = (w[kCGWindowLayer as String] as? Int) ?? 0
-            // kCGWindowLayer often shows stale/default level. Query the
-            // actual current server-level directly so we can see whether
-            // Parallels is elevating its Coherence window to compete.
+            let onScreen = (w[kCGWindowIsOnscreen as String] as? Bool) ?? false
             var actualLevel: CGWindowLevel = -1
             CGSGetWindowLevel(CGS_CONNECTION, CGWindowID(wid), &actualLevel)
             let short = name.isEmpty ? "" : ":\(name.prefix(22))"
-            return "cLv\(layer)/aLv\(actualLevel) #\(wid) \(owner)\(short)"
+            let vis = onScreen ? "on" : "OFF"
+            return "[\(vis)] cLv\(layer)/aLv\(actualLevel) #\(wid) \(owner)\(short)"
         }
         log("SYSZ", "\(label): \(top.joined(separator: " || "))")
     }

@@ -302,18 +302,7 @@ class Window {
         Diagnostics.log("FOCUS", "enter focusMacOsWindowOverParallelsCoherence target=\(debugId ?? "?")")
         Diagnostics.logFrontmostSignals("before Par→mac")
         guard let targetWid = cgWindowId else { return }
-        let sourceWidForFight = previouslyFrontmostWindowId()
-        // Parallels' Coherence integration re-raises its window in L0
-        // z-order within ~500ms after our focus lands, covering the
-        // target. CGSSetWindowLevel doesn't work cross-process here, so
-        // we instead fight for z-order directly with CGSOrderWindow
-        // (target above source) repeatedly during that window. Writes
-        // happen on a background queue; they don't block main thread.
-        scheduleZOrderFightLoop(targetWid: targetWid, sourceWid: sourceWidForFight)
-        // Arm guard BEFORE SLPS fires so any AX focus-changed event the
-        // activation triggers is suppressed (for non-target windows) from
-        // the very first event. If the guard were armed after SLPS, a
-        // spurious event could race onto the main queue ahead of us.
+        scheduleZOrderFightLoop(targetWid: targetWid, sourceWid: previouslyFrontmostWindowId())
         Windows.armAltTabFocusGuard(for: self)
         let sourceWid = previouslyFrontmostWindowId()
         CGSDisableUpdate(CGS_CONNECTION)
@@ -321,6 +310,13 @@ class Window {
         var psn = ProcessSerialNumber()
         GetProcessForPID(application.pid, &psn)
         _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
+        // Add makeKeyWindow back. Originally removed because of a theory
+        // that its synthetic events confused Parallels; but with Cmd→Ctrl
+        // keymap fix, the Windows Start-menu trigger is gone, and
+        // without makeKeyWindow, cross-Space switches (target on a
+        // different Space than current) don't trigger properly — the
+        // target stays on its original Space and never becomes visible.
+        makeKeyWindow(&psn)
         CGSReenableUpdate(CGS_CONNECTION)
         manuallyUpdateFocusOrderForParallelsTransition()
         pollForTargetAppFrontmostAndRaise(attempt: 0)
@@ -422,36 +418,20 @@ class Window {
     /// The CGWindowID of the source app's focused window at the moment the
     /// AltTab session started — used so we can explicitly order the target
     /// above it when the level pin restores, avoiding a z-order flip.
-    /// Schedule repeated CGSOrderWindow(target, .above, source) calls for
-    /// ~1s post-focus. Each call is a direct window-server z-order write
-    /// at L0 — no flicker, no re-composition. Executed on the utility
-    /// queue so main thread stays responsive. Generation counter lets
-    /// us abort if the user AltTabs again mid-fight.
+    /// Log diagnostic: is target on the active Space / visible? If not,
+    /// this tells us the issue is Space-membership, not z-order.
     private func scheduleZOrderFightLoop(targetWid: CGWindowID, sourceWid: CGWindowID?) {
-        guard let sourceWid else { return }
-        Windows.parallelsTransitionGeneration &+= 1
-        let myGen = Windows.parallelsTransitionGeneration
-        let ticks = [30, 80, 150, 250, 400, 600, 850, 1200]
-        for delayMs in ticks {
-            DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + .milliseconds(delayMs)) {
-                guard Windows.parallelsTransitionGeneration == myGen else { return }
-                // Parallels pins its Coherence windows at kCGFloatingWindowLevel (3),
-                // matching our pin. So instead of just CGSOrderWindow (which loses
-                // to whoever orders last at the same level), ALSO bump target's
-                // level higher each tick — but not so high that Cocoa treats it
-                // as non-interactive. kCGModalPanelWindowLevel (8) beats L3 and
-                // still accepts keyboard input.
-                CGSSetWindowLevel(CGS_CONNECTION, targetWid, 8)
-                let err = CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, sourceWid)
-                Diagnostics.log("FIGHT", "+\(delayMs)ms CGSOrderWindow(target=\(targetWid), above, source=\(sourceWid)) → \(err.rawValue)")
-            }
-        }
-        // After the fight loop, drop target back to a sane level so normal
-        // window behavior resumes (not stuck above other apps forever).
-        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + .milliseconds(1500)) {
-            guard Windows.parallelsTransitionGeneration == myGen else { return }
-            CGSSetWindowLevel(CGS_CONNECTION, targetWid, 0)
-            Diagnostics.log("FIGHT", "restored target=\(targetWid) level=0")
+        // CGSOrderWindow cross-process returns kCGErrorIllegalArgument
+        // (1000) consistently — Apple locked this down. No fight loop
+        // can work via direct z-order manipulation. We rely on SLPS +
+        // makeKeyWindow + AX raise (stock path) for z-order.
+        //
+        // Instead, log the target's Space-membership so we can see if
+        // the failure mode is "target is on different Space".
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(100)) {
+            let spaces = (CGSCopySpacesForWindows(CGS_CONNECTION, CGSSpaceMask.all.rawValue, [targetWid] as CFArray) as? [UInt64]) ?? []
+            let visibleSpaces = (Spaces.visibleSpaces.map { UInt64($0) })
+            Diagnostics.log("SPACE", "target=\(targetWid) inSpaces=\(spaces) visibleSpaces=\(visibleSpaces) onActive=\(spaces.contains(where: { visibleSpaces.contains($0) }))")
         }
     }
 
