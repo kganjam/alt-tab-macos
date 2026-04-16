@@ -388,14 +388,17 @@ class Window {
         Diagnostics.log("MANUAL", "manualUpdate target=\(debugId ?? "?") source=\(source?.debugId ?? "nil")")
         Windows.setTargetAndSourceAsMostRecent(target: self, source: source)
         Diagnostics.logTrackedRecency("after manualUpdate")
-        // Single delayed capture at +800ms — enough to observe any
-        // delayed Parallels reaction, minimal overhead.
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(800)) { [weak self] in
-            guard let self else { return }
-            Diagnostics.logSystemZOrder("post-manualUpdate +800ms")
-            Diagnostics.logFrontmostSignals("post-manualUpdate +800ms")
-            Diagnostics.logTrackedRecency("post-manualUpdate +800ms")
-            _ = self.cgWindowId
+        // Two delayed captures:
+        //   +400ms — right after any one-shot Parallels re-raise settles
+        //   +2500ms — catches delayed re-raise / Parallels polling behavior
+        // Both run on a background queue so they don't block main.
+        for delayMs in [400, 2500] {
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
+                guard let self else { return }
+                Diagnostics.logSystemZOrder("post-manualUpdate +\(delayMs)ms")
+                Diagnostics.logFrontmostSignals("post-manualUpdate +\(delayMs)ms")
+                _ = self.cgWindowId
+            }
         }
     }
 

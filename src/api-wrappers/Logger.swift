@@ -119,16 +119,36 @@ class Diagnostics {
         log("RECENCY", "\(label): \(top)")
     }
 
+    /// Overlays that dominate the top of CGWindowListCopyWindowInfo's
+    /// return but aren't "real" app windows the user cares about.
+    /// Filtered out so SYSZ actually shows the app z-order.
+    private static let sysZOwnerBlocklist: Set<String> = [
+        "Window Server", "Control Center", "Dock", "AltTab",
+        "Notification Center", "SystemUIServer", "Spotlight",
+        "Menubar", "Wallpaper",
+    ]
+
     static func logSystemZOrder(_ label: String) {
         guard enabled else { return }
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return }
-        let top = info.prefix(10).map { (w: [String: Any]) -> String in
-            let owner = w[kCGWindowOwnerName as String] as? String ?? "?"
-            let name = w[kCGWindowName as String] as? String ?? ""
-            let wid = w[kCGWindowNumber as String] as? Int ?? 0
-            let layer = w[kCGWindowLayer as String] as? Int ?? 0
-            let short = name.isEmpty ? "" : ":\(name.prefix(24))"
+        let filtered = info.filter { w in
+            let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
+            if sysZOwnerBlocklist.contains(owner) { return false }
+            // Drop hidden/off-screen / zero-alpha overlays
+            let alpha = (w[kCGWindowAlpha as String] as? Double) ?? 1.0
+            if alpha < 0.1 { return false }
+            // Drop zero-size helper windows
+            if let bounds = w[kCGWindowBounds as String] as? [String: Any],
+               let width = bounds["Width"] as? Double, width < 40 { return false }
+            return true
+        }
+        let top = filtered.prefix(6).map { (w: [String: Any]) -> String in
+            let owner = (w[kCGWindowOwnerName as String] as? String) ?? "?"
+            let name = (w[kCGWindowName as String] as? String) ?? ""
+            let wid = (w[kCGWindowNumber as String] as? Int) ?? 0
+            let layer = (w[kCGWindowLayer as String] as? Int) ?? 0
+            let short = name.isEmpty ? "" : ":\(name.prefix(22))"
             return "L\(layer) #\(wid) \(owner)\(short)"
         }
         log("SYSZ", "\(label): \(top.joined(separator: " || "))")
