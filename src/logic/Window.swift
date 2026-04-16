@@ -435,8 +435,23 @@ class Window {
         for delayMs in ticks {
             DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + .milliseconds(delayMs)) {
                 guard Windows.parallelsTransitionGeneration == myGen else { return }
-                CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, sourceWid)
+                // Parallels pins its Coherence windows at kCGFloatingWindowLevel (3),
+                // matching our pin. So instead of just CGSOrderWindow (which loses
+                // to whoever orders last at the same level), ALSO bump target's
+                // level higher each tick — but not so high that Cocoa treats it
+                // as non-interactive. kCGModalPanelWindowLevel (8) beats L3 and
+                // still accepts keyboard input.
+                CGSSetWindowLevel(CGS_CONNECTION, targetWid, 8)
+                let err = CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, sourceWid)
+                Diagnostics.log("FIGHT", "+\(delayMs)ms CGSOrderWindow(target=\(targetWid), above, source=\(sourceWid)) → \(err.rawValue)")
             }
+        }
+        // After the fight loop, drop target back to a sane level so normal
+        // window behavior resumes (not stuck above other apps forever).
+        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + .milliseconds(1500)) {
+            guard Windows.parallelsTransitionGeneration == myGen else { return }
+            CGSSetWindowLevel(CGS_CONNECTION, targetWid, 0)
+            Diagnostics.log("FIGHT", "restored target=\(targetWid) level=0")
         }
     }
 
