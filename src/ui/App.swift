@@ -265,15 +265,6 @@ class App: AppCenterApplication {
 
     static func focusSelectedWindow(_ selectedWindow: Window?) {
         guard appIsBeingUsed else { return } // already hidden
-        // Pause window-server compositing across the TilesPanel teardown AND
-        // the sync portion of window.focus() so the user sees only one
-        // atomic frame: panel gone + target already on top. Without this,
-        // there's one frame between orderOut and pin where the source
-        // window is fully visible — exactly the release-moment flicker.
-        // Ref-counted: Window.focus() does its own pair inside, which
-        // nests safely (counter stays > 0 until our Reenable fires).
-        CGSDisableUpdate(CGS_CONNECTION)
-        defer { CGSReenableUpdate(CGS_CONNECTION) }
         hideUi(true)
         if let window = selectedWindow, MissionControl.state() == .inactive || MissionControl.state() == .showDesktop {
             window.focus()

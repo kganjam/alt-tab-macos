@@ -39,9 +39,16 @@ class Windows {
     /// switch. The Parallels focus paths re-arm the guard themselves
     /// when they need it; the standard SLPS path doesn't — leaving it
     /// cleared is the correct default.
+    ///
+    /// ALSO bumps `parallelsTransitionGeneration` so any pending delayed
+    /// snapshot-restore block from a prior Parallels transition becomes
+    /// stale and is skipped. Without this, a Par→A restore scheduled at
+    /// t+500ms would fire after the user has mac→B-switched, restoring
+    /// the pre-Par state and demoting B out of position 0.
     static func clearAltTabFocusGuard() {
         altTabFocusTarget = nil
         altTabFocusTargetUntil = 0
+        parallelsTransitionGeneration &+= 1
     }
 
     static func shouldSuppressFocusOrderUpdate(for window: Window) -> Bool {
