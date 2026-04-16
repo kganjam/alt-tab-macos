@@ -28,18 +28,23 @@ class Windows {
     /// state.
     static var parallelsTransitionGeneration: UInt64 = 0
 
-    /// Called at AltTab session start. Ensures the currently-frontmost
-    /// app's focused window is at lastFocusOrder 0 so the switcher
-    /// displays it as the current window regardless of any prior
-    /// recency-list drift (e.g. from Parallels transitions with spurious
-    /// AX events). Finds the frontmost running app, looks up its tracked
-    /// `focusedWindow`, and promotes it if not already at 0.
-    static func normalizeFocusOrderForCurrentFrontmost() {
-        guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier,
-              let app = (Applications.list.first { $0.pid == pid }),
-              let focused = app.focusedWindow,
-              focused.lastFocusOrder != 0 else { return }
-        _ = updateLastFocusOrder(focused)
+    /// Called at AltTab session start. Deterministically sets recency so
+    /// position 0 is the current frontmost window and position 1 is the
+    /// PREVIOUS session's source window (the window the user was on
+    /// before switching to the current one). Everything else is re-indexed
+    /// to 2, 3, … preserving relative recency. This ensures the switcher
+    /// always shows [current, previous, …] regardless of any spurious
+    /// AX events that may have drifted the list between sessions.
+    static func normalizeFocusOrderAtSessionStart(currentPid: pid_t?, previousPid: pid_t?) {
+        guard let currentPid,
+              let currentApp = (Applications.list.first { $0.pid == currentPid }),
+              let currentWindow = currentApp.focusedWindow else { return }
+        let previousWindow: Window? = {
+            guard let previousPid, previousPid != currentPid,
+                  let prevApp = (Applications.list.first { $0.pid == previousPid }) else { return nil }
+            return prevApp.focusedWindow
+        }()
+        setTargetAndSourceAsMostRecent(target: currentWindow, source: previousWindow)
     }
 
     /// Set `target` to lastFocusOrder 0 AND `source` (if provided) to 1,

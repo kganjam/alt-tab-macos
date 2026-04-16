@@ -29,6 +29,13 @@ class App: AppCenterApplication {
     /// to AltTab's own pid, which breaks the Parallels Coherence outbound
     /// detection that relies on the real source app's bundle identifier.
     static var sessionSourcePid: pid_t?
+    /// The `sessionSourcePid` from the PREVIOUS AltTab session — the pid
+    /// of the window where the user was before they alt-tabbed to the
+    /// current foreground. Used to normalize recency at session start:
+    /// position 1 should always be this window. Without this, a
+    /// spurious AX event that briefly promoted some unrelated window
+    /// into position 1 persists across sessions.
+    static var previousSessionSourcePid: pid_t?
     private static var isFirstSummon = true
     private static var isVeryFirstSummon = true
     private static var pendingShowSettingsWindow = false
@@ -315,14 +322,24 @@ class App: AppCenterApplication {
         // fix — otherwise `Applications.frontmostPid` reads as AltTab's own pid
         // by the time `Window.focus()` runs.
         if !appIsBeingUsed {
-            sessionSourcePid = NSWorkspace.shared.frontmostApplication?.processIdentifier
-            // Safety net: ensure the currently-foreground window is at
-            // lastFocusOrder 0 before the switcher opens. Parallels focus
-            // transitions can leave the recency list briefly out of sync
-            // if spurious AX events slip through; this normalizes state
-            // right before the list is displayed so the user always sees
-            // the correct "current window" at position 0.
-            Windows.normalizeFocusOrderForCurrentFrontmost()
+            // Rotate: previous session's source → previousSessionSourcePid,
+            // current frontmost → sessionSourcePid. Only rotate if frontmost
+            // actually changed (so repeated hotkey presses from the same app
+            // don't lose the genuine prior source).
+            let newSourcePid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            if newSourcePid != sessionSourcePid {
+                previousSessionSourcePid = sessionSourcePid
+                sessionSourcePid = newSourcePid
+            }
+            // Safety net: normalize recency before switcher opens. Position
+            // 0 = current frontmost window, position 1 = previous session's
+            // source window (the window the user was on before switching
+            // to current). Any spurious drift in between sessions gets
+            // overwritten so the switcher always shows the correct
+            // current+next pair.
+            Windows.normalizeFocusOrderAtSessionStart(
+                currentPid: sessionSourcePid,
+                previousPid: previousSessionSourcePid)
         }
         appIsBeingUsed = true
         UsageStats.recordTrigger(shortcutIndex)
