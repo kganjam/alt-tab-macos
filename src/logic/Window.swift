@@ -316,13 +316,18 @@ class Window {
         }
     }
 
+    /// Pin the target window to kCGScreenSaverWindowLevel (1000) — the
+    /// highest usable level. Nothing except the mouse cursor draws above
+    /// it, so Parallels' Coherence integration cannot cause a flicker no
+    /// matter what level or ordering trick it uses. Restore to the
+    /// original level after a brief window once the transition is done.
     private func pinTargetLevelTemporarily() {
         guard let targetWid = cgWindowId else { return }
         var originalLevel: CGWindowLevel = 0
         CGSGetWindowLevel(CGS_CONNECTION, targetWid, &originalLevel)
-        let kCGFloatingWindowLevel: CGWindowLevel = 3
-        CGSSetWindowLevel(CGS_CONNECTION, targetWid, kCGFloatingWindowLevel)
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(1000)) {
+        let kCGScreenSaverWindowLevel: CGWindowLevel = 1000
+        CGSSetWindowLevel(CGS_CONNECTION, targetWid, kCGScreenSaverWindowLevel)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(700)) {
             CGSSetWindowLevel(CGS_CONNECTION, targetWid, originalLevel)
         }
     }
