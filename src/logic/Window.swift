@@ -257,39 +257,71 @@ class Window {
 
     /// Parallels Coherence → macOS window path.
     ///
-    /// Two failure modes were observed with the stock SLPS focus flow:
-    ///   - `makeKeyWindow` (the Hammerspoon SLPS event-injection trick) and
-    ///     `_SLPSSetFrontProcessWithOptions` interact with Parallels' event
-    ///     mirror in ways that cause the Coherence window to re-raise.
-    ///   - `NSRunningApplication.activate(options: .activateAllWindows)`
-    ///     breaks multi-window apps like Terminal (raises every window).
+    /// Three problems to solve at once:
+    ///   1. `makeKeyWindow` (the Hammerspoon SLPS event-injection trick) and
+    ///      `_SLPSSetFrontProcessWithOptions` interact badly with Parallels'
+    ///      event mirror — the Coherence window re-raises.
+    ///   2. `NSRunningApplication.activate(options: .activateAllWindows)`
+    ///      breaks multi-window apps like Terminal.
+    ///   3. Even with `activate(options: [])`, Parallels' re-raise can fire
+    ///      a few ms after activation and defeat our raise if we fire it
+    ///      the instant frontmost flips.
     ///
-    /// A fixed 80ms delay between activate() and AX raise was also
-    /// unreliable because activation latency varies. Instead, kick off
-    /// `activate(options: [])` and then POLL `NSWorkspace.frontmostApplication`
-    /// on the main queue every 10ms until either (a) it becomes the target
-    /// app, at which point we issue `kAXRaiseAction` on the specific
-    /// target window, or (b) we hit a 400ms timeout and raise anyway. The
-    /// poll eliminates the race between "activation in flight" and "AX
-    /// raise fires too early", which is the fragile part when Parallels
-    /// is fighting us at the event-mirror level.
+    /// Strategy: pin the target window's server-level to
+    /// `kCGFloatingWindowLevel` for the duration of the transition. While
+    /// pinned, the window server enforces z-order at the compositor level,
+    /// so Parallels cannot draw its Coherence window on top no matter how
+    /// many raises or activations it fires. After 1 second we restore the
+    /// target's original level unconditionally so it can't get stuck
+    /// elevated. In parallel: activate the target, poll until the frontmost
+    /// app becomes the target, then wait an extra settling delay (so
+    /// Parallels' one-shot reaction runs and completes first), then fire
+    /// `kAXRaiseAction` on the specific target window. The AX raise
+    /// handles the "correct window within the app" selection; the level
+    /// pin handles the visual stack.
     private func focusMacOsWindowOverParallelsCoherence() {
+        pinTargetLevelTemporarily()
         application.runningApplication.activate(options: [])
         pollForTargetAppFrontmostAndRaise(attempt: 0)
     }
 
+    private func pinTargetLevelTemporarily() {
+        guard let targetWid = cgWindowId else { return }
+        var originalLevel: CGWindowLevel = 0
+        CGSGetWindowLevel(CGS_CONNECTION, targetWid, &originalLevel)
+        // Floating level (3) is what inspector panels and tear-off menus use —
+        // high enough to beat a Coherence window at normal level, low enough
+        // that menus/popups/tooltips still appear above it.
+        let kCGFloatingWindowLevel: CGWindowLevel = 3
+        CGSSetWindowLevel(CGS_CONNECTION, targetWid, kCGFloatingWindowLevel)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(1000)) {
+            CGSSetWindowLevel(CGS_CONNECTION, targetWid, originalLevel)
+        }
+    }
+
     private static let parallelsOutboundPollAttempts = 40 // 40 × 10ms = 400ms budget
     private static let parallelsOutboundPollIntervalMs = 10
+    /// After activate() kicks off, NSWorkspace.frontmostApplication updates
+    /// asynchronously. Parallels' one-shot re-raise reaction fires ~tens of
+    /// ms after that. Wait for the frontmost flip THEN add a settling
+    /// delay, so our final kAXRaiseAction is the last thing the window
+    /// server sees for this transition.
+    private static let parallelsOutboundSettleMs = 140
     private func pollForTargetAppFrontmostAndRaise(attempt: Int) {
         let targetPid = application.pid
-        if NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPid
-               || attempt >= Window.parallelsOutboundPollAttempts {
-            BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+        let targetIsFrontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPid
+        if targetIsFrontmost || attempt >= Window.parallelsOutboundPollAttempts {
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + .milliseconds(Window.parallelsOutboundSettleMs)
+            ) { [weak self] in
                 guard let self else { return }
-                try? self.axUiElement!.focusWindow()
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
-                Windows.previewSelectedWindowIfNeeded()
+                BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+                    guard let self else { return }
+                    try? self.axUiElement!.focusWindow()
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
+                    Windows.previewSelectedWindowIfNeeded()
+                }
             }
             return
         }
