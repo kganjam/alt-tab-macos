@@ -65,6 +65,11 @@ class AccessibilityEvents {
         } else {
             App.checkIfShortcutsShouldBeDisabled(nil, app)
             if let windowless = (Windows.list.first { $0.isWindowlessApp && $0.application.pid == pid }) {
+                // same suppression as focusedWindowChanged: during an
+                // AltTab-initiated Parallels transition, don't let a
+                // coincidental windowless app activation promote its
+                // window into position 0 on top of our target.
+                if Windows.shouldSuppressFocusOrderUpdate(for: windowless) { return }
                 if let windows = Windows.updateLastFocusOrder(windowless) {
                     App.refreshOpenUiAfterExternalEvent(windows)
                 }

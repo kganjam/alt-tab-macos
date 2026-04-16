@@ -206,6 +206,10 @@ class Window {
     }
 
     func focus() {
+        // Clear any stale focus guard from a prior Parallels transition.
+        // Parallels-involved paths below re-arm for their own target;
+        // standard macOS→macOS SLPS path correctly runs with no guard.
+        Windows.clearAltTabFocusGuard()
         if let altTabWindow = altTabWindow() {
             App.shared.activate(ignoringOtherApps: true)
             altTabWindow.makeKeyAndOrderFront(nil)

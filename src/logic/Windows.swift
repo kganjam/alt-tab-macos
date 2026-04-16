@@ -33,6 +33,17 @@ class Windows {
         altTabFocusTargetUntil = CFAbsoluteTimeGetCurrent() + altTabFocusGuardMs / 1000.0
     }
 
+    /// Clear the guard at the start of each new focus() call so a 2-second
+    /// guard left over from a prior Parallels transition can't silently
+    /// suppress legitimate focus events from a subsequent macOS→macOS
+    /// switch. The Parallels focus paths re-arm the guard themselves
+    /// when they need it; the standard SLPS path doesn't — leaving it
+    /// cleared is the correct default.
+    static func clearAltTabFocusGuard() {
+        altTabFocusTarget = nil
+        altTabFocusTargetUntil = 0
+    }
+
     static func shouldSuppressFocusOrderUpdate(for window: Window) -> Bool {
         guard CFAbsoluteTimeGetCurrent() < altTabFocusTargetUntil,
               let target = altTabFocusTarget else { return false }
