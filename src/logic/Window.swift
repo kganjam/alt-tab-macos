@@ -359,9 +359,14 @@ class Window {
         return sourceApp.focusedWindow?.cgWindowId
     }
 
-    private static let parallelsOutboundPollAttempts = 40 // 40 × 10ms = 400ms budget
-    private static let parallelsOutboundPollIntervalMs = 10
-    private static let parallelsOutboundSettleMs = 140
+    private static let parallelsOutboundPollAttempts = 20 // 20 × 5ms = 100ms budget
+    private static let parallelsOutboundPollIntervalMs = 5
+    /// Settle-after-flip delay: was 140ms when Parallels was actively
+    /// fighting via the Windows Start menu path. With Cmd→Ctrl remapping
+    /// in Parallels, the Start menu no longer opens on Cmd, so Parallels
+    /// has far less to react to. 40ms is enough buffer for any remaining
+    /// async reaction while keeping the transition snappy.
+    private static let parallelsOutboundSettleMs = 40
     private func pollForTargetAppFrontmostAndRaise(attempt: Int) {
         let targetPid = application.pid
         let targetIsFrontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPid
