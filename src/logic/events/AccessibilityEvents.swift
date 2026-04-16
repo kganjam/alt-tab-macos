@@ -136,6 +136,12 @@ class AccessibilityEvents {
         // this avoids issues with dialogs, quicklook, etc (see scenarios from #1044 and #2003)
         window.application.focusedWindow = window
         App.checkIfShortcutsShouldBeDisabled(window, nil)
+        // During an AltTab-initiated Parallels focus transition, Cocoa
+        // often fires a brief spurious focus-changed for the target app's
+        // PREVIOUSLY-key window before settling on the real target. Skip
+        // `updateLastFocusOrder` for those so the recency list doesn't
+        // get a stale window promoted to position 0.
+        if Windows.shouldSuppressFocusOrderUpdate(for: window) { return }
         if let windows = Windows.updateLastFocusOrder(window) {
             App.refreshOpenUiAfterExternalEvent(windows)
         }

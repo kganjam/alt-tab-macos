@@ -7,6 +7,32 @@ class Windows {
     static var hoveredWindowIndex: Int?
     // we use this to track if the focused window changed while alt-tab was open
     private static var lastFocusedWindowTarget: String?
+    /// When AltTab initiates a focus change via SLPS + pin for a Parallels
+    /// transition, Cocoa often fires a brief spurious `kAXFocusedWindowChanged`
+    /// notification for the target app's PREVIOUSLY-key window before
+    /// settling on our actual target. If we let that event through to
+    /// `updateLastFocusOrder`, the recency list gets a stale window
+    /// promoted to position 0, and a user alternating A↔B can end up
+    /// with C (a third window) being offered as the next target.
+    ///
+    /// `altTabFocusTarget` is set to the target window for the duration
+    /// of `altTabFocusGuardMs` milliseconds. During that window,
+    /// `AccessibilityEvents.focusedWindowChanged` suppresses recency
+    /// updates for any window OTHER than this target.
+    static var altTabFocusTarget: Window?
+    static var altTabFocusTargetUntil: CFAbsoluteTime = 0
+    static let altTabFocusGuardMs: Double = 400
+
+    static func armAltTabFocusGuard(for target: Window) {
+        altTabFocusTarget = target
+        altTabFocusTargetUntil = CFAbsoluteTimeGetCurrent() + altTabFocusGuardMs / 1000.0
+    }
+
+    static func shouldSuppressFocusOrderUpdate(for window: Window) -> Bool {
+        guard CFAbsoluteTimeGetCurrent() < altTabFocusTargetUntil,
+              let target = altTabFocusTarget else { return false }
+        return window !== target
+    }
     private static var lastWindowActivityType = WindowActivityType.none
     static var searchQuery = ""
     private static var shouldSelectBestMatchOnSearchChange = false

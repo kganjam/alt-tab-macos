@@ -330,15 +330,21 @@ class Window {
         manuallyUpdateFocusOrderForParallelsTransition()
     }
 
-    /// SLPS-with-wid is a direct window-server call that doesn't always
-    /// trigger `kAXFocusedWindowChangedNotification` — the AX event that
-    /// AltTab's `AccessibilityEvents` handler uses to call
-    /// `Windows.updateLastFocusOrder`. When it's missed, AltTab's
-    /// internal recency order goes stale and the switcher popup shows
-    /// windows in wrong order. Manually promote the target to the front
-    /// of the recency list and sync `application.focusedWindow` so the
-    /// next AltTab session reflects reality.
+    /// SLPS-with-wid is a direct window-server call that doesn't reliably
+    /// trigger `kAXFocusedWindowChangedNotification`. Meanwhile Cocoa
+    /// activation of a multi-window target app (e.g. Terminal) often
+    /// fires a brief spurious focus-changed for whatever window was
+    /// previously key in that app, BEFORE the real target arrives.
+    ///
+    /// Two-part fix:
+    ///   1. Arm a guard so `AccessibilityEvents.focusedWindowChanged`
+    ///      ignores updates for any window other than our target for
+    ///      ~400ms. Spurious "previously-key" events get dropped.
+    ///   2. Immediately promote the target ourselves via
+    ///      `updateLastFocusOrder` + sync `application.focusedWindow`.
+    ///      This is the same bookkeeping the AX handler would do.
     private func manuallyUpdateFocusOrderForParallelsTransition() {
+        Windows.armAltTabFocusGuard(for: self)
         application.focusedWindow = self
         _ = Windows.updateLastFocusOrder(self)
     }
