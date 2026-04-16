@@ -303,6 +303,7 @@ class Window {
         GetProcessForPID(application.pid, &psn)
         _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
         CGSReenableUpdate(CGS_CONNECTION)
+        manuallyUpdateFocusOrderForParallelsTransition()
         pollForTargetAppFrontmostAndRaise(attempt: 0)
     }
 
@@ -326,6 +327,20 @@ class Window {
         GetProcessForPID(application.pid, &psn)
         _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
         CGSReenableUpdate(CGS_CONNECTION)
+        manuallyUpdateFocusOrderForParallelsTransition()
+    }
+
+    /// SLPS-with-wid is a direct window-server call that doesn't always
+    /// trigger `kAXFocusedWindowChangedNotification` — the AX event that
+    /// AltTab's `AccessibilityEvents` handler uses to call
+    /// `Windows.updateLastFocusOrder`. When it's missed, AltTab's
+    /// internal recency order goes stale and the switcher popup shows
+    /// windows in wrong order. Manually promote the target to the front
+    /// of the recency list and sync `application.focusedWindow` so the
+    /// next AltTab session reflects reality.
+    private func manuallyUpdateFocusOrderForParallelsTransition() {
+        application.focusedWindow = self
+        _ = Windows.updateLastFocusOrder(self)
     }
 
     /// The CGWindowID of the source app's focused window at the moment the
