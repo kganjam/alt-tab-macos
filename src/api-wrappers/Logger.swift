@@ -148,8 +148,13 @@ class Diagnostics {
             let name = (w[kCGWindowName as String] as? String) ?? ""
             let wid = (w[kCGWindowNumber as String] as? Int) ?? 0
             let layer = (w[kCGWindowLayer as String] as? Int) ?? 0
+            // kCGWindowLayer often shows stale/default level. Query the
+            // actual current server-level directly so we can see whether
+            // Parallels is elevating its Coherence window to compete.
+            var actualLevel: CGWindowLevel = -1
+            CGSGetWindowLevel(CGS_CONNECTION, CGWindowID(wid), &actualLevel)
             let short = name.isEmpty ? "" : ":\(name.prefix(22))"
-            return "L\(layer) #\(wid) \(owner)\(short)"
+            return "cLv\(layer)/aLv\(actualLevel) #\(wid) \(owner)\(short)"
         }
         log("SYSZ", "\(label): \(top.joined(separator: " || "))")
     }
