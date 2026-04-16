@@ -279,19 +279,39 @@ class Window {
     /// `kAXRaiseAction` on the specific target window. The AX raise
     /// handles the "correct window within the app" selection; the level
     /// pin handles the visual stack.
-    /// Coherence → macOS. Pin and activate atomically via a compositing
-    /// pause so there's no intermediate-frame flicker. Then poll for the
-    /// frontmost flip, settle, and raise the specific window.
+    /// Coherence → macOS. Pin the target high + set front process with the
+    /// SPECIFIC target window atomically. Using `_SLPSSetFrontProcessWithOptions`
+    /// (not `NSRunningApplication.activate`) because the latter doesn't take
+    /// a window argument — it raises whichever window of the target app was
+    /// most recently key, which corrupts AltTab's last-focus-order: e.g.
+    /// Par→Term1 via AltTab would briefly raise Term2 (previously key in
+    /// Terminal) before the AX raise pulled Term1 forward, so the next
+    /// AltTab would go to Term2 instead of back to Par. SLPS-with-wid skips
+    /// that intermediate raise.
+    ///
+    /// `makeKeyWindow` (the Hammerspoon byte-blob fake-event trick) is
+    /// intentionally omitted — Parallels' event mirror reads the synthetic
+    /// events as a click back on the source Coherence window and immediately
+    /// re-raises. SLPS-with-wid alone is enough when the target is a
+    /// well-behaved macOS app.
     private func focusMacOsWindowOverParallelsCoherence() {
-        atomicallyPinAndActivate()
+        guard let targetWid = cgWindowId else { return }
+        let sourceWid = previouslyFrontmostWindowId()
+        CGSDisableUpdate(CGS_CONNECTION)
+        pinTargetLevelTemporarily(sourceWid: sourceWid)
+        var psn = ProcessSerialNumber()
+        GetProcessForPID(application.pid, &psn)
+        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
+        CGSReenableUpdate(CGS_CONNECTION)
         pollForTargetAppFrontmostAndRaise(attempt: 0)
     }
 
     /// Atomically pin the target to kCGScreenSaverWindowLevel AND activate
     /// the target app, with the window server's compositor paused so both
     /// changes appear in a single frame — no visible flicker from ordering
-    /// or intermediate state. Safe: the pause is held for a single function
-    /// body on the main thread, never crossing async boundaries.
+    /// or intermediate state. Used for macOS → Coherence and Coherence →
+    /// Coherence where each Parallels app has exactly one window, so the
+    /// "wrong window activates" problem doesn't apply.
     private func atomicallyPinAndActivate() {
         let sourceWid = previouslyFrontmostWindowId()
         CGSDisableUpdate(CGS_CONNECTION)
