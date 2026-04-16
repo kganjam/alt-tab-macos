@@ -296,6 +296,11 @@ class Window {
     /// well-behaved macOS app.
     private func focusMacOsWindowOverParallelsCoherence() {
         guard let targetWid = cgWindowId else { return }
+        // Arm guard BEFORE SLPS fires so any AX focus-changed event the
+        // activation triggers is suppressed (for non-target windows) from
+        // the very first event. If the guard were armed after SLPS, a
+        // spurious event could race onto the main queue ahead of us.
+        Windows.armAltTabFocusGuard(for: self)
         let sourceWid = previouslyFrontmostWindowId()
         CGSDisableUpdate(CGS_CONNECTION)
         pinTargetLevelTemporarily(sourceWid: sourceWid)
@@ -320,6 +325,9 @@ class Window {
     /// both the level pin and the SLPS call so they land in one frame.
     private func atomicallyPinAndActivate() {
         guard let targetWid = cgWindowId else { return }
+        // Arm guard BEFORE SLPS so any Cocoa-activation AX focus event
+        // arrives on main with the suppression filter already in place.
+        Windows.armAltTabFocusGuard(for: self)
         let sourceWid = previouslyFrontmostWindowId()
         CGSDisableUpdate(CGS_CONNECTION)
         pinTargetLevelTemporarily(sourceWid: sourceWid)
