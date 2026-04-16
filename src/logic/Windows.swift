@@ -42,6 +42,28 @@ class Windows {
         _ = updateLastFocusOrder(focused)
     }
 
+    /// Set `target` to lastFocusOrder 0 AND `source` (if provided) to 1,
+    /// with all other windows shifted to 2, 3, … preserving their
+    /// relative recency. Used for Parallels-involved transitions where
+    /// ordinary `updateLastFocusOrder(target)` can leave a corrupted
+    /// window at position 1 (if a spurious AX event had previously
+    /// promoted it). Making the ordering deterministic from the known
+    /// source+target is more robust than trusting the prior list state.
+    static func setTargetAndSourceAsMostRecent(target: Window, source: Window?) {
+        let others = list.filter { $0 !== target && $0 !== source }
+            .sorted { $0.lastFocusOrder < $1.lastFocusOrder }
+        target.lastFocusOrder = 0
+        var nextOrder = 1
+        if let source {
+            source.lastFocusOrder = nextOrder
+            nextOrder += 1
+        }
+        for w in others {
+            w.lastFocusOrder = nextOrder
+            nextOrder += 1
+        }
+    }
+
     static func armAltTabFocusGuard(for target: Window) {
         altTabFocusTarget = target
         altTabFocusTargetUntil = CFAbsoluteTimeGetCurrent() + altTabFocusGuardMs / 1000.0

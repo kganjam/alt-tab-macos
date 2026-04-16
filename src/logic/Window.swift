@@ -344,14 +344,28 @@ class Window {
 
     /// SLPS-with-wid is a direct window-server call that doesn't reliably
     /// trigger `kAXFocusedWindowChangedNotification`. Arm the guard and
-    /// promote target synchronously. Any spurious AX events that arrive
-    /// within the guard window for non-target windows are suppressed by
-    /// `AccessibilityEvents.focusedWindowChanged` before they can touch
-    /// the recency list.
+    /// promote target synchronously. Explicitly set BOTH target to
+    /// position 0 AND the session-start source window to position 1 —
+    /// this is more robust than `updateLastFocusOrder(target)` alone,
+    /// which can leave a previously-corrupted window at position 1.
+    /// The source is looked up from `App.sessionSourcePid` (captured
+    /// before the TilesPanel showed, so it reflects the real pre-
+    /// session foreground app, not AltTab itself).
     private func manuallyUpdateFocusOrderForParallelsTransition() {
         Windows.armAltTabFocusGuard(for: self)
         application.focusedWindow = self
-        _ = Windows.updateLastFocusOrder(self)
+        let source = sessionSourceWindow()
+        Windows.setTargetAndSourceAsMostRecent(target: self, source: source)
+    }
+
+    /// Looks up the Window the user was focused on when this AltTab
+    /// session started, via `App.sessionSourcePid`. Returns nil if the
+    /// source was the same app as the target (so we have no separate
+    /// "previous" window to promote) or can't be found.
+    private func sessionSourceWindow() -> Window? {
+        guard let pid = App.sessionSourcePid, pid != application.pid,
+              let sourceApp = (Applications.list.first { $0.pid == pid }) else { return nil }
+        return sourceApp.focusedWindow
     }
 
     /// The CGWindowID of the source app's focused window at the moment the
