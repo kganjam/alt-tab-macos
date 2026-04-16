@@ -28,6 +28,20 @@ class Windows {
     /// state.
     static var parallelsTransitionGeneration: UInt64 = 0
 
+    /// Called at AltTab session start. Ensures the currently-frontmost
+    /// app's focused window is at lastFocusOrder 0 so the switcher
+    /// displays it as the current window regardless of any prior
+    /// recency-list drift (e.g. from Parallels transitions with spurious
+    /// AX events). Finds the frontmost running app, looks up its tracked
+    /// `focusedWindow`, and promotes it if not already at 0.
+    static func normalizeFocusOrderForCurrentFrontmost() {
+        guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+              let app = (Applications.list.first { $0.pid == pid }),
+              let focused = app.focusedWindow,
+              focused.lastFocusOrder != 0 else { return }
+        _ = updateLastFocusOrder(focused)
+    }
+
     static func armAltTabFocusGuard(for target: Window) {
         altTabFocusTarget = target
         altTabFocusTargetUntil = CFAbsoluteTimeGetCurrent() + altTabFocusGuardMs / 1000.0

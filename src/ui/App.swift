@@ -316,6 +316,13 @@ class App: AppCenterApplication {
         // by the time `Window.focus()` runs.
         if !appIsBeingUsed {
             sessionSourcePid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            // Safety net: ensure the currently-foreground window is at
+            // lastFocusOrder 0 before the switcher opens. Parallels focus
+            // transitions can leave the recency list briefly out of sync
+            // if spurious AX events slip through; this normalizes state
+            // right before the list is displayed so the user always sees
+            // the correct "current window" at position 0.
+            Windows.normalizeFocusOrderForCurrentFrontmost()
         }
         appIsBeingUsed = true
         UsageStats.recordTrigger(shortcutIndex)

@@ -343,40 +343,15 @@ class Window {
     }
 
     /// SLPS-with-wid is a direct window-server call that doesn't reliably
-    /// trigger `kAXFocusedWindowChangedNotification`. Meanwhile Cocoa
-    /// activation of a multi-window target app (e.g. Terminal) often
-    /// fires a brief spurious focus-changed for whatever window was
-    /// previously key in that app, BEFORE the real target arrives.
-    ///
-    /// Previously the fix was just an arm-guard + immediate
-    /// updateLastFocusOrder(target). But if a spurious event DID slip
-    /// through before the guard was armed (or after it expired), that
-    /// event would bump some wrong window into position 1. Our
-    /// subsequent updateLastFocusOrder(target) moves target to 0, but
-    /// the wrong window STAYS at 1 — so the next AltTab offers it
-    /// instead of the correct previously-focused window.
-    ///
-    /// Robust fix: snapshot the full lastFocusOrder state of every
-    /// window BEFORE the transition (so we have the true pre-transition
-    /// order), arm the guard, immediately promote target, and then at
-    /// +500ms and +1000ms atomically RESTORE the snapshot + re-apply the
-    /// single promotion. Any spurious updates to other windows in
-    /// between are overwritten. Skipped if the user has AltTab'd again
-    /// in the meantime (generation counter check).
+    /// trigger `kAXFocusedWindowChangedNotification`. Arm the guard and
+    /// promote target synchronously. Any spurious AX events that arrive
+    /// within the guard window for non-target windows are suppressed by
+    /// `AccessibilityEvents.focusedWindowChanged` before they can touch
+    /// the recency list.
     private func manuallyUpdateFocusOrderForParallelsTransition() {
-        let snapshot = Windows.list.map { (window: $0, order: $0.lastFocusOrder) }
-        Windows.parallelsTransitionGeneration &+= 1
-        let myGeneration = Windows.parallelsTransitionGeneration
         Windows.armAltTabFocusGuard(for: self)
         application.focusedWindow = self
         _ = Windows.updateLastFocusOrder(self)
-        for delayMs in [500, 1000] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
-                guard let self, Windows.parallelsTransitionGeneration == myGeneration else { return }
-                for (window, order) in snapshot { window.lastFocusOrder = order }
-                _ = Windows.updateLastFocusOrder(self)
-            }
-        }
     }
 
     /// The CGWindowID of the source app's focused window at the moment the
