@@ -306,17 +306,25 @@ class Window {
         pollForTargetAppFrontmostAndRaise(attempt: 0)
     }
 
-    /// Atomically pin the target to kCGScreenSaverWindowLevel AND activate
-    /// the target app, with the window server's compositor paused so both
-    /// changes appear in a single frame — no visible flicker from ordering
-    /// or intermediate state. Used for macOS → Coherence and Coherence →
-    /// Coherence where each Parallels app has exactly one window, so the
-    /// "wrong window activates" problem doesn't apply.
+    /// Atomically pin the target to kCGScreenSaverWindowLevel AND set it as
+    /// the front process + key window via `_SLPSSetFrontProcessWithOptions`
+    /// (which takes a specific CGWindowID). Used for macOS → Coherence and
+    /// Coherence → Coherence. Prefer SLPS-with-wid over
+    /// `NSRunningApplication.activate` because activate() triggers the full
+    /// Cocoa/Parallels activation pipeline (including the Parallels event
+    /// mirror redrawing both source and target Coherence windows with new
+    /// focus states), which visibly flickers on Par→Par switches. SLPS is
+    /// a single window-server call with no app-level side effects beyond
+    /// "process is front with this window". Compositor is paused around
+    /// both the level pin and the SLPS call so they land in one frame.
     private func atomicallyPinAndActivate() {
+        guard let targetWid = cgWindowId else { return }
         let sourceWid = previouslyFrontmostWindowId()
         CGSDisableUpdate(CGS_CONNECTION)
         pinTargetLevelTemporarily(sourceWid: sourceWid)
-        application.runningApplication.activate(options: [])
+        var psn = ProcessSerialNumber()
+        GetProcessForPID(application.pid, &psn)
+        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
         CGSReenableUpdate(CGS_CONNECTION)
     }
 
