@@ -433,26 +433,28 @@ class Window {
         }
     }
 
-    /// Pin the target window to kCGScreenSaverWindowLevel (1000) so it
-    /// draws above everything while Parallels' Coherence integration
-    /// settles. Restore after 3s — deliberately long so the restore
-    /// happens well after any user-perceived transition, not during it.
-    /// The restore is atomic (order target above source + drop level,
-    /// under CGSDisableUpdate) so if Parallels raised its source
-    /// Coherence window to the top of level-0 during the pin, the drop
-    /// doesn't show a z-order flip.
+    /// Pin the target window at kCGFloatingWindowLevel (3) for 3s so
+    /// it draws above Parallels' Coherence window at normal level.
+    /// Level 3 is what inspector panels use — high enough to beat
+    /// normal windows, LOW enough that Cocoa still treats the window
+    /// as interactive and routes keyboard input to it.
     ///
-    /// Downside of a longer pin: if the user alt-tabs again within 3s,
-    /// the previously-pinned window would stay on top above the new
-    /// target. Mitigation is that the next focus() call pins the NEW
-    /// target higher (same level, but ordered above), so the user-visible
-    /// "currently selected" window stays correct.
+    /// Previously pinned at kCGScreenSaverWindowLevel (1000), which
+    /// Cocoa classifies as non-interactive (decorative screensaver
+    /// class). Keyboard input bypassed the pinned window and landed
+    /// on whichever window was still at a normal interactive level —
+    /// so typing after switching to OneNote sent keystrokes to
+    /// Terminal.
+    ///
+    /// Restore after 3s with an atomic reorder so if Parallels raised
+    /// its source window to the top of level-0 during the pin, the
+    /// drop doesn't show a z-order flip.
     private func pinTargetLevelTemporarily(sourceWid: CGWindowID?) {
         guard let targetWid = cgWindowId else { return }
         var originalLevel: CGWindowLevel = 0
         CGSGetWindowLevel(CGS_CONNECTION, targetWid, &originalLevel)
-        let kCGScreenSaverWindowLevel: CGWindowLevel = 1000
-        CGSSetWindowLevel(CGS_CONNECTION, targetWid, kCGScreenSaverWindowLevel)
+        let kCGFloatingWindowLevel: CGWindowLevel = 3
+        CGSSetWindowLevel(CGS_CONNECTION, targetWid, kCGFloatingWindowLevel)
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(3000)) {
             CGSDisableUpdate(CGS_CONNECTION)
             if let sourceWid {
