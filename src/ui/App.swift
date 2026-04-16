@@ -23,19 +23,23 @@ class App: AppCenterApplication {
     static var shortcutIndex = 0
     static var forceDoNothingOnRelease = false
     /// Captured at the start of each AltTab session so that focus() can tell
-    /// which app was REALLY in the foreground when the user hit Alt-Tab — not
-    /// whatever is frontmost by the time `focus()` runs. Showing the
-    /// `TilesPanel` (a `canBecomeKey` NSPanel) can flip `Applications.frontmostPid`
-    /// to AltTab's own pid, which breaks the Parallels Coherence outbound
-    /// detection that relies on the real source app's bundle identifier.
-    static var sessionSourcePid: pid_t?
-    /// The `sessionSourcePid` from the PREVIOUS AltTab session — the pid
-    /// of the window where the user was before they alt-tabbed to the
-    /// current foreground. Used to normalize recency at session start:
-    /// position 1 should always be this window. Without this, a
-    /// spurious AX event that briefly promoted some unrelated window
-    /// into position 1 persists across sessions.
-    static var previousSessionSourcePid: pid_t?
+    /// which window was REALLY in the foreground when the user hit Alt-Tab.
+    /// Tracked by CGWindowID (not pid) so that switching between two
+    /// windows of the same app (e.g. two OneNote windows both under a
+    /// single Parallels winapp process) properly rotates between them.
+    static var sessionSourceWid: CGWindowID?
+    /// The `sessionSourceWid` from the PREVIOUS AltTab session — the
+    /// window the user was on before they alt-tabbed to the current
+    /// foreground. Used to set position 1 in the switcher list.
+    static var previousSessionSourceWid: CGWindowID?
+    /// Mirror of `sessionSourceWid` as a pid, exposed as before for the
+    /// existing Parallels-outbound detection which only needs to know
+    /// the source app. Kept in sync via rotation.
+    static var sessionSourcePid: pid_t? {
+        guard let wid = sessionSourceWid,
+              let w = (Windows.list.first { $0.cgWindowId == wid }) else { return nil }
+        return w.application.pid
+    }
     private static var isFirstSummon = true
     private static var isVeryFirstSummon = true
     private static var pendingShowSettingsWindow = false
@@ -322,17 +326,23 @@ class App: AppCenterApplication {
         // fix — otherwise `Applications.frontmostPid` reads as AltTab's own pid
         // by the time `Window.focus()` runs.
         if !appIsBeingUsed {
-            let newSourcePid = Applications.frontmostPid
-                ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
-            NSLog("ALTTAB session-start: newSourcePid=\(newSourcePid?.description ?? "nil") sessionSourcePid=\(sessionSourcePid?.description ?? "nil") previousSessionSourcePid=\(previousSessionSourcePid?.description ?? "nil")")
-            if newSourcePid != sessionSourcePid {
-                previousSessionSourcePid = sessionSourcePid
-                sessionSourcePid = newSourcePid
+            // Determine the currently-foreground WINDOW (not app). Needed
+            // so that switching between two windows of the same app
+            // (same pid) rotates correctly — the pid check doesn't
+            // distinguish them.
+            let newSourceWid: CGWindowID? = {
+                guard let pid = Applications.frontmostPid,
+                      let app = (Applications.list.first { $0.pid == pid }),
+                      let focused = app.focusedWindow else { return nil }
+                return focused.cgWindowId
+            }()
+            if newSourceWid != sessionSourceWid {
+                previousSessionSourceWid = sessionSourceWid
+                sessionSourceWid = newSourceWid
             }
-            NSLog("ALTTAB after-rotate: sessionSourcePid=\(sessionSourcePid?.description ?? "nil") previousSessionSourcePid=\(previousSessionSourcePid?.description ?? "nil")")
             Windows.normalizeFocusOrderAtSessionStart(
-                currentPid: sessionSourcePid,
-                previousPid: previousSessionSourcePid)
+                currentWid: sessionSourceWid,
+                previousWid: previousSessionSourceWid)
         }
         appIsBeingUsed = true
         UsageStats.recordTrigger(shortcutIndex)

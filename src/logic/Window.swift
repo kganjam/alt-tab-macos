@@ -368,20 +368,16 @@ class Window {
         application.focusedWindow = self
         Applications.frontmostPid = application.pid
         let source = sessionSourceWindow()
-        NSLog("ALTTAB manualUpdate: target=\(self.debugId ?? "?") source=\(source?.debugId ?? "nil") sessionSourcePid=\(App.sessionSourcePid?.description ?? "nil")")
         Windows.setTargetAndSourceAsMostRecent(target: self, source: source)
-        let top = Windows.list.sorted { $0.lastFocusOrder < $1.lastFocusOrder }.prefix(5)
-        NSLog("ALTTAB list-after-manualUpdate: \(top.map { "\($0.lastFocusOrder):\($0.debugId ?? "?")" }.joined(separator: " | "))")
     }
 
     /// Looks up the Window the user was focused on when this AltTab
-    /// session started, via `App.sessionSourcePid`. Returns nil if the
-    /// source was the same app as the target (so we have no separate
-    /// "previous" window to promote) or can't be found.
+    /// session started, via `App.sessionSourceWid`. Returns nil if it
+    /// resolves to this same window (so we have no separate "previous"
+    /// window to promote) or can't be found.
     private func sessionSourceWindow() -> Window? {
-        guard let pid = App.sessionSourcePid, pid != application.pid,
-              let sourceApp = (Applications.list.first { $0.pid == pid }) else { return nil }
-        return sourceApp.focusedWindow
+        guard let wid = App.sessionSourceWid, wid != cgWindowId else { return nil }
+        return Windows.list.first { $0.cgWindowId == wid }
     }
 
     /// The CGWindowID of the source app's focused window at the moment the

@@ -35,22 +35,14 @@ class Windows {
     /// to 2, 3, … preserving relative recency. This ensures the switcher
     /// always shows [current, previous, …] regardless of any spurious
     /// AX events that may have drifted the list between sessions.
-    static func normalizeFocusOrderAtSessionStart(currentPid: pid_t?, previousPid: pid_t?) {
-        guard let currentPid,
-              let currentApp = (Applications.list.first { $0.pid == currentPid }),
-              let currentWindow = currentApp.focusedWindow else {
-            NSLog("ALTTAB normalize SKIPPED: currentPid=\(currentPid?.description ?? "nil") currentApp found=\(Applications.list.contains { $0.pid == currentPid }) currentWindow found=false")
-            return
-        }
+    static func normalizeFocusOrderAtSessionStart(currentWid: CGWindowID?, previousWid: CGWindowID?) {
+        guard let currentWid,
+              let currentWindow = (list.first { $0.cgWindowId == currentWid }) else { return }
         let previousWindow: Window? = {
-            guard let previousPid, previousPid != currentPid,
-                  let prevApp = (Applications.list.first { $0.pid == previousPid }) else { return nil }
-            return prevApp.focusedWindow
+            guard let previousWid, previousWid != currentWid else { return nil }
+            return list.first { $0.cgWindowId == previousWid }
         }()
-        NSLog("ALTTAB normalize: current=\(currentWindow.debugId ?? "?") previous=\(previousWindow?.debugId ?? "nil")")
         setTargetAndSourceAsMostRecent(target: currentWindow, source: previousWindow)
-        let top = list.sorted { $0.lastFocusOrder < $1.lastFocusOrder }.prefix(5)
-        NSLog("ALTTAB list-after-normalize: \(top.map { "\($0.lastFocusOrder):\($0.debugId ?? "?")" }.joined(separator: " | "))")
     }
 
     /// Set `target` to lastFocusOrder 0 AND `source` (if provided) to 1,
