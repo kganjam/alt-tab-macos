@@ -11,7 +11,18 @@ class App: AppCenterApplication {
     static let bundleIdentifier = Bundle.main.bundleIdentifier!
     static let bundleURL = Bundle.main.bundleURL
     static let name = Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as! String
-    static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as! String
+    /// Custom-build version string shown in the About panel. Reads the
+    /// bundle-plist value (normally `#VERSION#` placeholder from a local
+    /// build) and prepends a clear "CUSTOM BUILD" marker so it's obvious
+    /// the user is running our patched version rather than the official
+    /// release. The timestamp is baked at compile time via the BUILD_DATE
+    /// preprocessor-ish approach — we use a static string updated by the
+    /// local build wrapper script.
+    static let version: String = {
+        let bundleVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String) ?? "unknown"
+        let buildDate = "BUILD_DATE_PLACEHOLDER" // updated by build script
+        return "CUSTOM BUILD (\(buildDate)) — base:\(bundleVersion)"
+    }()
     static let licence = Bundle.main.object(forInfoDictionaryKey: "NSHumanReadableCopyright") as! String
     static let repository = "https://github.com/lwouis/alt-tab-macos"
     static let website = "https://alt-tab.app"
@@ -284,6 +295,7 @@ class App: AppCenterApplication {
 
     static func focusSelectedWindow(_ selectedWindow: Window?) {
         guard appIsBeingUsed else { return } // already hidden
+        Diagnostics.log("KEY", "release → focusSelectedWindow target=\(selectedWindow?.debugId ?? "nil")")
         hideUi(true)
         if let window = selectedWindow, MissionControl.state() == .inactive || MissionControl.state() == .showDesktop {
             window.focus()
@@ -334,11 +346,9 @@ class App: AppCenterApplication {
         // fix — otherwise `Applications.frontmostPid` reads as AltTab's own pid
         // by the time `Window.focus()` runs.
         if !appIsBeingUsed {
-            // Determine the currently-foreground WINDOW. Prefer our own
-            // `lastFocusedTargetWid` (ground truth from our last AltTab
-            // transition — can't be corrupted by stale AX events) if the
-            // window still exists in the list; otherwise fall back to
-            // Applications.frontmostPid → focusedWindow.
+            Diagnostics.log("SESSION", "new session shortcutIndex=\(shortcutIndex)")
+            Diagnostics.logFrontmostSignals("session-start pre")
+            Diagnostics.logTrackedRecency("session-start pre")
             let newSourceWid: CGWindowID? = {
                 if let wid = lastFocusedTargetWid,
                    Windows.list.contains(where: { $0.cgWindowId == wid }) {
@@ -356,6 +366,8 @@ class App: AppCenterApplication {
             Windows.normalizeFocusOrderAtSessionStart(
                 currentWid: sessionSourceWid,
                 previousWid: previousSessionSourceWid)
+            Diagnostics.logFrontmostSignals("session-start post")
+            Diagnostics.logTrackedRecency("session-start post")
         }
         appIsBeingUsed = true
         UsageStats.recordTrigger(shortcutIndex)
@@ -465,6 +477,8 @@ extension App: NSApplicationDelegate {
         App.shared.disableRelaunchOnLogin()
         Logger.initialize()
         Logger.info { "Launching AltTab \(App.version)" }
+        Diagnostics.log("INIT", "AltTab \(App.version) launched (custom build with diagnostics)")
+        Diagnostics.startContinuousMonitoring()
         #if DEBUG
         UserDefaults.standard.set(true, forKey: "NSConstraintBasedLayoutVisualizeMutuallyExclusiveConstraints")
         #endif

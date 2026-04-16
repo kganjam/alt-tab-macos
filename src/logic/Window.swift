@@ -299,6 +299,9 @@ class Window {
     /// re-raises. SLPS-with-wid alone is enough when the target is a
     /// well-behaved macOS app.
     private func focusMacOsWindowOverParallelsCoherence() {
+        Diagnostics.log("FOCUS", "enter focusMacOsWindowOverParallelsCoherence target=\(debugId ?? "?")")
+        Diagnostics.logSystemZOrder("before Par→mac")
+        Diagnostics.logFrontmostSignals("before Par→mac")
         guard let targetWid = cgWindowId else { return }
         // Arm guard BEFORE SLPS fires so any AX focus-changed event the
         // activation triggers is suppressed (for non-target windows) from
@@ -338,6 +341,9 @@ class Window {
     /// makeKeyWindow, keyboard continues to go to the previous app
     /// (e.g. Terminal).
     private func atomicallyPinAndActivate() {
+        Diagnostics.log("FOCUS", "enter atomicallyPinAndActivate target=\(debugId ?? "?")")
+        Diagnostics.logSystemZOrder("before atomicPinActivate")
+        Diagnostics.logFrontmostSignals("before atomicPinActivate")
         guard let targetWid = cgWindowId else { return }
         Windows.armAltTabFocusGuard(for: self)
         let sourceWid = previouslyFrontmostWindowId()
@@ -374,7 +380,20 @@ class Window {
         Applications.frontmostPid = application.pid
         App.lastFocusedTargetWid = cgWindowId
         let source = sessionSourceWindow()
+        Diagnostics.log("MANUAL", "manualUpdate target=\(debugId ?? "?") source=\(source?.debugId ?? "nil")")
         Windows.setTargetAndSourceAsMostRecent(target: self, source: source)
+        Diagnostics.logTrackedRecency("after manualUpdate")
+        // Schedule delayed captures to observe z-order AFTER any async
+        // reactions (Parallels re-raise, Cocoa activation pipeline).
+        for delay in [50, 200, 600, 1500] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
+                guard let self else { return }
+                Diagnostics.logSystemZOrder("post-manualUpdate +\(delay)ms")
+                Diagnostics.logFrontmostSignals("post-manualUpdate +\(delay)ms")
+                Diagnostics.logTrackedRecency("post-manualUpdate +\(delay)ms")
+                _ = self.cgWindowId  // keep reference alive
+            }
+        }
     }
 
     /// Looks up the Window the user was focused on when this AltTab

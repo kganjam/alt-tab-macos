@@ -82,6 +82,91 @@ class Logger {
     }
 }
 
+/// Custom diagnostic logging for debugging the Parallels Coherence focus
+/// transitions. All output goes through NSLog so it appears in Console.app
+/// (filter "AltTab") and in the launch redirect log at /tmp/alttab-run.log.
+///
+/// Toggle via UserDefaults:
+///   defaults write com.lwouis.alt-tab-macos diagnosticsEnabled -bool true   # default
+///   defaults write com.lwouis.alt-tab-macos diagnosticsEnabled -bool false  # silence
+/// Continuous monitoring interval (ms):
+///   defaults write com.lwouis.alt-tab-macos diagnosticsMonitorMs -int 500
+///   defaults write com.lwouis.alt-tab-macos diagnosticsMonitorMs -int -1    # disable
+class Diagnostics {
+    private static let enabledKey = "diagnosticsEnabled"
+    private static let monitorIntervalKey = "diagnosticsMonitorMs"
+    private static var monitorTimer: Timer?
+    private static let startTime = Date()
+
+    static var enabled: Bool {
+        if UserDefaults.standard.object(forKey: enabledKey) == nil { return true }
+        return UserDefaults.standard.bool(forKey: enabledKey)
+    }
+
+    static func log(_ category: String, _ message: @autoclosure () -> String) {
+        guard enabled else { return }
+        let elapsed = Date().timeIntervalSince(startTime)
+        NSLog("[DIAG %@] t+%.3fs %@", category, elapsed, message())
+    }
+
+    static func logTrackedRecency(_ label: String) {
+        guard enabled else { return }
+        let top = Windows.list
+            .sorted { $0.lastFocusOrder < $1.lastFocusOrder }
+            .prefix(8)
+            .map { "\($0.lastFocusOrder):\(diagShortId($0))" }
+            .joined(separator: " | ")
+        log("RECENCY", "\(label): \(top)")
+    }
+
+    static func logSystemZOrder(_ label: String) {
+        guard enabled else { return }
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return }
+        let top = info.prefix(10).map { (w: [String: Any]) -> String in
+            let owner = w[kCGWindowOwnerName as String] as? String ?? "?"
+            let name = w[kCGWindowName as String] as? String ?? ""
+            let wid = w[kCGWindowNumber as String] as? Int ?? 0
+            let layer = w[kCGWindowLayer as String] as? Int ?? 0
+            let short = name.isEmpty ? "" : ":\(name.prefix(24))"
+            return "L\(layer) #\(wid) \(owner)\(short)"
+        }
+        log("SYSZ", "\(label): \(top.joined(separator: " || "))")
+    }
+
+    static func logFrontmostSignals(_ label: String) {
+        guard enabled else { return }
+        let nsWorkspace = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let atFront = Applications.frontmostPid
+        log("FRONT", "\(label): nsw=\(nsWorkspace?.description ?? "nil") atFront=\(atFront?.description ?? "nil") sessionWid=\(App.sessionSourceWid?.description ?? "nil") prevWid=\(App.previousSessionSourceWid?.description ?? "nil") lastTargetWid=\(App.lastFocusedTargetWid?.description ?? "nil")")
+    }
+
+    static func startContinuousMonitoring() {
+        guard enabled else { return }
+        let intervalMs = UserDefaults.standard.integer(forKey: monitorIntervalKey)
+        let effectiveMs = intervalMs > 0 ? intervalMs : 2000 // default 2s
+        if intervalMs < 0 { return }
+        stopContinuousMonitoring()
+        monitorTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(effectiveMs) / 1000.0, repeats: true) { _ in
+            logSystemZOrder("tick")
+            logTrackedRecency("tick")
+        }
+        log("INIT", "continuous monitoring started, interval=\(effectiveMs)ms. Disable: defaults write com.lwouis.alt-tab-macos diagnosticsMonitorMs -int -1")
+    }
+
+    static func stopContinuousMonitoring() {
+        monitorTimer?.invalidate()
+        monitorTimer = nil
+    }
+
+    private static func diagShortId(_ w: Window) -> String {
+        let title = (w.title ?? "").prefix(18)
+        let appName = w.application.localizedName ?? "?"
+        let wid = w.cgWindowId.map { "#\($0)" } ?? "#nil"
+        return "\(wid) \(appName):\(title)"
+    }
+}
+
 /// custom destination to display logs in the debug window
 class DebugWindowDestination: BaseDestination {
     var onNewEntry: ((SwiftyBeaver.Level, String) -> Void)?
