@@ -206,7 +206,6 @@ class Window {
     }
 
     func focus() {
-        let outboundFromCoherence = isOutboundFromParallelsCoherence()
         if let altTabWindow = altTabWindow() {
             App.shared.activate(ignoringOtherApps: true)
             altTabWindow.makeKeyAndOrderFront(nil)
@@ -222,6 +221,8 @@ class Window {
             Windows.previewSelectedWindowIfNeeded()
         } else if isParallelsCoherenceWindow {
             focusParallelsCoherenceWindow()
+        } else if isOutboundFromParallelsCoherence() {
+            focusMacOsWindowOverParallelsCoherence()
         } else {
             // macOS bug: when switching to a System Preferences window in another space, it switches to that space,
             // but quickly switches back to another window in that space
@@ -231,19 +232,7 @@ class Window {
                 var psn = ProcessSerialNumber()
                 GetProcessForPID(self.application.pid, &psn)
                 _SLPSSetFrontProcessWithOptions(&psn, self.cgWindowId!, SLPSMode.userGenerated.rawValue)
-                // Skip `makeKeyWindow` (the Hammerspoon SLPS event-injection
-                // trick) when the previous foreground app was a Parallels
-                // Coherence window: Parallels' event mirror interprets those
-                // synthetic event records as a click on the source Coherence
-                // window and immediately re-raises it, covering our target.
-                // `_SLPSSetFrontProcessWithOptions` already targets the
-                // specific CGWindowID, and `kAXRaiseAction` below raises
-                // within the target app — the makeKeyWindow step only exists
-                // to help apps that don't cleanly pick up key status from
-                // SLPS alone, and isn't needed for most well-behaved apps.
-                if !outboundFromCoherence {
-                    self.makeKeyWindow(&psn)
-                }
+                self.makeKeyWindow(&psn)
                 try? self.axUiElement!.focusWindow()
                 DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
                     Windows.previewSelectedWindowIfNeeded()
@@ -264,6 +253,35 @@ class Window {
         guard let sourcePid, sourcePid != application.pid,
               let sourceApp = (Applications.list.first { $0.pid == sourcePid }) else { return false }
         return sourceApp.isParallelsCoherence
+    }
+
+    /// Parallels Coherence → macOS window path. Research + testing showed
+    /// two failure modes with the stock SLPS focus flow:
+    ///   - `makeKeyWindow` (the Hammerspoon SLPS event-injection trick) and
+    ///     `_SLPSSetFrontProcessWithOptions` interact with Parallels' event
+    ///     mirror in ways that cause the Coherence window to re-raise.
+    ///   - `NSRunningApplication.activate(options: .activateAllWindows)`
+    ///     breaks multi-window apps like Terminal (raises every window).
+    ///
+    /// This path uses `NSRunningApplication.activate(options: [])`, which
+    /// makes the target the foreground app and raises only its current key
+    /// window — Terminal, Safari, etc. behave correctly. Then, after a
+    /// short delay for activation to settle, `kAXRaiseAction` on the
+    /// specific target axUiElement brings the exact selected window to the
+    /// top within the now-active app. No SLPS private calls, no fake
+    /// events, no options flags that raise unrelated windows.
+    private func focusMacOsWindowOverParallelsCoherence() {
+        application.runningApplication.activate(options: [])
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(80)) { [weak self] in
+            guard let self else { return }
+            BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+                guard let self else { return }
+                try? self.axUiElement!.focusWindow()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
+                Windows.previewSelectedWindowIfNeeded()
+            }
+        }
     }
 
     /// Focus path for Parallels Coherence windows. Avoids `_SLPSSetFrontProcessWithOptions`
