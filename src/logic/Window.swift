@@ -279,13 +279,24 @@ class Window {
     /// `kAXRaiseAction` on the specific target window. The AX raise
     /// handles the "correct window within the app" selection; the level
     /// pin handles the visual stack.
-    /// Coherence → macOS. Pin BEFORE activate so the target is visually on
-    /// top from the very start — one clean jump instead of a flicker gap
-    /// where Parallels could briefly re-raise during the poll window.
+    /// Coherence → macOS. Pin and activate atomically via a compositing
+    /// pause so there's no intermediate-frame flicker. Then poll for the
+    /// frontmost flip, settle, and raise the specific window.
     private func focusMacOsWindowOverParallelsCoherence() {
+        atomicallyPinAndActivate()
+        pollForTargetAppFrontmostAndRaise(attempt: 0)
+    }
+
+    /// Atomically pin the target to kCGScreenSaverWindowLevel AND activate
+    /// the target app, with the window server's compositor paused so both
+    /// changes appear in a single frame — no visible flicker from ordering
+    /// or intermediate state. Safe: the pause is held for a single function
+    /// body on the main thread, never crossing async boundaries.
+    private func atomicallyPinAndActivate() {
+        CGSDisableUpdate(CGS_CONNECTION)
         pinTargetLevelTemporarily()
         application.runningApplication.activate(options: [])
-        pollForTargetAppFrontmostAndRaise(attempt: 0)
+        CGSReenableUpdate(CGS_CONNECTION)
     }
 
     private static let parallelsOutboundPollAttempts = 40 // 40 × 10ms = 400ms budget
@@ -335,11 +346,11 @@ class Window {
     /// Focus path for Parallels Coherence windows (macOS → Coherence or
     /// Coherence → Coherence). Avoids the SLPS path (`makeKeyWindow`
     /// synthetic events) which can cause flicker even when Parallels is the
-    /// target. Instead: pin the target above normal windows, activate the
-    /// app cleanly, then raise the specific window after a short settle.
+    /// target. Wrap the pin+activate in a window-server compositing pause
+    /// so the two changes land as one atomic frame, eliminating the
+    /// intermediate-frame flicker visible when they happen in sequence.
     private func focusParallelsCoherenceWindow() {
-        pinTargetLevelTemporarily()
-        application.runningApplication.activate(options: [])
+        atomicallyPinAndActivate()
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(60)) { [weak self] in
             guard let self else { return }
             BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in

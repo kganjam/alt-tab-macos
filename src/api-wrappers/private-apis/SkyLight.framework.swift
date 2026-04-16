@@ -165,6 +165,18 @@ func CGSGetWindowLevel(_ cid: CGSConnectionID, _ wid: CGWindowID, _ level: Unsaf
 @_silgen_name("CGSSetWindowLevel") @discardableResult
 func CGSSetWindowLevel(_ cid: CGSConnectionID, _ wid: CGWindowID, _ level: CGWindowLevel) -> CGError
 
+/// Pause/resume window server compositing for this connection. Any window
+/// changes between the Disable and Reenable calls are batched and applied
+/// atomically when Reenable fires — users never see intermediate frames.
+/// MUST be paired tightly; leaving updates disabled freezes all compositing.
+/// This is the same mechanism AppKit uses internally via NSDisableScreenUpdates
+/// for in-app transitions; the CGS variant works globally.
+/// * macOS 10.10+
+@_silgen_name("CGSDisableUpdate") @discardableResult
+func CGSDisableUpdate(_ cid: CGSConnectionID) -> CGError
+@_silgen_name("CGSReenableUpdate") @discardableResult
+func CGSReenableUpdate(_ cid: CGSConnectionID) -> CGError
+
 /// returns status of the checkbox in System Preferences > Security & Privacy > Privacy > Screen Recording
 /// returns 1 if checked or 0 if unchecked; also prompts the user the first time if unchecked
 /// the return value will be the same during the app lifetime; it will not reflect the actual status of the checkbox
