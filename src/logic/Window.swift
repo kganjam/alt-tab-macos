@@ -327,6 +327,16 @@ class Window {
     /// a single window-server call with no app-level side effects beyond
     /// "process is front with this window". Compositor is paused around
     /// both the level pin and the SLPS call so they land in one frame.
+    /// Target-is-Parallels path (mac→Par, Par→Par). Uses the full
+    /// stock SLPS flow (SLPS + makeKeyWindow + AX raise) because the
+    /// target is a Parallels Coherence window that needs the "synthetic
+    /// click" events to route keyboard into its Windows guest. The
+    /// concern that makeKeyWindow confuses Parallels applies only when
+    /// the SOURCE is a Coherence window (Par→mac) — for Par targets,
+    /// Parallels PROPERLY interprets the synthetic events as user
+    /// activation of that specific Coherence window. Without
+    /// makeKeyWindow, keyboard continues to go to the previous app
+    /// (e.g. Terminal).
     private func atomicallyPinAndActivate() {
         guard let targetWid = cgWindowId else { return }
         Windows.armAltTabFocusGuard(for: self)
@@ -336,25 +346,11 @@ class Window {
         var psn = ProcessSerialNumber()
         GetProcessForPID(application.pid, &psn)
         _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
+        makeKeyWindow(&psn)
+        try? axUiElement?.focusWindow()
         CGSReenableUpdate(CGS_CONNECTION)
         application.runningApplication.activate(options: [])
         manuallyUpdateFocusOrderForParallelsTransition()
-        // Explicitly tell the target app (via AX) WHICH of its windows
-        // should be the focused/main one, AND raise that window. For
-        // multi-window apps like OneNote under Parallels, activate()
-        // alone makes the app active but doesn't disambiguate between
-        // e.g. Soup vs Trading — Parallels defaults to whichever was
-        // most recently key on the Windows side, which may not match
-        // our intended target. Setting kAXFocusedWindow + raising the
-        // specific window is what signals Parallels' event mirror to
-        // route keyboard to THIS specific Coherence window.
-        BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
-            guard let self, let appAx = self.application.axUiElement,
-                  let selfAx = self.axUiElement else { return }
-            try? appAx.setAttribute(kAXFocusedWindowAttribute, selfAx)
-            try? appAx.setAttribute(kAXMainWindowAttribute, selfAx)
-            try? selfAx.focusWindow()
-        }
     }
 
     /// SLPS-with-wid is a direct window-server call that doesn't reliably
