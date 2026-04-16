@@ -255,25 +255,35 @@ class Window {
         return sourceApp.isParallelsCoherence
     }
 
-    /// Parallels Coherence → macOS window path. Research + testing showed
-    /// two failure modes with the stock SLPS focus flow:
+    /// Parallels Coherence → macOS window path.
+    ///
+    /// Two failure modes were observed with the stock SLPS focus flow:
     ///   - `makeKeyWindow` (the Hammerspoon SLPS event-injection trick) and
     ///     `_SLPSSetFrontProcessWithOptions` interact with Parallels' event
     ///     mirror in ways that cause the Coherence window to re-raise.
     ///   - `NSRunningApplication.activate(options: .activateAllWindows)`
     ///     breaks multi-window apps like Terminal (raises every window).
     ///
-    /// This path uses `NSRunningApplication.activate(options: [])`, which
-    /// makes the target the foreground app and raises only its current key
-    /// window — Terminal, Safari, etc. behave correctly. Then, after a
-    /// short delay for activation to settle, `kAXRaiseAction` on the
-    /// specific target axUiElement brings the exact selected window to the
-    /// top within the now-active app. No SLPS private calls, no fake
-    /// events, no options flags that raise unrelated windows.
+    /// A fixed 80ms delay between activate() and AX raise was also
+    /// unreliable because activation latency varies. Instead, kick off
+    /// `activate(options: [])` and then POLL `NSWorkspace.frontmostApplication`
+    /// on the main queue every 10ms until either (a) it becomes the target
+    /// app, at which point we issue `kAXRaiseAction` on the specific
+    /// target window, or (b) we hit a 400ms timeout and raise anyway. The
+    /// poll eliminates the race between "activation in flight" and "AX
+    /// raise fires too early", which is the fragile part when Parallels
+    /// is fighting us at the event-mirror level.
     private func focusMacOsWindowOverParallelsCoherence() {
         application.runningApplication.activate(options: [])
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(80)) { [weak self] in
-            guard let self else { return }
+        pollForTargetAppFrontmostAndRaise(attempt: 0)
+    }
+
+    private static let parallelsOutboundPollAttempts = 40 // 40 × 10ms = 400ms budget
+    private static let parallelsOutboundPollIntervalMs = 10
+    private func pollForTargetAppFrontmostAndRaise(attempt: Int) {
+        let targetPid = application.pid
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPid
+               || attempt >= Window.parallelsOutboundPollAttempts {
             BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
                 guard let self else { return }
                 try? self.axUiElement!.focusWindow()
@@ -281,6 +291,12 @@ class Window {
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
                 Windows.previewSelectedWindowIfNeeded()
             }
+            return
+        }
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(Window.parallelsOutboundPollIntervalMs)
+        ) { [weak self] in
+            self?.pollForTargetAppFrontmostAndRaise(attempt: attempt + 1)
         }
     }
 
