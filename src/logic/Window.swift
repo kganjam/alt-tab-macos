@@ -280,37 +280,28 @@ class Window {
     /// handles the "correct window within the app" selection; the level
     /// pin handles the visual stack.
     private func focusMacOsWindowOverParallelsCoherence() {
-        pinTargetLevelTemporarily()
         application.runningApplication.activate(options: [])
-        pollForTargetAppFrontmostAndRaise(attempt: 0)
-    }
-
-    private func pinTargetLevelTemporarily() {
-        guard let targetWid = cgWindowId else { return }
-        var originalLevel: CGWindowLevel = 0
-        CGSGetWindowLevel(CGS_CONNECTION, targetWid, &originalLevel)
-        // Floating level (3) is what inspector panels and tear-off menus use —
-        // high enough to beat a Coherence window at normal level, low enough
-        // that menus/popups/tooltips still appear above it.
-        let kCGFloatingWindowLevel: CGWindowLevel = 3
-        CGSSetWindowLevel(CGS_CONNECTION, targetWid, kCGFloatingWindowLevel)
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(1000)) {
-            CGSSetWindowLevel(CGS_CONNECTION, targetWid, originalLevel)
-        }
+        pollForTargetAppFrontmostThenPinAndRaise(attempt: 0)
     }
 
     private static let parallelsOutboundPollAttempts = 40 // 40 × 10ms = 400ms budget
     private static let parallelsOutboundPollIntervalMs = 10
-    /// After activate() kicks off, NSWorkspace.frontmostApplication updates
-    /// asynchronously. Parallels' one-shot re-raise reaction fires ~tens of
-    /// ms after that. Wait for the frontmost flip THEN add a settling
-    /// delay, so our final kAXRaiseAction is the last thing the window
-    /// server sees for this transition.
     private static let parallelsOutboundSettleMs = 140
-    private func pollForTargetAppFrontmostAndRaise(attempt: Int) {
+    /// After activate(), poll until frontmost flips to the target, THEN:
+    ///   1. Pin the target to kCGFloatingWindowLevel so Parallels can't
+    ///      visually cover it during the settle window.
+    ///   2. Wait 140ms for Parallels' one-shot re-raise reaction to finish.
+    ///   3. Fire kAXRaiseAction on the specific target window.
+    ///   4. Restore the target's original level after 1s.
+    ///
+    /// Level-pinning AFTER the frontmost flip (not before activate) avoids
+    /// a visual jump: the normal app-switch animation plays out first,
+    /// then the pin silently locks z-order.
+    private func pollForTargetAppFrontmostThenPinAndRaise(attempt: Int) {
         let targetPid = application.pid
         let targetIsFrontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPid
         if targetIsFrontmost || attempt >= Window.parallelsOutboundPollAttempts {
+            pinTargetLevelTemporarily()
             DispatchQueue.main.asyncAfter(
                 deadline: .now() + .milliseconds(Window.parallelsOutboundSettleMs)
             ) { [weak self] in
@@ -328,19 +319,35 @@ class Window {
         DispatchQueue.main.asyncAfter(
             deadline: .now() + .milliseconds(Window.parallelsOutboundPollIntervalMs)
         ) { [weak self] in
-            self?.pollForTargetAppFrontmostAndRaise(attempt: attempt + 1)
+            self?.pollForTargetAppFrontmostThenPinAndRaise(attempt: attempt + 1)
         }
     }
 
-    /// Focus path for Parallels Coherence windows. Avoids `_SLPSSetFrontProcessWithOptions`
-    /// and the SLPS "makeKeyWindow" fake-event trick: Parallels mirrors macOS focus into
-    /// the Windows guest, and those private events confuse the mirror, causing a visible
-    /// bounce back to the previously-focused Coherence window. Using only
-    /// `NSRunningApplication.activate` + `kAXRaiseAction` lets Parallels sync cleanly.
+    private func pinTargetLevelTemporarily() {
+        guard let targetWid = cgWindowId else { return }
+        var originalLevel: CGWindowLevel = 0
+        CGSGetWindowLevel(CGS_CONNECTION, targetWid, &originalLevel)
+        let kCGFloatingWindowLevel: CGWindowLevel = 3
+        CGSSetWindowLevel(CGS_CONNECTION, targetWid, kCGFloatingWindowLevel)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(1000)) {
+            CGSSetWindowLevel(CGS_CONNECTION, targetWid, originalLevel)
+        }
+    }
+
+    /// Focus path for Parallels Coherence windows (macOS → Coherence direction).
+    /// Parallels WANTS focus on its own Coherence window so there's no re-raise
+    /// fight. Use the stock SLPS path (`_SLPSSetFrontProcessWithOptions` +
+    /// `makeKeyWindow` + `kAXRaiseAction`) for a single atomic transition with
+    /// minimal flicker. `makeKeyWindow` only conflicts when the SOURCE is a
+    /// Coherence window and the TARGET is a macOS app; here the direction is
+    /// reversed so it's safe.
     private func focusParallelsCoherenceWindow() {
-        application.runningApplication.activate(options: .activateAllWindows)
         BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
             guard let self else { return }
+            var psn = ProcessSerialNumber()
+            GetProcessForPID(self.application.pid, &psn)
+            _SLPSSetFrontProcessWithOptions(&psn, self.cgWindowId!, SLPSMode.userGenerated.rawValue)
+            self.makeKeyWindow(&psn)
             try? self.axUiElement!.focusWindow()
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
                 Windows.previewSelectedWindowIfNeeded()
