@@ -22,6 +22,11 @@ class Windows {
     static var altTabFocusTarget: Window?
     static var altTabFocusTargetUntil: CFAbsoluteTime = 0
     static let altTabFocusGuardMs: Double = 2000
+    /// Bumped on every Parallels-involved focus transition. Delayed
+    /// snapshot-restore blocks check this and skip if a newer transition
+    /// has started, so a late restore can't clobber the user's latest
+    /// state.
+    static var parallelsTransitionGeneration: UInt64 = 0
 
     static func armAltTabFocusGuard(for target: Window) {
         altTabFocusTarget = target

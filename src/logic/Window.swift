@@ -344,24 +344,32 @@ class Window {
     /// fires a brief spurious focus-changed for whatever window was
     /// previously key in that app, BEFORE the real target arrives.
     ///
-    /// Three-part fix:
-    ///   1. Arm a guard so `AccessibilityEvents.focusedWindowChanged`
-    ///      ignores updates for any window other than our target for
-    ///      ~2s. Spurious events get dropped.
-    ///   2. Immediately promote the target ourselves via
-    ///      `updateLastFocusOrder` + sync `application.focusedWindow`.
-    ///      This is the same bookkeeping the AX handler would do.
-    ///   3. Re-assert the target's recency position at +200ms and
-    ///      +500ms. If a spurious event somehow slipped through the
-    ///      guard (rare timing edge cases), these re-assertions correct
-    ///      the recency list before the user's next AltTab.
+    /// Previously the fix was just an arm-guard + immediate
+    /// updateLastFocusOrder(target). But if a spurious event DID slip
+    /// through before the guard was armed (or after it expired), that
+    /// event would bump some wrong window into position 1. Our
+    /// subsequent updateLastFocusOrder(target) moves target to 0, but
+    /// the wrong window STAYS at 1 — so the next AltTab offers it
+    /// instead of the correct previously-focused window.
+    ///
+    /// Robust fix: snapshot the full lastFocusOrder state of every
+    /// window BEFORE the transition (so we have the true pre-transition
+    /// order), arm the guard, immediately promote target, and then at
+    /// +500ms and +1000ms atomically RESTORE the snapshot + re-apply the
+    /// single promotion. Any spurious updates to other windows in
+    /// between are overwritten. Skipped if the user has AltTab'd again
+    /// in the meantime (generation counter check).
     private func manuallyUpdateFocusOrderForParallelsTransition() {
+        let snapshot = Windows.list.map { (window: $0, order: $0.lastFocusOrder) }
+        Windows.parallelsTransitionGeneration &+= 1
+        let myGeneration = Windows.parallelsTransitionGeneration
         Windows.armAltTabFocusGuard(for: self)
         application.focusedWindow = self
         _ = Windows.updateLastFocusOrder(self)
-        for delayMs in [200, 500] {
+        for delayMs in [500, 1000] {
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
-                guard let self, self.lastFocusOrder != 0 else { return }
+                guard let self, Windows.parallelsTransitionGeneration == myGeneration else { return }
+                for (window, order) in snapshot { window.lastFocusOrder = order }
                 _ = Windows.updateLastFocusOrder(self)
             }
         }
