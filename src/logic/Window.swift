@@ -293,10 +293,21 @@ class Window {
     /// or intermediate state. Safe: the pause is held for a single function
     /// body on the main thread, never crossing async boundaries.
     private func atomicallyPinAndActivate() {
+        let sourceWid = previouslyFrontmostWindowId()
         CGSDisableUpdate(CGS_CONNECTION)
-        pinTargetLevelTemporarily()
+        pinTargetLevelTemporarily(sourceWid: sourceWid)
         application.runningApplication.activate(options: [])
         CGSReenableUpdate(CGS_CONNECTION)
+    }
+
+    /// The CGWindowID of the source app's focused window at the moment the
+    /// AltTab session started — used so we can explicitly order the target
+    /// above it when the level pin restores, avoiding a z-order flip.
+    private func previouslyFrontmostWindowId() -> CGWindowID? {
+        guard let sourcePid = App.sessionSourcePid ?? Applications.frontmostPid,
+              sourcePid != application.pid,
+              let sourceApp = (Applications.list.first { $0.pid == sourcePid }) else { return nil }
+        return sourceApp.focusedWindow?.cgWindowId
     }
 
     private static let parallelsOutboundPollAttempts = 40 // 40 × 10ms = 400ms budget
@@ -328,18 +339,31 @@ class Window {
     }
 
     /// Pin the target window to kCGScreenSaverWindowLevel (1000) — the
-    /// highest usable level. Nothing except the mouse cursor draws above
-    /// it, so Parallels' Coherence integration cannot cause a flicker no
-    /// matter what level or ordering trick it uses. Restore to the
-    /// original level after a brief window once the transition is done.
-    private func pinTargetLevelTemporarily() {
+    /// highest usable level — to guarantee it draws above everything
+    /// while Parallels' Coherence integration settles. Restore after
+    /// 700ms, but do the restore ATOMICALLY:
+    ///   1. Pause compositing
+    ///   2. Order target above source (so when level drops, z-order at
+    ///      level 0 has target above source)
+    ///   3. Drop target's level back to original
+    ///   4. Resume compositing
+    /// Without the explicit ordering at restore time, if Parallels had
+    /// raised its source Coherence window to the top of the level-0
+    /// stack during the 700ms pin, the target visibly falls behind it
+    /// when its level drops back to 0.
+    private func pinTargetLevelTemporarily(sourceWid: CGWindowID?) {
         guard let targetWid = cgWindowId else { return }
         var originalLevel: CGWindowLevel = 0
         CGSGetWindowLevel(CGS_CONNECTION, targetWid, &originalLevel)
         let kCGScreenSaverWindowLevel: CGWindowLevel = 1000
         CGSSetWindowLevel(CGS_CONNECTION, targetWid, kCGScreenSaverWindowLevel)
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(700)) {
+            CGSDisableUpdate(CGS_CONNECTION)
+            if let sourceWid {
+                CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, sourceWid)
+            }
             CGSSetWindowLevel(CGS_CONNECTION, targetWid, originalLevel)
+            CGSReenableUpdate(CGS_CONNECTION)
         }
     }
 

@@ -177,6 +177,21 @@ func CGSDisableUpdate(_ cid: CGSConnectionID) -> CGError
 @_silgen_name("CGSReenableUpdate") @discardableResult
 func CGSReenableUpdate(_ cid: CGSConnectionID) -> CGError
 
+enum CGSWindowOrderingMode: Int32 {
+    case below = -1
+    case out = 0
+    case above = 1
+}
+
+/// Places `wid` above/below `relativeToWid` in the window server's z-order.
+/// Pass `relativeToWid == 0` with `.above` for top of z-order, or with
+/// `.below` for bottom. Unlike `kAXRaiseAction`, this does not cause app
+/// activation or a re-composition flash — the window server rewrites the
+/// order directly.
+/// * macOS 10.10+
+@_silgen_name("CGSOrderWindow") @discardableResult
+func CGSOrderWindow(_ cid: CGSConnectionID, _ wid: CGWindowID, _ place: CGSWindowOrderingMode.RawValue, _ relativeToWid: CGWindowID) -> CGError
+
 /// returns status of the checkbox in System Preferences > Security & Privacy > Privacy > Screen Recording
 /// returns 1 if checked or 0 if unchecked; also prompts the user the first time if unchecked
 /// the return value will be the same during the app lifetime; it will not reflect the actual status of the checkbox
