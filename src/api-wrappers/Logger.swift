@@ -158,7 +158,15 @@ class Diagnostics {
         guard enabled else { return }
         let nsWorkspace = NSWorkspace.shared.frontmostApplication?.processIdentifier
         let atFront = Applications.frontmostPid
-        log("FRONT", "\(label): nsw=\(nsWorkspace?.description ?? "nil") atFront=\(atFront?.description ?? "nil") sessionWid=\(App.sessionSourceWid?.description ?? "nil") prevWid=\(App.previousSessionSourceWid?.description ?? "nil") lastTargetWid=\(App.lastFocusedTargetWid?.description ?? "nil")")
+        // Query actual window-server level for the last-focused target.
+        // If this stays at 0 despite our CGSSetWindowLevel(.., 3) call,
+        // the pin isn't crossing process boundaries and z-order
+        // enforcement relies solely on the CGSOrderWindow fight loop.
+        var targetLevel: CGWindowLevel = -1
+        if let wid = App.lastFocusedTargetWid {
+            CGSGetWindowLevel(CGS_CONNECTION, wid, &targetLevel)
+        }
+        log("FRONT", "\(label): nsw=\(nsWorkspace?.description ?? "nil") atFront=\(atFront?.description ?? "nil") sessionWid=\(App.sessionSourceWid?.description ?? "nil") prevWid=\(App.previousSessionSourceWid?.description ?? "nil") lastTargetWid=\(App.lastFocusedTargetWid?.description ?? "nil") targetActualLevel=\(targetLevel)")
     }
 
     static func startContinuousMonitoring() {

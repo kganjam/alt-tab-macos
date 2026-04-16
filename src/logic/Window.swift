@@ -302,6 +302,14 @@ class Window {
         Diagnostics.log("FOCUS", "enter focusMacOsWindowOverParallelsCoherence target=\(debugId ?? "?")")
         Diagnostics.logFrontmostSignals("before Par→mac")
         guard let targetWid = cgWindowId else { return }
+        let sourceWidForFight = previouslyFrontmostWindowId()
+        // Parallels' Coherence integration re-raises its window in L0
+        // z-order within ~500ms after our focus lands, covering the
+        // target. CGSSetWindowLevel doesn't work cross-process here, so
+        // we instead fight for z-order directly with CGSOrderWindow
+        // (target above source) repeatedly during that window. Writes
+        // happen on a background queue; they don't block main thread.
+        scheduleZOrderFightLoop(targetWid: targetWid, sourceWid: sourceWidForFight)
         // Arm guard BEFORE SLPS fires so any AX focus-changed event the
         // activation triggers is suppressed (for non-target windows) from
         // the very first event. If the guard were armed after SLPS, a
@@ -414,6 +422,24 @@ class Window {
     /// The CGWindowID of the source app's focused window at the moment the
     /// AltTab session started — used so we can explicitly order the target
     /// above it when the level pin restores, avoiding a z-order flip.
+    /// Schedule repeated CGSOrderWindow(target, .above, source) calls for
+    /// ~1s post-focus. Each call is a direct window-server z-order write
+    /// at L0 — no flicker, no re-composition. Executed on the utility
+    /// queue so main thread stays responsive. Generation counter lets
+    /// us abort if the user AltTabs again mid-fight.
+    private func scheduleZOrderFightLoop(targetWid: CGWindowID, sourceWid: CGWindowID?) {
+        guard let sourceWid else { return }
+        Windows.parallelsTransitionGeneration &+= 1
+        let myGen = Windows.parallelsTransitionGeneration
+        let ticks = [30, 80, 150, 250, 400, 600, 850, 1200]
+        for delayMs in ticks {
+            DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + .milliseconds(delayMs)) {
+                guard Windows.parallelsTransitionGeneration == myGen else { return }
+                CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, sourceWid)
+            }
+        }
+    }
+
     private func previouslyFrontmostWindowId() -> CGWindowID? {
         guard let sourcePid = App.sessionSourcePid ?? Applications.frontmostPid,
               sourcePid != application.pid,
