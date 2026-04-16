@@ -97,6 +97,19 @@ class Windows {
               let target = altTabFocusTarget else { return false }
         return window !== target
     }
+
+    /// Same guard semantics as `shouldSuppressFocusOrderUpdate` but
+    /// checks app-level (for `kAXApplicationActivatedNotification`
+    /// events). Returns true if a Parallels-transition guard is armed
+    /// and the activating app isn't the target's app — used to prevent
+    /// macOS's transient activation of an unrelated app between source
+    /// deactivating and target activating from flipping
+    /// `Applications.frontmostPid` to that unrelated app.
+    static func shouldSuppressApplicationActivation(for app: Application) -> Bool {
+        guard CFAbsoluteTimeGetCurrent() < altTabFocusTargetUntil,
+              let target = altTabFocusTarget else { return false }
+        return target.application.pid != app.pid
+    }
     private static var lastWindowActivityType = WindowActivityType.none
     static var searchQuery = ""
     private static var shouldSelectBestMatchOnSearchChange = false

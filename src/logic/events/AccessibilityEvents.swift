@@ -53,6 +53,15 @@ class AccessibilityEvents {
     }
 
     private static func applicationActivated(_ app: Application, _ pid: pid_t, _ type: String, _ appFocusedWindow: AXUIElement?, _ wid: CGWindowID?) {
+        // During an AltTab-initiated Parallels transition, macOS can
+        // briefly activate a DIFFERENT app between source deactivating
+        // and target activating (the activation history pops whatever
+        // was previously active). That transient event would flip
+        // `frontmostPid` to an unrelated app, which pollutes the next
+        // AltTab session's source-capture and promotes the wrong window
+        // into position 1. Skip frontmostPid/hasBeenActiveOnce updates
+        // for any app other than the target during the guard window.
+        if Windows.shouldSuppressApplicationActivation(for: app) { return }
         Applications.frontmostPid = pid
         if app.hasBeenActiveOnce != true {
             app.hasBeenActiveOnce = true
