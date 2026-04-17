@@ -302,7 +302,7 @@ class Window {
         Diagnostics.log("FOCUS", "enter focusMacOsWindowOverParallelsCoherence target=\(debugId ?? "?")")
         Diagnostics.logFrontmostSignals("before Par→mac")
         guard let targetWid = cgWindowId else { return }
-        scheduleZOrderFightLoop(targetWid: targetWid, sourceWid: previouslyFrontmostWindowId())
+        scheduleDelayedReRaise(targetWid: targetWid)
         Windows.armAltTabFocusGuard(for: self)
         let sourceWid = previouslyFrontmostWindowId()
         CGSDisableUpdate(CGS_CONNECTION)
@@ -418,20 +418,33 @@ class Window {
     /// The CGWindowID of the source app's focused window at the moment the
     /// AltTab session started — used so we can explicitly order the target
     /// above it when the level pin restores, avoiding a z-order flip.
-    /// Log diagnostic: is target on the active Space / visible? If not,
-    /// this tells us the issue is Space-membership, not z-order.
-    private func scheduleZOrderFightLoop(targetWid: CGWindowID, sourceWid: CGWindowID?) {
-        // CGSOrderWindow cross-process returns kCGErrorIllegalArgument
-        // (1000) consistently — Apple locked this down. No fight loop
-        // can work via direct z-order manipulation. We rely on SLPS +
-        // makeKeyWindow + AX raise (stock path) for z-order.
-        //
-        // Instead, log the target's Space-membership so we can see if
-        // the failure mode is "target is on different Space".
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(100)) {
-            let spaces = (CGSCopySpacesForWindows(CGS_CONNECTION, CGSSpaceMask.all.rawValue, [targetWid] as CFArray) as? [UInt64]) ?? []
-            let visibleSpaces = (Spaces.visibleSpaces.map { UInt64($0) })
-            Diagnostics.log("SPACE", "target=\(targetWid) inSpaces=\(spaces) visibleSpaces=\(visibleSpaces) onActive=\(spaces.contains(where: { visibleSpaces.contains($0) }))")
+    /// Parallels has a timer that re-activates its Coherence window
+    /// ~800-1500ms after any focus transition. Our initial SLPS +
+    /// makeKeyWindow + AX raise at t=0 succeeds immediately but gets
+    /// overridden when Parallels' timer fires. CGSSetWindowLevel and
+    /// CGSOrderWindow are both no-ops for cross-process windows (the
+    /// level-pin was a database-only change, not compositor-enforced).
+    ///
+    /// Schedule a SECOND full focus attempt (SLPS + makeKeyWindow + AX
+    /// raise) at ~1500ms, timed to land right after Parallels' re-
+    /// activation settles. If Parallels only fires once, our second
+    /// attempt wins permanently.
+    private func scheduleDelayedReRaise(targetWid: CGWindowID) {
+        Windows.parallelsTransitionGeneration &+= 1
+        let myGen = Windows.parallelsTransitionGeneration
+        for delayMs in [1200, 2000] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
+                guard let self, Windows.parallelsTransitionGeneration == myGen else { return }
+                var psn = ProcessSerialNumber()
+                GetProcessForPID(self.application.pid, &psn)
+                _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
+                self.makeKeyWindow(&psn)
+                BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+                    guard let self else { return }
+                    try? self.axUiElement?.focusWindow()
+                    Diagnostics.log("RERAISE", "+\(delayMs)ms re-raised target=\(self.debugId ?? "?")")
+                }
+            }
         }
     }
 
