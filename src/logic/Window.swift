@@ -544,7 +544,7 @@ class Window {
     }
 
     /// The following function was ported from https://github.com/Hammerspoon/hammerspoon/issues/370#issuecomment-545545468
-    private func makeKeyWindow(_ psn: inout ProcessSerialNumber) -> Void {
+    func makeKeyWindow(_ psn: inout ProcessSerialNumber) -> Void {
         var bytes = [UInt8](repeating: 0, count: 0xf8)
         bytes[0x04] = 0xf8
         bytes[0x3a] = 0x10

@@ -70,6 +70,7 @@ class Windows {
     static func armAltTabFocusGuard(for target: Window) {
         altTabFocusTarget = target
         altTabFocusTargetUntil = CFAbsoluteTimeGetCurrent() + altTabFocusGuardMs / 1000.0
+        counterRaiseCount = 0
     }
 
     /// Clear the guard at the start of each new focus() call so a 2-second
@@ -99,14 +100,39 @@ class Windows {
     /// Same guard semantics as `shouldSuppressFocusOrderUpdate` but
     /// checks app-level (for `kAXApplicationActivatedNotification`
     /// events). Returns true if a Parallels-transition guard is armed
-    /// and the activating app isn't the target's app — used to prevent
-    /// macOS's transient activation of an unrelated app between source
-    /// deactivating and target activating from flipping
-    /// `Applications.frontmostPid` to that unrelated app.
+    /// and the activating app isn't the target's app.
+    ///
+    /// EVENT-DRIVEN COUNTER-RAISE: when this returns true, we also
+    /// schedule an immediate re-raise of the target. This way,
+    /// Parallels' timer-driven self-activation (which fires ~1s after
+    /// our focus) is countered the moment it's detected — no timing
+    /// guesswork needed. The re-raise runs on the background AX queue
+    /// so AX IPC can't freeze main thread.
+    static var counterRaiseCount = 0
+    static let maxCounterRaises = 3
+
     static func shouldSuppressApplicationActivation(for app: Application) -> Bool {
         guard CFAbsoluteTimeGetCurrent() < altTabFocusTargetUntil,
               let target = altTabFocusTarget else { return false }
-        return target.application.pid != app.pid
+        guard target.application.pid != app.pid else { return false }
+        // Counter-raise: Parallels just stole front — take it back.
+        if counterRaiseCount < maxCounterRaises {
+            counterRaiseCount += 1
+            let targetWid = target.cgWindowId
+            let targetPid = target.application.pid
+            Diagnostics.log("COUNTER", "Parallels stole front (attempt \(counterRaiseCount)/\(maxCounterRaises)), counter-raising \(target.debugId ?? "?")")
+            var psn = ProcessSerialNumber()
+            GetProcessForPID(targetPid, &psn)
+            if let wid = targetWid {
+                _SLPSSetFrontProcessWithOptions(&psn, wid, SLPSMode.userGenerated.rawValue)
+                target.makeKeyWindow(&psn)
+            }
+            BackgroundWork.accessibilityCommandsQueue.addOperation { [weak target] in
+                guard let target else { return }
+                try? target.axUiElement?.focusWindow()
+            }
+        }
+        return true
     }
     private static var lastWindowActivityType = WindowActivityType.none
     static var searchQuery = ""
