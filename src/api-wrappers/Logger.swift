@@ -249,11 +249,6 @@ class FocusOverlay {
             Diagnostics.log("OVERLAY", "no cached thumbnail for \(window.debugId ?? "?")")
             return
         }
-        // Verify thumbnail is actually a CGImage (not IOSurface etc.)
-        guard CFGetTypeID(thumbnail as CFTypeRef) == CGImage.typeID else {
-            Diagnostics.log("OVERLAY", "thumbnail not CGImage for \(window.debugId ?? "?")")
-            return
-        }
         // Convert from CG coordinates (top-left origin) to Cocoa (bottom-left)
         let screenHeight = NSScreen.screens.first?.frame.height ?? 0
         let frame = NSRect(x: position.x, y: screenHeight - position.y - size.height,
@@ -274,11 +269,15 @@ class FocusOverlay {
         panel.animationBehavior = .none
         panel.collectionBehavior = .canJoinAllSpaces
 
-        let imageView = NSImageView(frame: NSRect(origin: .zero, size: frame.size))
-        let cgImage = unsafeBitCast(thumbnail, to: CGImage.self)
-        imageView.image = NSImage(cgImage: cgImage, size: frame.size)
-        imageView.imageScaling = .scaleAxesIndependently
-        panel.contentView = imageView
+        // Use CALayer.contents which natively accepts BOTH CGImage AND
+        // IOSurface (modern macOS stores thumbnails as IOSurface, not
+        // CGImage). No type conversion needed.
+        let layerView = NSView(frame: NSRect(origin: .zero, size: frame.size))
+        layerView.wantsLayer = true
+        layerView.layer = CALayer()
+        layerView.layer?.contents = thumbnail
+        layerView.layer?.contentsGravity = .resizeAspectFill
+        panel.contentView = layerView
 
         panel.orderFrontRegardless()
         overlayWindow = panel

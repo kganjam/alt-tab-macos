@@ -440,7 +440,7 @@ class Window {
     private func scheduleDelayedReRaise(targetWid: CGWindowID) {
         Windows.parallelsTransitionGeneration &+= 1
         let myGen = Windows.parallelsTransitionGeneration
-        for delayMs in [1200, 2000] {
+        for delayMs in [600, 1000, 1500] {
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
                 guard let self, Windows.parallelsTransitionGeneration == myGen else { return }
                 var psn = ProcessSerialNumber()
