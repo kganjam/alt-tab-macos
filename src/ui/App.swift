@@ -308,7 +308,7 @@ class App: AppCenterApplication {
                (sourceApp.isParallelsCoherence || window.isParallelsCoherenceWindow),
                let sourceWindow = sourceApp.focusedWindow,
                sourceWindow !== window {
-                FocusOverlay.show(over: sourceWindow, duration: 0.8)
+                FocusOverlay.show(over: sourceWindow, duration: 5.0)
             }
         }
         hideUi(true)
@@ -507,6 +507,11 @@ extension App: NSApplicationDelegate {
         Logger.info { "Launching AltTab \(App.version)" }
         Diagnostics.log("INIT", "AltTab \(App.version) launched (custom build with diagnostics)")
         Diagnostics.startContinuousMonitoring()
+        FocusOverlay.createPersistentOverlay()
+        // Permanent test overlay — REMOVE after testing
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            Diagnostics.showTestOverlay()
+        }
         #if DEBUG
         UserDefaults.standard.set(true, forKey: "NSConstraintBasedLayoutVisualizeMutuallyExclusiveConstraints")
         #endif

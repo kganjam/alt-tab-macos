@@ -449,10 +449,8 @@ class Window {
                     guard let self else { return }
                     try? self.axUiElement?.focusWindow()
                     Diagnostics.log("RERAISE", "+\(delayMs)ms re-raised target=\(self.debugId ?? "?")")
-                    // Dismiss overlay as soon as target is confirmed frontmost
-                    if NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPid {
-                        DispatchQueue.main.async { FocusOverlay.dismiss() }
-                    }
+                    // Don't dismiss overlay early — let it live for full
+                    // duration to prevent any late Parallels re-raise flash.
                 }
             }
         }

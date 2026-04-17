@@ -178,6 +178,39 @@ class Diagnostics {
         log("FRONT", "\(label): nsw=\(nsWorkspace?.description ?? "nil") atFront=\(atFront?.description ?? "nil") sessionWid=\(App.sessionSourceWid?.description ?? "nil") prevWid=\(App.previousSessionSourceWid?.description ?? "nil") lastTargetWid=\(App.lastFocusedTargetWid?.description ?? "nil") targetActualLevel=\(targetLevel)")
     }
 
+    /// Permanent test overlay — a bright red box pinned at max level.
+    /// If this stays above Parallels windows, the overlay approach works
+    /// and the issue is positioning/timing. If Parallels draws OVER this,
+    /// Parallels uses a compositor path that bypasses NSWindow levels.
+    /// Toggle: defaults write com.lwouis.alt-tab-macos testOverlay -bool true/false
+    static func showTestOverlay() {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 100, y: 100, width: 300, height: 200),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
+        panel.level = .init(rawValue: 2147483631)
+        panel.backgroundColor = .red.withAlphaComponent(0.8)
+        panel.isOpaque = false
+        panel.ignoresMouseEvents = true
+        panel.animationBehavior = .none
+        panel.collectionBehavior = .canJoinAllSpaces
+        panel.title = "AltTab Test Overlay"
+
+        let label = NSTextField(labelWithString: "AltTab Test Overlay\nLevel: 2147483631\nShould stay on top of everything")
+        label.frame = NSRect(x: 20, y: 60, width: 260, height: 80)
+        label.textColor = .white
+        label.font = .systemFont(ofSize: 16, weight: .bold)
+        label.maximumNumberOfLines = 3
+        panel.contentView?.addSubview(label)
+
+        panel.orderFrontRegardless()
+        log("TEST", "permanent test overlay shown at level 2147483631")
+    }
+
     static func startContinuousMonitoring() {
         guard enabled else { return }
         // Default: OFF. Monitor only runs when explicitly enabled with
@@ -230,40 +263,28 @@ class Diagnostics {
 class FocusOverlay {
     private static let enabledKey = "focusOverlayEnabled"
     private static var overlayWindow: NSPanel?
-    private static let overlayLevel: NSWindow.Level = .init(rawValue: 102) // kCGOverlayWindowLevel
+    private static let overlayLevel: NSWindow.Level = .init(rawValue: 2147483631) // just below cursor level — absolute max
 
     static var enabled: Bool {
         if UserDefaults.standard.object(forKey: enabledKey) == nil { return true }
         return UserDefaults.standard.bool(forKey: enabledKey)
     }
 
-    /// Show the overlay using the Window's CACHED thumbnail from the
-    /// switcher (already in memory) + its known position/size. No
-    /// CGWindowListCreateImage or CGWindowListCopyWindowInfo needed —
-    /// those were taking 1200ms+ and defeating the purpose of the overlay.
-    static func show(over window: Window, duration: TimeInterval = 2.0) {
-        guard enabled else { return }
-        dismiss()
-        guard let position = window.position, let size = window.size,
-              let thumbnail = window.thumbnail else {
-            Diagnostics.log("OVERLAY", "no cached thumbnail for \(window.debugId ?? "?")")
-            return
-        }
-        // Cover the SOURCE window's frame. For Par→mac this hides OneNote
-        // so Parallels' re-raise is invisible. Terminal stays uncovered.
-        let screenHeight = NSScreen.screens.first?.frame.height ?? 0
-        let frame = NSRect(x: position.x, y: screenHeight - position.y - size.height,
-                           width: size.width, height: size.height)
+    /// Persistent overlay panel — created ONCE at launch (like the test
+    /// overlay that proved it works), repositioned and shown/hidden per
+    /// transition. Avoids the panel-creation gap that let OneNote flash.
+    private static var persistentPanel: NSPanel?
 
+    /// Call once at launch to create the persistent overlay panel.
+    static func createPersistentOverlay() {
         let panel = NSPanel(
-            contentRect: frame,
+            contentRect: .zero,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
         panel.isFloatingPanel = true
-        panel.hidesOnDeactivate = false  // CRITICAL: without this, the overlay
-        // hides when AltTab deactivates (hideUi), exposing OneNote underneath
+        panel.hidesOnDeactivate = false
         panel.level = overlayLevel
         panel.backgroundColor = .clear
         panel.isOpaque = false
@@ -271,26 +292,37 @@ class FocusOverlay {
         panel.ignoresMouseEvents = true
         panel.animationBehavior = .none
         panel.collectionBehavior = .canJoinAllSpaces
-
-        // Show the source window's cached thumbnail (so it looks like
-        // OneNote is still there, but actually it's our overlay covering
-        // it at L102). When Parallels re-raises OneNote, it appears
-        // "under" our overlay — invisible to the user.
-        let layerView = NSView(frame: NSRect(origin: .zero, size: frame.size))
+        let layerView = NSView()
         layerView.wantsLayer = true
         layerView.layer = CALayer()
-        layerView.layer?.contents = thumbnail
         layerView.layer?.contentsGravity = .resizeAspectFill
         panel.contentView = layerView
+        persistentPanel = panel
+        Diagnostics.log("OVERLAY", "persistent panel created at level \(overlayLevel.rawValue)")
+    }
 
+    /// Reposition + update thumbnail + show the persistent overlay.
+    static func show(over window: Window, duration: TimeInterval = 2.0) {
+        guard enabled, let panel = persistentPanel else { return }
+        guard let position = window.position, let size = window.size else {
+            Diagnostics.log("OVERLAY", "no position/size for \(window.debugId ?? "?")")
+            return
+        }
+        let screenHeight = NSScreen.screens.first?.frame.height ?? 0
+        let frame = NSRect(x: position.x, y: screenHeight - position.y - size.height,
+                           width: size.width, height: size.height)
+
+        // Update frame + thumbnail on the existing panel (no creation)
+        panel.setFrame(frame, display: false)
+        if let layerView = panel.contentView {
+            layerView.frame = NSRect(origin: .zero, size: frame.size)
+            layerView.layer?.contents = window.thumbnail
+            layerView.layer?.frame = CGRect(origin: .zero, size: frame.size)
+        }
         panel.orderFrontRegardless()
-        // Force immediate render so there's no 1-frame gap between
-        // AltTab's panel dismissing and our overlay painting. Without
-        // this, the compositor may paint one frame where neither the
-        // overlay nor the switcher panel is visible — showing OneNote.
         CATransaction.flush()
         overlayWindow = panel
-        Diagnostics.log("OVERLAY", "shown (cached) \(window.debugId ?? "?") for \(duration)s")
+        Diagnostics.log("OVERLAY", "shown (persistent) \(window.debugId ?? "?") for \(duration)s")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
             dismiss()
@@ -298,8 +330,8 @@ class FocusOverlay {
     }
 
     static func dismiss() {
-        guard let panel = overlayWindow else { return }
-        panel.orderOut(nil)
+        // Don't destroy — just hide. Panel stays for next use.
+        persistentPanel?.orderOut(nil)
         overlayWindow = nil
     }
 }
