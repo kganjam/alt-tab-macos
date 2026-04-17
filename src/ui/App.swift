@@ -410,6 +410,13 @@ class App: AppCenterApplication {
             }
             if !Windows.updatesBeforeShowing() { hideUi(); return }
             Windows.setInitialSelectedAndHoveredWindowIndex()
+            // Pre-capture the default-selected window's sharp image NOW
+            // (while switcher is rendering). By release time it's ready.
+            if let selected = Windows.selectedWindow(),
+               let wid = selected.cgWindowId,
+               let pos = selected.position, let sz = selected.size {
+                FocusOverlay.preCapture(wid: wid, position: pos, size: sz)
+            }
             if Preferences.windowDisplayDelay == DispatchTimeInterval.milliseconds(0) {
                 buildUiAndShowPanel()
             } else {

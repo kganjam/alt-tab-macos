@@ -275,6 +275,27 @@ class FocusOverlay {
     /// transition. Avoids the panel-creation gap that let OneNote flash.
     private static var persistentPanel: NSPanel?
 
+    /// Pre-captured sharp image, ready for instant display on release.
+    static var preCapturedImage: CGImage?
+    static var preCapturedWid: CGWindowID?
+
+    /// Start capturing the target window on a background thread NOW
+    /// (while switcher is showing). By release time, it's ready.
+    static func preCapture(wid: CGWindowID, position: CGPoint, size: CGSize) {
+        preCapturedImage = nil
+        preCapturedWid = wid
+        DispatchQueue.global(qos: .userInteractive).async {
+            let t0 = CACurrentMediaTime()
+            let rect = CGRect(x: position.x, y: position.y, width: size.width, height: size.height)
+            if let img = CGWindowListCreateImage(rect, .optionIncludingWindow, wid, [.boundsIgnoreFraming, .nominalResolution]) {
+                let ms = Int((CACurrentMediaTime() - t0) * 1000)
+                Diagnostics.log("OVERLAY", "pre-captured wid=\(wid) \(img.width)x\(img.height) in \(ms)ms")
+                preCapturedImage = img
+                preCapturedWid = wid
+            }
+        }
+    }
+
     /// Call once at launch to create the persistent overlay panel.
     static func createPersistentOverlay() {
         let panel = NSPanel(
@@ -322,21 +343,26 @@ class FocusOverlay {
         containerView.layer?.sublayers?.forEach { $0.removeFromSuperlayer() }
         containerView.subviews.forEach { $0.removeFromSuperview() }
 
-        // CALayerContents is AltTab's custom enum:
-        //   .cgImage(CGImage?) or .pixelBuffer(CVPixelBuffer?)
+        // Use pre-captured sharp image if available (captured while
+        // switcher was showing). Otherwise fall back to thumbnail.
         var rendered = false
-        if let thumbnail = target.thumbnail {
-            let overlayT0 = CACurrentMediaTime()
+        if let wid = target.cgWindowId,
+           preCapturedWid == wid,
+           let sharp = preCapturedImage {
+            let imageView = NSImageView(frame: NSRect(origin: .zero, size: frame.size))
+            imageView.image = NSImage(cgImage: sharp, size: frame.size)
+            imageView.imageScaling = .scaleAxesIndependently
+            containerView.addSubview(imageView)
+            rendered = true
+            Diagnostics.log("OVERLAY", "using pre-captured sharp \(sharp.width)x\(sharp.height)")
+        }
+        if !rendered, let thumbnail = target.thumbnail {
             var cgImage: CGImage? = nil
             switch thumbnail {
-            case .cgImage(let img):
-                cgImage = img
-                Diagnostics.log("OVERLAY", "thumbnail is CGImage \(img != nil ? "\(img!.width)x\(img!.height)" : "nil")")
+            case .cgImage(let img): cgImage = img
             case .pixelBuffer(let buf):
                 if let buf {
-                    let ciImage = CIImage(cvPixelBuffer: buf)
-                    cgImage = CIContext().createCGImage(ciImage, from: ciImage.extent)
-                    Diagnostics.log("OVERLAY", "pixelBuffer→CGImage in \(Int((CACurrentMediaTime() - overlayT0) * 1000))ms")
+                    cgImage = CIContext().createCGImage(CIImage(cvPixelBuffer: buf), from: CIImage(cvPixelBuffer: buf).extent)
                 }
             }
             if let cgImage {
@@ -345,12 +371,15 @@ class FocusOverlay {
                 imageView.imageScaling = .scaleAxesIndependently
                 containerView.addSubview(imageView)
                 rendered = true
+                Diagnostics.log("OVERLAY", "using thumbnail (blurry)")
             }
         }
         if !rendered {
             containerView.layer?.backgroundColor = NSColor.blue.withAlphaComponent(0.7).cgColor
-            Diagnostics.log("OVERLAY", "fallback blue for \(target.debugId ?? "?")")
+            Diagnostics.log("OVERLAY", "fallback blue")
         }
+        preCapturedImage = nil
+        preCapturedWid = nil
 
         panel.orderFrontRegardless()
         CATransaction.flush()
