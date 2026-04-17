@@ -343,27 +343,39 @@ class FocusOverlay {
         containerView.layer?.sublayers?.forEach { $0.removeFromSuperlayer() }
         containerView.subviews.forEach { $0.removeFromSuperview() }
 
-        // Use pre-captured sharp image if available (captured while
-        // switcher was showing). Otherwise fall back to thumbnail.
+        // Try CALayerHost for LIVE window mirroring (private API).
+        // Full resolution, real-time updates, zero capture latency.
         var rendered = false
         if let wid = target.cgWindowId,
-           preCapturedWid == wid,
-           let sharp = preCapturedImage {
-            let imageView = NSImageView(frame: NSRect(origin: .zero, size: frame.size))
-            imageView.image = NSImage(cgImage: sharp, size: frame.size)
-            imageView.imageScaling = .scaleAxesIndependently
-            containerView.addSubview(imageView)
-            rendered = true
-            Diagnostics.log("OVERLAY", "using pre-captured sharp \(sharp.width)x\(sharp.height)")
+           let layerHostClass = NSClassFromString("CALayerHost") as? CALayer.Type {
+            // Try to get the window's context ID from the window server
+            var ctxRef: CFTypeRef?
+            let err = CGSCopyWindowProperty(CGS_CONNECTION, wid, "CtxID" as CFString, &ctxRef)
+            if err == .success, let ctxNum = ctxRef as? NSNumber {
+                let contextId = ctxNum.uint32Value
+                let hostLayer = layerHostClass.init()
+                hostLayer.setValue(NSNumber(value: contextId), forKey: "contextId")
+                hostLayer.frame = CGRect(origin: .zero, size: frame.size)
+                containerView.layer?.addSublayer(hostLayer)
+                rendered = true
+                Diagnostics.log("OVERLAY", "CALayerHost LIVE mirror contextId=\(contextId) for wid=\(wid)")
+            } else {
+                Diagnostics.log("OVERLAY", "CGSGetWindowProperty CtxID failed err=\(err.rawValue) ctxRef=\(ctxRef as Any)")
+            }
         }
-        if !rendered, let thumbnail = target.thumbnail {
+        // Fallback: pre-captured sharp or thumbnail
+        if !rendered {
             var cgImage: CGImage? = nil
-            switch thumbnail {
-            case .cgImage(let img): cgImage = img
-            case .pixelBuffer(let buf):
-                if let buf {
-                    cgImage = CIContext().createCGImage(CIImage(cvPixelBuffer: buf), from: CIImage(cvPixelBuffer: buf).extent)
+            if let wid = target.cgWindowId, preCapturedWid == wid, let sharp = preCapturedImage {
+                cgImage = sharp
+                Diagnostics.log("OVERLAY", "fallback: pre-captured sharp")
+            } else if let thumbnail = target.thumbnail {
+                switch thumbnail {
+                case .cgImage(let img): cgImage = img
+                case .pixelBuffer(let buf):
+                    if let buf { cgImage = CIContext().createCGImage(CIImage(cvPixelBuffer: buf), from: CIImage(cvPixelBuffer: buf).extent) }
                 }
+                Diagnostics.log("OVERLAY", "fallback: thumbnail")
             }
             if let cgImage {
                 let imageView = NSImageView(frame: NSRect(origin: .zero, size: frame.size))
@@ -371,7 +383,6 @@ class FocusOverlay {
                 imageView.imageScaling = .scaleAxesIndependently
                 containerView.addSubview(imageView)
                 rendered = true
-                Diagnostics.log("OVERLAY", "using thumbnail (blurry)")
             }
         }
         if !rendered {
