@@ -223,6 +223,8 @@ class Window {
                 application.runningApplication.activate(options: .activateAllWindows)
             }
             Windows.previewSelectedWindowIfNeeded()
+        } else if isParallelsCoherenceWindow && isSameProcessAsCurrentFrontmost() {
+            focusParallelsCoherenceWindowSameProcess()
         } else if isParallelsCoherenceWindow {
             focusParallelsCoherenceWindow()
         } else if isOutboundFromParallelsCoherence() {
@@ -567,12 +569,38 @@ class Window {
         }
     }
 
-    /// Focus path for Parallels Coherence windows (macOS → Coherence or
-    /// Coherence → Coherence). Avoids the SLPS path (`makeKeyWindow`
-    /// synthetic events) which can cause flicker even when Parallels is the
-    /// target. Wrap the pin+activate in a window-server compositing pause
-    /// so the two changes land as one atomic frame, eliminating the
-    /// intermediate-frame flicker visible when they happen in sequence.
+    /// True if the target window's app is already the frontmost process.
+    /// Used to take a lighter-weight focus path for Par→Par (same OneNote
+    /// process). When the app is already front, we don't need SLPS/
+    /// makeKeyWindow/activate — just AX to change the key window.
+    private func isSameProcessAsCurrentFrontmost() -> Bool {
+        application.pid == Applications.frontmostPid
+    }
+
+    /// Par→Par SAME PROCESS. Both source and target are Coherence windows
+    /// in the same prl_client_app (e.g. two OneNote notebooks). The app
+    /// is already frontmost. Using the full SLPS + makeKeyWindow +
+    /// activate bombardment triggers 4+ Parallels render passes (each
+    /// signal tells Parallels to re-draw focus state). Instead, just use
+    /// AX: set the app's focused window attribute to the target and raise
+    /// it. This is one signal → one Parallels render → minimal flicker.
+    private func focusParallelsCoherenceWindowSameProcess() {
+        Diagnostics.log("FOCUS", "enter focusParallelsCoherenceWindowSameProcess target=\(debugId ?? "?")")
+        manuallyUpdateFocusOrderForParallelsTransition()
+        BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+            guard let self, let appAx = self.application.axUiElement,
+                  let selfAx = self.axUiElement else { return }
+            try? appAx.setAttribute(kAXFocusedWindowAttribute, selfAx)
+            try? selfAx.focusWindow()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
+            Windows.previewSelectedWindowIfNeeded()
+        }
+    }
+
+    /// mac→Par CROSS PROCESS. Target is a Parallels Coherence window but
+    /// the source is a different app. Need full SLPS + makeKeyWindow to
+    /// activate the Parallels process and signal keyboard forwarding.
     private func focusParallelsCoherenceWindow() {
         atomicallyPinAndActivate()
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(60)) { [weak self] in
