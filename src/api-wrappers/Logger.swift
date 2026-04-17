@@ -322,27 +322,24 @@ class FocusOverlay {
         containerView.layer?.sublayers?.forEach { $0.removeFromSuperlayer() }
         containerView.subviews.forEach { $0.removeFromSuperview() }
 
-        // Try to convert IOSurface thumbnail to CGImage via Core Image
-        let t0 = CACurrentMediaTime()
+        // CALayerContents is AltTab's custom enum:
+        //   .cgImage(CGImage?) or .pixelBuffer(CVPixelBuffer?)
         var rendered = false
         if let thumbnail = target.thumbnail {
-            let ciContext = CIContext()
-            // IOSurface path — CALayerContents (Any) wraps an IOSurfaceRef
-            if let surface = (thumbnail as AnyObject) as? IOSurface {
-                let ciImage = CIImage(ioSurface: surface)
-                if let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) {
-                    let convertMs = Int((CACurrentMediaTime() - t0) * 1000)
-                    Diagnostics.log("OVERLAY", "IOSurface→CGImage in \(convertMs)ms (\(cgImage.width)x\(cgImage.height))")
-                    let imageView = NSImageView(frame: NSRect(origin: .zero, size: frame.size))
-                    imageView.image = NSImage(cgImage: cgImage, size: frame.size)
-                    imageView.imageScaling = .scaleAxesIndependently
-                    containerView.addSubview(imageView)
-                    rendered = true
+            let overlayT0 = CACurrentMediaTime()
+            var cgImage: CGImage? = nil
+            switch thumbnail {
+            case .cgImage(let img):
+                cgImage = img
+                Diagnostics.log("OVERLAY", "thumbnail is CGImage \(img != nil ? "\(img!.width)x\(img!.height)" : "nil")")
+            case .pixelBuffer(let buf):
+                if let buf {
+                    let ciImage = CIImage(cvPixelBuffer: buf)
+                    cgImage = CIContext().createCGImage(ciImage, from: ciImage.extent)
+                    Diagnostics.log("OVERLAY", "pixelBuffer→CGImage in \(Int((CACurrentMediaTime() - overlayT0) * 1000))ms")
                 }
             }
-            // CGImage path (fallback)
-            if !rendered, CFGetTypeID(thumbnail as CFTypeRef) == CGImage.typeID {
-                let cgImage = unsafeBitCast(thumbnail, to: CGImage.self)
+            if let cgImage {
                 let imageView = NSImageView(frame: NSRect(origin: .zero, size: frame.size))
                 imageView.image = NSImage(cgImage: cgImage, size: frame.size)
                 imageView.imageScaling = .scaleAxesIndependently
@@ -351,7 +348,6 @@ class FocusOverlay {
             }
         }
         if !rendered {
-            // Fallback: blue rectangle
             containerView.layer?.backgroundColor = NSColor.blue.withAlphaComponent(0.7).cgColor
             Diagnostics.log("OVERLAY", "fallback blue for \(target.debugId ?? "?")")
         }
