@@ -303,47 +303,63 @@ class FocusOverlay {
 
     private static var panelPool: [NSPanel] = []
 
-    /// Full-screen opaque overlay with a HOLE cut where the target is.
-    /// OneNote areas are covered (black). Terminal area is transparent
-    /// (shows through naturally). Uses CAShapeLayer with even-odd fill.
-    static func showWithHole(target: Window, covering parWindows: [Window], duration: TimeInterval) {
+    /// Show the TARGET window's content on the overlay at max level.
+    /// This keeps Terminal visible regardless of what Parallels does.
+    /// Converts IOSurface thumbnail to CGImage via CIContext (GPU path).
+    static func showTarget(_ target: Window, duration: TimeInterval = 1.5) {
         guard enabled, let panel = persistentPanel else { return }
-        let screen = NSScreen.main ?? NSScreen.screens.first!
-        let screenFrame = screen.frame
-        let screenHeight = screenFrame.height
+        guard let pos = target.position, let sz = target.size else { return }
 
-        panel.setFrame(screenFrame, display: false)
-        panel.backgroundColor = .black
+        let screenHeight = NSScreen.screens.first?.frame.height ?? 0
+        let frame = NSRect(x: pos.x, y: screenHeight - pos.y - sz.height,
+                           width: sz.width, height: sz.height)
+        panel.setFrame(frame, display: false)
+        panel.backgroundColor = .clear
 
         guard let containerView = panel.contentView else { return }
-        containerView.frame = NSRect(origin: .zero, size: screenFrame.size)
-        containerView.wantsLayer = true
-        // Remove old mask
+        containerView.frame = NSRect(origin: .zero, size: frame.size)
         containerView.layer?.mask = nil
         containerView.layer?.sublayers?.forEach { $0.removeFromSuperlayer() }
+        containerView.subviews.forEach { $0.removeFromSuperview() }
 
-        // Cut a hole where the target window is using even-odd fill
-        if let pos = target.position, let sz = target.size {
-            let maskLayer = CAShapeLayer()
-            let path = CGMutablePath()
-            // Fill the entire screen
-            path.addRect(CGRect(origin: .zero, size: screenFrame.size))
-            // Cut a hole at the target's position (even-odd makes this transparent)
-            let holeRect = CGRect(
-                x: pos.x - screenFrame.origin.x,
-                y: screenHeight - pos.y - sz.height - screenFrame.origin.y,
-                width: sz.width, height: sz.height)
-            path.addRect(holeRect)
-            maskLayer.path = path
-            maskLayer.fillRule = .evenOdd
-            containerView.layer?.mask = maskLayer
-            Diagnostics.log("OVERLAY", "hole at \(holeRect) for target=\(target.debugId ?? "?")")
+        // Try to convert IOSurface thumbnail to CGImage via Core Image
+        let t0 = CACurrentMediaTime()
+        var rendered = false
+        if let thumbnail = target.thumbnail {
+            let ciContext = CIContext()
+            // IOSurface path — CALayerContents (Any) wraps an IOSurfaceRef
+            if let surface = (thumbnail as AnyObject) as? IOSurface {
+                let ciImage = CIImage(ioSurface: surface)
+                if let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) {
+                    let convertMs = Int((CACurrentMediaTime() - t0) * 1000)
+                    Diagnostics.log("OVERLAY", "IOSurface→CGImage in \(convertMs)ms (\(cgImage.width)x\(cgImage.height))")
+                    let imageView = NSImageView(frame: NSRect(origin: .zero, size: frame.size))
+                    imageView.image = NSImage(cgImage: cgImage, size: frame.size)
+                    imageView.imageScaling = .scaleAxesIndependently
+                    containerView.addSubview(imageView)
+                    rendered = true
+                }
+            }
+            // CGImage path (fallback)
+            if !rendered, CFGetTypeID(thumbnail as CFTypeRef) == CGImage.typeID {
+                let cgImage = unsafeBitCast(thumbnail, to: CGImage.self)
+                let imageView = NSImageView(frame: NSRect(origin: .zero, size: frame.size))
+                imageView.image = NSImage(cgImage: cgImage, size: frame.size)
+                imageView.imageScaling = .scaleAxesIndependently
+                containerView.addSubview(imageView)
+                rendered = true
+            }
+        }
+        if !rendered {
+            // Fallback: blue rectangle
+            containerView.layer?.backgroundColor = NSColor.blue.withAlphaComponent(0.7).cgColor
+            Diagnostics.log("OVERLAY", "fallback blue for \(target.debugId ?? "?")")
         }
 
         panel.orderFrontRegardless()
         CATransaction.flush()
         overlayWindow = panel
-        Diagnostics.log("OVERLAY", "shown with hole, covering \(parWindows.count) Par windows for \(duration)s")
+        Diagnostics.log("OVERLAY", "shown target=\(target.debugId ?? "?") for \(duration)s")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
             dismiss()
@@ -352,16 +368,16 @@ class FocusOverlay {
 
     static func showOverMultiple(_ windows: [Window], duration: TimeInterval = 2.0) {
         guard let first = windows.first else { return }
-        showWithHole(target: first, covering: Array(windows.dropFirst()), duration: duration)
+        showTarget(first, duration: duration)
     }
 
     static func show(over window: Window, duration: TimeInterval = 2.0) {
-        showOverMultiple([window], duration: duration)
+        showTarget(window, duration: duration)
     }
 
     static func dismiss() {
         persistentPanel?.orderOut(nil)
-        persistentPanel?.contentView?.layer?.mask = nil
+        persistentPanel?.contentView?.subviews.forEach { $0.removeFromSuperview() }
         overlayWindow = nil
     }
 }

@@ -296,15 +296,15 @@ class App: AppCenterApplication {
     static func focusSelectedWindow(_ selectedWindow: Window?) {
         guard appIsBeingUsed else { return } // already hidden
         Diagnostics.log("KEY", "release → focusSelectedWindow target=\(selectedWindow?.debugId ?? "nil")")
-        // Cover ALL Parallels Coherence windows with an opaque overlay
-        // that has a HOLE cut where the target window is, so Terminal
-        // renders naturally through the hole while OneNote is hidden.
+        // Show the TARGET window's cached content on an overlay at max
+        // level. Terminal stays visible regardless of Parallels' re-raise.
+        // IOSurface→CGImage conversion via CIContext (GPU, fast).
         if let window = selectedWindow {
-            let parWindows = Windows.list.filter {
+            let hasParSource = Windows.list.contains {
                 $0.application.isParallelsCoherence && $0 !== window
             }
-            if !parWindows.isEmpty {
-                FocusOverlay.showWithHole(target: window, covering: parWindows, duration: 1.5)
+            if hasParSource {
+                FocusOverlay.showTarget(window, duration: 1.5)
             }
         }
         hideUi(true)
