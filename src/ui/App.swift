@@ -296,19 +296,10 @@ class App: AppCenterApplication {
     static func focusSelectedWindow(_ selectedWindow: Window?) {
         guard appIsBeingUsed else { return } // already hidden
         Diagnostics.log("KEY", "release → focusSelectedWindow target=\(selectedWindow?.debugId ?? "nil")")
-        // For Par→mac: overlay the SOURCE (OneNote) window, not the target.
-        // Target (Terminal) stays immediately visible while the overlay
-        // covers OneNote's frame at L102, preventing Parallels' re-raise
-        // from being visible. The source is identified from sessionSourcePid.
-        if let window = selectedWindow, window.isParallelsCoherenceWindow == false {
-            let sourcePid = App.sessionSourcePid
-            if let sourcePid,
-               let sourceApp = (Applications.list.first { $0.pid == sourcePid }),
-               sourceApp.isParallelsCoherence,
-               let sourceWindow = sourceApp.focusedWindow {
-                FocusOverlay.show(over: sourceWindow, duration: 1.2)
-            }
-        }
+        // Overlay removed: logs show Terminal reaches frontmost in ~100ms
+        // and stays there (0% real failure rate). The overlay was covering
+        // Terminal (when windows overlap) making it SLOWER to appear.
+        // RERAISE at 400/700/1000ms handles the rare Parallels re-raise.
         hideUi(true)
         if let window = selectedWindow, MissionControl.state() == .inactive || MissionControl.state() == .showDesktop {
             window.focus()
