@@ -485,6 +485,12 @@ class Windows {
             return
         }
         updateSelectedAndHoveredWindowIndex(nextIndex)
+        // Pre-capture the newly selected window for the overlay
+        if let window = selectedWindow(),
+           let wid = window.cgWindowId,
+           let pos = window.position, let sz = window.size {
+            FocusOverlay.preCapture(wid: wid, position: pos, size: sz)
+        }
     }
 
     static func selectedWindowIndexAfterCycling(_ step: Int) -> Int {
