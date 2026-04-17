@@ -304,11 +304,8 @@ class Window {
         Diagnostics.log("FOCUS", "enter focusMacOsWindowOverParallelsCoherence target=\(debugId ?? "?")")
         Diagnostics.logFrontmostSignals("before Par→mac")
         guard let targetWid = cgWindowId else { return }
-        // Show an AltTab-owned overlay using the CACHED thumbnail from
-        // the switcher (already in memory — no expensive screenshot).
-        // Since we OWN this window, the compositor enforces our level
-        // at 102. Parallels' re-raise can't cover it.
-        FocusOverlay.show(over: self, duration: 2.0)
+        // Overlay already shown in focusSelectedWindow (before hideUi)
+        // to eliminate the frame gap between panel dismiss and overlay appear.
         scheduleDelayedReRaise(targetWid: targetWid)
         installWorkspaceActivationWatcher(targetWid: targetWid)
         Windows.armAltTabFocusGuard(for: self)

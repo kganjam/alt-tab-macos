@@ -296,6 +296,15 @@ class App: AppCenterApplication {
     static func focusSelectedWindow(_ selectedWindow: Window?) {
         guard appIsBeingUsed else { return } // already hidden
         Diagnostics.log("KEY", "release → focusSelectedWindow target=\(selectedWindow?.debugId ?? "nil")")
+        // Show overlay BEFORE hideUi so there's zero visual gap between
+        // AltTab's switcher panel disappearing and the overlay appearing.
+        // Only for Par→mac (isOutboundFromParallelsCoherence targets).
+        if let window = selectedWindow, window.isParallelsCoherenceWindow == false {
+            let sourcePid = App.sessionSourcePid
+            if let sourcePid, (Applications.list.first { $0.pid == sourcePid })?.isParallelsCoherence == true {
+                FocusOverlay.show(over: window, duration: 2.0)
+            }
+        }
         hideUi(true)
         if let window = selectedWindow, MissionControl.state() == .inactive || MissionControl.state() == .showDesktop {
             window.focus()

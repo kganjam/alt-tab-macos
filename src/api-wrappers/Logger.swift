@@ -280,6 +280,11 @@ class FocusOverlay {
         panel.contentView = layerView
 
         panel.orderFrontRegardless()
+        // Force immediate render so there's no 1-frame gap between
+        // AltTab's panel dismissing and our overlay painting. Without
+        // this, the compositor may paint one frame where neither the
+        // overlay nor the switcher panel is visible — showing OneNote.
+        CATransaction.flush()
         overlayWindow = panel
         Diagnostics.log("OVERLAY", "shown (cached) \(window.debugId ?? "?") for \(duration)s")
 
