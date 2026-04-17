@@ -287,7 +287,7 @@ class FocusOverlay {
         DispatchQueue.global(qos: .userInteractive).async {
             let t0 = CACurrentMediaTime()
             let rect = CGRect(x: position.x, y: position.y, width: size.width, height: size.height)
-            if let img = CGWindowListCreateImage(rect, .optionIncludingWindow, wid, [.boundsIgnoreFraming, .nominalResolution]) {
+            if let img = CGWindowListCreateImage(rect, .optionIncludingWindow, wid, [.boundsIgnoreFraming, .bestResolution]) {
                 let ms = Int((CACurrentMediaTime() - t0) * 1000)
                 Diagnostics.log("OVERLAY", "pre-captured wid=\(wid) \(img.width)x\(img.height) in \(ms)ms")
                 preCapturedImage = img
@@ -331,40 +331,30 @@ class FocusOverlay {
         guard enabled, let panel = persistentPanel else { return }
         guard let pos = target.position, let sz = target.size else { return }
 
-        let screenHeight = NSScreen.screens.first?.frame.height ?? 0
-        let frame = NSRect(x: pos.x, y: screenHeight - pos.y - sz.height,
-                           width: sz.width, height: sz.height)
-        panel.setFrame(frame, display: false)
-        panel.backgroundColor = .clear
+        let screen = NSScreen.main ?? NSScreen.screens.first!
+        let screenFrame = screen.frame
+        let screenHeight = screenFrame.height
+        // Full screen panel with translucent red outside target area
+        panel.setFrame(screenFrame, display: false)
+        panel.backgroundColor = .red.withAlphaComponent(0.12)
+
+        let targetFrame = NSRect(
+            x: pos.x - screenFrame.origin.x,
+            y: screenHeight - pos.y - sz.height - screenFrame.origin.y,
+            width: sz.width, height: sz.height)
 
         guard let containerView = panel.contentView else { return }
-        containerView.frame = NSRect(origin: .zero, size: frame.size)
+        containerView.frame = NSRect(origin: .zero, size: screenFrame.size)
         containerView.layer?.mask = nil
         containerView.layer?.sublayers?.forEach { $0.removeFromSuperlayer() }
         containerView.subviews.forEach { $0.removeFromSuperview() }
+        let frame = targetFrame
 
-        // Try CALayerHost for LIVE window mirroring (private API).
-        // Full resolution, real-time updates, zero capture latency.
+        // Use pre-captured sharp image or thumbnail at target position.
+        // CALayerHost didn't work (wid isn't a valid contextId,
+        // CGSCopyWindowProperty("CtxID") returns nil on macOS 15+).
         var rendered = false
-        if let wid = target.cgWindowId,
-           let layerHostClass = NSClassFromString("CALayerHost") as? CALayer.Type {
-            // Try to get the window's context ID from the window server
-            var ctxRef: CFTypeRef?
-            let err = CGSCopyWindowProperty(CGS_CONNECTION, wid, "CtxID" as CFString, &ctxRef)
-            if err == .success, let ctxNum = ctxRef as? NSNumber {
-                let contextId = ctxNum.uint32Value
-                let hostLayer = layerHostClass.init()
-                hostLayer.setValue(NSNumber(value: contextId), forKey: "contextId")
-                hostLayer.frame = CGRect(origin: .zero, size: frame.size)
-                containerView.layer?.addSublayer(hostLayer)
-                rendered = true
-                Diagnostics.log("OVERLAY", "CALayerHost LIVE mirror contextId=\(contextId) for wid=\(wid)")
-            } else {
-                Diagnostics.log("OVERLAY", "CGSGetWindowProperty CtxID failed err=\(err.rawValue) ctxRef=\(ctxRef as Any)")
-            }
-        }
-        // Fallback: pre-captured sharp or thumbnail
-        if !rendered {
+        do {
             var cgImage: CGImage? = nil
             if let wid = target.cgWindowId, preCapturedWid == wid, let sharp = preCapturedImage {
                 cgImage = sharp
@@ -378,7 +368,7 @@ class FocusOverlay {
                 Diagnostics.log("OVERLAY", "fallback: thumbnail")
             }
             if let cgImage {
-                let imageView = NSImageView(frame: NSRect(origin: .zero, size: frame.size))
+                let imageView = NSImageView(frame: frame)
                 imageView.image = NSImage(cgImage: cgImage, size: frame.size)
                 imageView.imageScaling = .scaleAxesIndependently
                 containerView.addSubview(imageView)
@@ -386,7 +376,11 @@ class FocusOverlay {
             }
         }
         if !rendered {
-            containerView.layer?.backgroundColor = NSColor.blue.withAlphaComponent(0.7).cgColor
+            // Blue fallback at target position
+            let blueLayer = CALayer()
+            blueLayer.backgroundColor = NSColor.blue.withAlphaComponent(0.7).cgColor
+            blueLayer.frame = frame
+            containerView.layer?.addSublayer(blueLayer)
             Diagnostics.log("OVERLAY", "fallback blue")
         }
         preCapturedImage = nil
