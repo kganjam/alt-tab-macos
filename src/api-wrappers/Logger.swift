@@ -249,18 +249,24 @@ class FocusOverlay {
             Diagnostics.log("OVERLAY", "no cached thumbnail for \(window.debugId ?? "?")")
             return
         }
-        // Convert from CG coordinates (top-left origin) to Cocoa (bottom-left)
-        let screenHeight = NSScreen.screens.first?.frame.height ?? 0
-        let frame = NSRect(x: position.x, y: screenHeight - position.y - size.height,
-                           width: size.width, height: size.height)
+        // Use the FULL SCREEN as the overlay frame so OneNote can't peek
+        // around the edges. Position the thumbnail at the target window's
+        // location within the full-screen overlay.
+        let screen = NSScreen.main ?? NSScreen.screens.first!
+        let screenFrame = screen.frame
+        let screenHeight = screen.frame.height
+        let targetFrame = NSRect(x: position.x, y: screenHeight - position.y - size.height,
+                                 width: size.width, height: size.height)
 
         let panel = NSPanel(
-            contentRect: frame,
+            contentRect: screenFrame,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
         panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false  // CRITICAL: without this, the overlay
+        // hides when AltTab deactivates (hideUi), exposing OneNote underneath
         panel.level = overlayLevel
         panel.backgroundColor = .clear
         panel.isOpaque = false
@@ -269,15 +275,25 @@ class FocusOverlay {
         panel.animationBehavior = .none
         panel.collectionBehavior = .canJoinAllSpaces
 
-        // Use CALayer.contents which natively accepts BOTH CGImage AND
-        // IOSurface (modern macOS stores thumbnails as IOSurface, not
-        // CGImage). No type conversion needed.
-        let layerView = NSView(frame: NSRect(origin: .zero, size: frame.size))
-        layerView.wantsLayer = true
-        layerView.layer = CALayer()
-        layerView.layer?.contents = thumbnail
-        layerView.layer?.contentsGravity = .resizeAspectFill
-        panel.contentView = layerView
+        // Full-screen dark background with the target thumbnail positioned
+        // at the window's actual location. Covers everything so OneNote
+        // can't peek around edges.
+        let containerView = NSView(frame: NSRect(origin: .zero, size: screenFrame.size))
+        containerView.wantsLayer = true
+        containerView.layer = CALayer()
+        containerView.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.01).cgColor
+
+        // Position thumbnail at the target window's location within the screen
+        let thumbnailLayer = CALayer()
+        thumbnailLayer.contents = thumbnail
+        thumbnailLayer.contentsGravity = .resizeAspectFill
+        thumbnailLayer.frame = CGRect(
+            x: targetFrame.origin.x - screenFrame.origin.x,
+            y: targetFrame.origin.y - screenFrame.origin.y,
+            width: targetFrame.width,
+            height: targetFrame.height)
+        containerView.layer?.addSublayer(thumbnailLayer)
+        panel.contentView = containerView
 
         panel.orderFrontRegardless()
         // Force immediate render so there's no 1-frame gap between
