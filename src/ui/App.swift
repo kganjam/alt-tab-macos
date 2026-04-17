@@ -296,19 +296,20 @@ class App: AppCenterApplication {
     static func focusSelectedWindow(_ selectedWindow: Window?) {
         guard appIsBeingUsed else { return } // already hidden
         Diagnostics.log("KEY", "release → focusSelectedWindow target=\(selectedWindow?.debugId ?? "nil")")
-        // For ANY transition involving Parallels (Par→mac, Par→Par),
-        // overlay the SOURCE window to mask flicker during transition.
-        // Overlay covers SOURCE's frame (not target's) so the target
-        // is immediately visible. Duration is short (0.8s) to avoid
-        // blocking the target if windows overlap.
+        // Cover ALL visible Parallels Coherence windows (not just the
+        // source). During transitions, ANY Coherence window can flash —
+        // not just the one we're switching from. Exclude the target if
+        // it's also a Coherence window (Par→Par case).
         if let window = selectedWindow {
-            let sourcePid = App.sessionSourcePid
-            if let sourcePid,
-               let sourceApp = (Applications.list.first { $0.pid == sourcePid }),
-               (sourceApp.isParallelsCoherence || window.isParallelsCoherenceWindow),
-               let sourceWindow = sourceApp.focusedWindow,
-               sourceWindow !== window {
-                FocusOverlay.show(over: sourceWindow, duration: 5.0)
+            let isParInvolved = window.isParallelsCoherenceWindow ||
+                (App.sessionSourcePid.flatMap { pid in
+                    Applications.list.first { $0.pid == pid }?.isParallelsCoherence
+                } ?? false)
+            if isParInvolved {
+                let parWindows = Windows.list.filter {
+                    $0.application.isParallelsCoherence && $0 !== window && $0.shouldShowTheUser
+                }
+                FocusOverlay.showOverMultiple(parWindows, duration: 1.5)
             }
         }
         hideUi(true)
@@ -508,10 +509,6 @@ extension App: NSApplicationDelegate {
         Diagnostics.log("INIT", "AltTab \(App.version) launched (custom build with diagnostics)")
         Diagnostics.startContinuousMonitoring()
         FocusOverlay.createPersistentOverlay()
-        // Permanent test overlay — REMOVE after testing
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-            Diagnostics.showTestOverlay()
-        }
         #if DEBUG
         UserDefaults.standard.set(true, forKey: "NSConstraintBasedLayoutVisualizeMutuallyExclusiveConstraints")
         #endif

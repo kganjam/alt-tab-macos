@@ -301,37 +301,77 @@ class FocusOverlay {
         Diagnostics.log("OVERLAY", "persistent panel created at level \(overlayLevel.rawValue)")
     }
 
-    /// Reposition + update thumbnail + show the persistent overlay.
-    static func show(over window: Window, duration: TimeInterval = 2.0) {
-        guard enabled, let panel = persistentPanel else { return }
-        guard let position = window.position, let size = window.size else {
-            Diagnostics.log("OVERLAY", "no position/size for \(window.debugId ?? "?")")
-            return
-        }
-        let screenHeight = NSScreen.screens.first?.frame.height ?? 0
-        let frame = NSRect(x: position.x, y: screenHeight - position.y - size.height,
-                           width: size.width, height: size.height)
+    /// Cover multiple windows with separate overlay panels.
+    /// Creates additional panels as needed (pool grows, never shrinks).
+    private static var panelPool: [NSPanel] = []
 
-        // Update frame + thumbnail on the existing panel (no creation)
-        panel.setFrame(frame, display: false)
-        if let layerView = panel.contentView {
-            layerView.frame = NSRect(origin: .zero, size: frame.size)
-            layerView.layer?.contents = window.thumbnail
-            layerView.layer?.frame = CGRect(origin: .zero, size: frame.size)
+    static func showOverMultiple(_ windows: [Window], duration: TimeInterval = 2.0) {
+        guard enabled else { return }
+        dismiss()
+        let screenHeight = NSScreen.screens.first?.frame.height ?? 0
+        var usedPanels: [NSPanel] = []
+
+        for (idx, window) in windows.enumerated() {
+            guard let position = window.position, let size = window.size else { continue }
+            let frame = NSRect(x: position.x, y: screenHeight - position.y - size.height,
+                               width: size.width, height: size.height)
+
+            // Reuse from pool or create new
+            let panel: NSPanel
+            if idx < panelPool.count {
+                panel = panelPool[idx]
+            } else {
+                let p = NSPanel(
+                    contentRect: .zero,
+                    styleMask: [.borderless, .nonactivatingPanel],
+                    backing: .buffered,
+                    defer: false
+                )
+                p.isFloatingPanel = true
+                p.hidesOnDeactivate = false
+                p.level = overlayLevel
+                p.isOpaque = false
+                p.hasShadow = false
+                p.ignoresMouseEvents = true
+                p.animationBehavior = .none
+                p.collectionBehavior = .canJoinAllSpaces
+                let layerView = NSView()
+                layerView.wantsLayer = true
+                layerView.layer = CALayer()
+                layerView.layer?.contentsGravity = .resizeAspectFill
+                p.contentView = layerView
+                panelPool.append(p)
+                panel = p
+            }
+
+            panel.setFrame(frame, display: false)
+            panel.backgroundColor = .clear
+            if let layerView = panel.contentView {
+                layerView.frame = NSRect(origin: .zero, size: frame.size)
+                layerView.layer?.contents = window.thumbnail
+                layerView.layer?.frame = CGRect(origin: .zero, size: frame.size)
+            }
+            panel.orderFrontRegardless()
+            usedPanels.append(panel)
         }
-        panel.orderFrontRegardless()
         CATransaction.flush()
-        overlayWindow = panel
-        Diagnostics.log("OVERLAY", "shown (persistent) \(window.debugId ?? "?") for \(duration)s")
+        overlayWindow = usedPanels.first // track for dismiss
+        Diagnostics.log("OVERLAY", "shown \(usedPanels.count) panels over \(windows.count) Par windows for \(duration)s")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
             dismiss()
         }
     }
 
+    /// Show single window overlay (kept for backwards compat)
+    static func show(over window: Window, duration: TimeInterval = 2.0) {
+        showOverMultiple([window], duration: duration)
+    }
+
     static func dismiss() {
-        // Don't destroy — just hide. Panel stays for next use.
-        persistentPanel?.orderOut(nil)
+        for panel in panelPool {
+            panel.orderOut(nil)
+        }
         overlayWindow = nil
     }
 }
