@@ -296,20 +296,18 @@ class App: AppCenterApplication {
     static func focusSelectedWindow(_ selectedWindow: Window?) {
         guard appIsBeingUsed else { return } // already hidden
         Diagnostics.log("KEY", "release → focusSelectedWindow target=\(selectedWindow?.debugId ?? "nil")")
-        // Cover ALL visible Parallels Coherence windows (not just the
-        // source). During transitions, ANY Coherence window can flash —
-        // not just the one we're switching from. Exclude the target if
-        // it's also a Coherence window (Par→Par case).
+        // Cover ALL Parallels Coherence windows AND show the target's
+        // thumbnail on the overlay so it appears instantly. The real
+        // target renders at level 0 (behind the overlay) — user can't
+        // see it until overlay dismisses. Painting the target's
+        // thumbnail on the overlay gives instant visual feedback.
         if let window = selectedWindow {
-            let isParInvolved = window.isParallelsCoherenceWindow ||
-                (App.sessionSourcePid.flatMap { pid in
-                    Applications.list.first { $0.pid == pid }?.isParallelsCoherence
-                } ?? false)
-            if isParInvolved {
-                let parWindows = Windows.list.filter {
-                    $0.application.isParallelsCoherence && $0 !== window && $0.shouldShowTheUser
-                }
-                FocusOverlay.showOverMultiple(parWindows, duration: 1.5)
+            let parWindows = Windows.list.filter {
+                $0.application.isParallelsCoherence && $0 !== window
+            }
+            if !parWindows.isEmpty {
+                Diagnostics.log("OVERLAY", "covering \(parWindows.count) Par windows + target=\(window.debugId ?? "?")")
+                FocusOverlay.showWithTarget(window, coveringParallels: parWindows, duration: 1.5)
             }
         }
         hideUi(true)
