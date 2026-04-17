@@ -304,12 +304,11 @@ class Window {
         Diagnostics.log("FOCUS", "enter focusMacOsWindowOverParallelsCoherence target=\(debugId ?? "?")")
         Diagnostics.logFrontmostSignals("before Par→mac")
         guard let targetWid = cgWindowId else { return }
-        // Show an AltTab-owned overlay screenshot of the target window
-        // at a high z-level. Since we OWN this window, the compositor
-        // enforces our level. Parallels' re-raise can't cover it.
-        // Auto-dismisses after 1.5s, by which time the counter-raise
-        // has settled the real window on top.
-        FocusOverlay.show(over: targetWid, duration: 1.5)
+        // Show an AltTab-owned overlay using the CACHED thumbnail from
+        // the switcher (already in memory — no expensive screenshot).
+        // Since we OWN this window, the compositor enforces our level
+        // at 102. Parallels' re-raise can't cover it.
+        FocusOverlay.show(over: self, duration: 2.0)
         scheduleDelayedReRaise(targetWid: targetWid)
         installWorkspaceActivationWatcher(targetWid: targetWid)
         Windows.armAltTabFocusGuard(for: self)
@@ -503,14 +502,13 @@ class Window {
         return sourceApp.focusedWindow?.cgWindowId
     }
 
-    private static let parallelsOutboundPollAttempts = 20 // 20 × 5ms = 100ms budget
+    private static let parallelsOutboundPollAttempts = 10 // 10 × 5ms = 50ms budget
     private static let parallelsOutboundPollIntervalMs = 5
-    /// Settle-after-flip delay: was 140ms when Parallels was actively
-    /// fighting via the Windows Start menu path. With Cmd→Ctrl remapping
-    /// in Parallels, the Start menu no longer opens on Cmd, so Parallels
-    /// has far less to react to. 40ms is enough buffer for any remaining
-    /// async reaction while keeping the transition snappy.
-    private static let parallelsOutboundSettleMs = 40
+    /// No settle needed: overlay covers the visual gap, counter-raise
+    /// handles Parallels' delayed re-activation, and makeKeyWindow in
+    /// the initial SLPS call ensures keyboard routing. Fire AX raise
+    /// immediately when frontmost flips.
+    private static let parallelsOutboundSettleMs = 0
     private func pollForTargetAppFrontmostAndRaise(attempt: Int) {
         let targetPid = application.pid
         let targetIsFrontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPid
