@@ -296,10 +296,21 @@ class App: AppCenterApplication {
     static func focusSelectedWindow(_ selectedWindow: Window?) {
         guard appIsBeingUsed else { return } // already hidden
         Diagnostics.log("KEY", "release → focusSelectedWindow target=\(selectedWindow?.debugId ?? "nil")")
-        // Overlay removed: logs show Terminal reaches frontmost in ~100ms
-        // and stays there (0% real failure rate). The overlay was covering
-        // Terminal (when windows overlap) making it SLOWER to appear.
-        // RERAISE at 400/700/1000ms handles the rare Parallels re-raise.
+        // For ANY transition involving Parallels (Par→mac, Par→Par),
+        // overlay the SOURCE window to mask flicker during transition.
+        // Overlay covers SOURCE's frame (not target's) so the target
+        // is immediately visible. Duration is short (0.8s) to avoid
+        // blocking the target if windows overlap.
+        if let window = selectedWindow {
+            let sourcePid = App.sessionSourcePid
+            if let sourcePid,
+               let sourceApp = (Applications.list.first { $0.pid == sourcePid }),
+               (sourceApp.isParallelsCoherence || window.isParallelsCoherenceWindow),
+               let sourceWindow = sourceApp.focusedWindow,
+               sourceWindow !== window {
+                FocusOverlay.show(over: sourceWindow, duration: 0.8)
+            }
+        }
         hideUi(true)
         if let window = selectedWindow, MissionControl.state() == .inactive || MissionControl.state() == .showDesktop {
             window.focus()
