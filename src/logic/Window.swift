@@ -303,6 +303,11 @@ class Window {
         Diagnostics.logFrontmostSignals("before Par→mac")
         guard let targetWid = cgWindowId else { return }
         scheduleDelayedReRaise(targetWid: targetWid)
+        // Register NSWorkspace observer as a BACKUP detection path.
+        // kAXApplicationActivatedNotification may not fire if AltTab
+        // didn't subscribe to the Parallels app's AX notifications.
+        // NSWorkspace.didActivateApplicationNotification is global.
+        installWorkspaceActivationWatcher(targetWid: targetWid)
         Windows.armAltTabFocusGuard(for: self)
         let sourceWid = previouslyFrontmostWindowId()
         CGSDisableUpdate(CGS_CONNECTION)
@@ -445,6 +450,45 @@ class Window {
                     Diagnostics.log("RERAISE", "+\(delayMs)ms re-raised target=\(self.debugId ?? "?")")
                 }
             }
+        }
+    }
+
+    /// NSWorkspace-based activation watcher. Fires when ANY app becomes
+    /// frontmost. If it's not our target's app, counter-raise.
+    private static var workspaceObserver: NSObjectProtocol?
+    private func installWorkspaceActivationWatcher(targetWid: CGWindowID) {
+        Window.removeWorkspaceActivationWatcher()
+        let targetPid = application.pid
+        let myGen = Windows.parallelsTransitionGeneration
+        Window.workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, Windows.parallelsTransitionGeneration == myGen else {
+                Window.removeWorkspaceActivationWatcher()
+                return
+            }
+            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  app.processIdentifier != targetPid else { return }
+            Diagnostics.log("WSCOUNTER", "NSWorkspace detected steal by pid=\(app.processIdentifier) \(app.bundleIdentifier ?? "?"), counter-raising \(self.debugId ?? "?")")
+            var psn = ProcessSerialNumber()
+            GetProcessForPID(targetPid, &psn)
+            _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
+            self.makeKeyWindow(&psn)
+            BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+                try? self?.axUiElement?.focusWindow()
+            }
+        }
+        // Auto-remove after guard expires
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(Windows.altTabFocusGuardMs))) {
+            Window.removeWorkspaceActivationWatcher()
+        }
+    }
+
+    private static func removeWorkspaceActivationWatcher() {
+        if let obs = workspaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+            workspaceObserver = nil
         }
     }
 
