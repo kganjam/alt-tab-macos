@@ -125,7 +125,8 @@ class Diagnostics {
     private static let sysZOwnerBlocklist: Set<String> = [
         "Window Server", "Control Center", "Dock", "AltTab",
         "Notification Center", "SystemUIServer", "Spotlight",
-        "Menubar", "Wallpaper",
+        "Menubar", "Wallpaper", "CursorUIViewService",
+        "LocalAuthenticationRemoteService",
     ]
 
     static func logSystemZOrder(_ label: String) {
@@ -244,7 +245,7 @@ class FocusOverlay {
         guard enabled else { return }
         dismiss()
         guard let position = window.position, let size = window.size,
-              let thumbnail = window.thumbnail as! CGImage? else {
+              let thumbnail = window.thumbnail else {
             Diagnostics.log("OVERLAY", "no cached thumbnail for \(window.debugId ?? "?")")
             return
         }
@@ -269,7 +270,8 @@ class FocusOverlay {
         panel.collectionBehavior = .canJoinAllSpaces
 
         let imageView = NSImageView(frame: NSRect(origin: .zero, size: frame.size))
-        imageView.image = NSImage(cgImage: thumbnail, size: frame.size)
+        let cgImage = unsafeBitCast(thumbnail, to: CGImage.self)
+        imageView.image = NSImage(cgImage: cgImage, size: frame.size)
         imageView.imageScaling = .scaleAxesIndependently
         panel.contentView = imageView
 
