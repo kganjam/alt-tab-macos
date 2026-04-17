@@ -296,18 +296,15 @@ class App: AppCenterApplication {
     static func focusSelectedWindow(_ selectedWindow: Window?) {
         guard appIsBeingUsed else { return } // already hidden
         Diagnostics.log("KEY", "release → focusSelectedWindow target=\(selectedWindow?.debugId ?? "nil")")
-        // Cover ALL Parallels Coherence windows AND show the target's
-        // thumbnail on the overlay so it appears instantly. The real
-        // target renders at level 0 (behind the overlay) — user can't
-        // see it until overlay dismisses. Painting the target's
-        // thumbnail on the overlay gives instant visual feedback.
+        // Cover ALL Parallels Coherence windows with opaque black panels
+        // at max level. Terminal renders naturally in uncovered space.
+        // No bitmap capture. Proven zero-flicker approach.
         if let window = selectedWindow {
             let parWindows = Windows.list.filter {
                 $0.application.isParallelsCoherence && $0 !== window
             }
             if !parWindows.isEmpty {
-                Diagnostics.log("OVERLAY", "covering \(parWindows.count) Par windows + target=\(window.debugId ?? "?")")
-                FocusOverlay.showWithTarget(window, coveringParallels: parWindows, duration: 1.5)
+                FocusOverlay.showOverMultiple(parWindows, duration: 1.5)
             }
         }
         hideUi(true)

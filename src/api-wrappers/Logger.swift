@@ -303,61 +303,50 @@ class FocusOverlay {
 
     private static var panelPool: [NSPanel] = []
 
-    /// Show target thumbnail + cover all Parallels windows.
-    /// One full-screen panel with sublayers for each element.
-    static func showWithTarget(_ target: Window, coveringParallels parWindows: [Window], duration: TimeInterval) {
-        guard enabled, let panel = persistentPanel else { return }
-        let screen = NSScreen.main ?? NSScreen.screens.first!
-        let screenFrame = screen.frame
-        let screenHeight = screenFrame.height
+    /// Cover each Parallels window with its own persistent overlay panel.
+    /// Terminal is NOT covered — it renders naturally in uncovered space.
+    /// No bitmap capture needed. Zero flicker proven with this approach.
+    static func showOverMultiple(_ windows: [Window], duration: TimeInterval = 2.0) {
+        guard enabled else { return }
+        dismiss()
+        let screenHeight = NSScreen.screens.first?.frame.height ?? 0
 
-        panel.setFrame(screenFrame, display: false)
-        // Translucent dark scrim covers entire screen — hides all Par windows
-        panel.backgroundColor = .black.withAlphaComponent(0.005)
-
-        guard let containerView = panel.contentView else { return }
-        containerView.frame = NSRect(origin: .zero, size: screenFrame.size)
-        // Remove old sublayers
-        containerView.layer?.sublayers?.forEach { $0.removeFromSuperlayer() }
-
-        // Add opaque target thumbnail at its exact screen position
-        if let pos = target.position, let sz = target.size, target.thumbnail != nil {
-            let targetLayer = CALayer()
-            targetLayer.contents = target.thumbnail
-            targetLayer.contentsGravity = .resizeAspectFill
-            targetLayer.frame = CGRect(
-                x: pos.x - screenFrame.origin.x,
-                y: screenHeight - pos.y - sz.height - screenFrame.origin.y,
-                width: sz.width, height: sz.height)
-            containerView.layer?.addSublayer(targetLayer)
+        // Grow pool as needed, reuse existing panels
+        while panelPool.count < windows.count {
+            let p = NSPanel(
+                contentRect: .zero,
+                styleMask: [.borderless, .nonactivatingPanel],
+                backing: .buffered,
+                defer: false
+            )
+            p.isFloatingPanel = true
+            p.hidesOnDeactivate = false
+            p.level = overlayLevel
+            p.isOpaque = true
+            p.hasShadow = false
+            p.ignoresMouseEvents = true
+            p.animationBehavior = .none
+            p.collectionBehavior = .canJoinAllSpaces
+            p.backgroundColor = .black
+            panelPool.append(p)
         }
 
-        // Add opaque covers over each Parallels window (red debug tint)
-        for parWin in parWindows {
-            guard let pos = parWin.position, let sz = parWin.size else { continue }
-            let coverLayer = CALayer()
-            coverLayer.backgroundColor = NSColor.red.withAlphaComponent(0.05).cgColor
-            coverLayer.frame = CGRect(
-                x: pos.x - screenFrame.origin.x,
-                y: screenHeight - pos.y - sz.height - screenFrame.origin.y,
-                width: sz.width, height: sz.height)
-            containerView.layer?.addSublayer(coverLayer)
+        for (idx, window) in windows.enumerated() {
+            guard let pos = window.position, let sz = window.size else { continue }
+            let frame = NSRect(x: pos.x, y: screenHeight - pos.y - sz.height,
+                               width: sz.width, height: sz.height)
+            let panel = panelPool[idx]
+            panel.setFrame(frame, display: false)
+            panel.backgroundColor = .black  // opaque black hides OneNote
+            panel.orderFrontRegardless()
         }
-
-        panel.orderFrontRegardless()
         CATransaction.flush()
-        overlayWindow = panel
-        Diagnostics.log("OVERLAY", "shown target=\(target.debugId ?? "?") + \(parWindows.count) Par covers for \(duration)s")
+        overlayWindow = panelPool.first
+        Diagnostics.log("OVERLAY", "shown \(windows.count) opaque covers for \(duration)s")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
             dismiss()
         }
-    }
-
-    /// Backwards compat
-    static func showOverMultiple(_ windows: [Window], duration: TimeInterval = 2.0) {
-        guard let first = windows.first else { return }
-        showWithTarget(first, coveringParallels: Array(windows.dropFirst()), duration: duration)
     }
 
     static func show(over window: Window, duration: TimeInterval = 2.0) {
@@ -365,7 +354,9 @@ class FocusOverlay {
     }
 
     static func dismiss() {
-        persistentPanel?.orderOut(nil)
+        for panel in panelPool {
+            panel.orderOut(nil)
+        }
         overlayWindow = nil
     }
 }
