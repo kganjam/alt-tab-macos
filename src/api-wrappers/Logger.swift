@@ -249,17 +249,14 @@ class FocusOverlay {
             Diagnostics.log("OVERLAY", "no cached thumbnail for \(window.debugId ?? "?")")
             return
         }
-        // Use the FULL SCREEN as the overlay frame so OneNote can't peek
-        // around the edges. Position the thumbnail at the target window's
-        // location within the full-screen overlay.
-        let screen = NSScreen.main ?? NSScreen.screens.first!
-        let screenFrame = screen.frame
-        let screenHeight = screen.frame.height
-        let targetFrame = NSRect(x: position.x, y: screenHeight - position.y - size.height,
-                                 width: size.width, height: size.height)
+        // Cover the SOURCE window's frame. For Par→mac this hides OneNote
+        // so Parallels' re-raise is invisible. Terminal stays uncovered.
+        let screenHeight = NSScreen.screens.first?.frame.height ?? 0
+        let frame = NSRect(x: position.x, y: screenHeight - position.y - size.height,
+                           width: size.width, height: size.height)
 
         let panel = NSPanel(
-            contentRect: screenFrame,
+            contentRect: frame,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -275,25 +272,16 @@ class FocusOverlay {
         panel.animationBehavior = .none
         panel.collectionBehavior = .canJoinAllSpaces
 
-        // Full-screen dark background with the target thumbnail positioned
-        // at the window's actual location. Covers everything so OneNote
-        // can't peek around edges.
-        let containerView = NSView(frame: NSRect(origin: .zero, size: screenFrame.size))
-        containerView.wantsLayer = true
-        containerView.layer = CALayer()
-        containerView.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.01).cgColor
-
-        // Position thumbnail at the target window's location within the screen
-        let thumbnailLayer = CALayer()
-        thumbnailLayer.contents = thumbnail
-        thumbnailLayer.contentsGravity = .resizeAspectFill
-        thumbnailLayer.frame = CGRect(
-            x: targetFrame.origin.x - screenFrame.origin.x,
-            y: targetFrame.origin.y - screenFrame.origin.y,
-            width: targetFrame.width,
-            height: targetFrame.height)
-        containerView.layer?.addSublayer(thumbnailLayer)
-        panel.contentView = containerView
+        // Show the source window's cached thumbnail (so it looks like
+        // OneNote is still there, but actually it's our overlay covering
+        // it at L102). When Parallels re-raises OneNote, it appears
+        // "under" our overlay — invisible to the user.
+        let layerView = NSView(frame: NSRect(origin: .zero, size: frame.size))
+        layerView.wantsLayer = true
+        layerView.layer = CALayer()
+        layerView.layer?.contents = thumbnail
+        layerView.layer?.contentsGravity = .resizeAspectFill
+        panel.contentView = layerView
 
         panel.orderFrontRegardless()
         // Force immediate render so there's no 1-frame gap between

@@ -437,17 +437,22 @@ class Window {
     private func scheduleDelayedReRaise(targetWid: CGWindowID) {
         Windows.parallelsTransitionGeneration &+= 1
         let myGen = Windows.parallelsTransitionGeneration
-        for delayMs in [600, 1000, 1500] {
+        let targetPid = application.pid
+        for delayMs in [400, 700, 1000] {
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
                 guard let self, Windows.parallelsTransitionGeneration == myGen else { return }
                 var psn = ProcessSerialNumber()
-                GetProcessForPID(self.application.pid, &psn)
+                GetProcessForPID(targetPid, &psn)
                 _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
                 self.makeKeyWindow(&psn)
                 BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
                     guard let self else { return }
                     try? self.axUiElement?.focusWindow()
                     Diagnostics.log("RERAISE", "+\(delayMs)ms re-raised target=\(self.debugId ?? "?")")
+                    // Dismiss overlay as soon as target is confirmed frontmost
+                    if NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPid {
+                        DispatchQueue.main.async { FocusOverlay.dismiss() }
+                    }
                 }
             }
         }
