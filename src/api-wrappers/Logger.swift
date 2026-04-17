@@ -303,50 +303,56 @@ class FocusOverlay {
 
     private static var panelPool: [NSPanel] = []
 
-    /// Cover each Parallels window with its own persistent overlay panel.
-    /// Terminal is NOT covered — it renders naturally in uncovered space.
-    /// No bitmap capture needed. Zero flicker proven with this approach.
-    static func showOverMultiple(_ windows: [Window], duration: TimeInterval = 2.0) {
-        guard enabled else { return }
-        dismiss()
-        let screenHeight = NSScreen.screens.first?.frame.height ?? 0
+    /// Full-screen opaque overlay with a HOLE cut where the target is.
+    /// OneNote areas are covered (black). Terminal area is transparent
+    /// (shows through naturally). Uses CAShapeLayer with even-odd fill.
+    static func showWithHole(target: Window, covering parWindows: [Window], duration: TimeInterval) {
+        guard enabled, let panel = persistentPanel else { return }
+        let screen = NSScreen.main ?? NSScreen.screens.first!
+        let screenFrame = screen.frame
+        let screenHeight = screenFrame.height
 
-        // Grow pool as needed, reuse existing panels
-        while panelPool.count < windows.count {
-            let p = NSPanel(
-                contentRect: .zero,
-                styleMask: [.borderless, .nonactivatingPanel],
-                backing: .buffered,
-                defer: false
-            )
-            p.isFloatingPanel = true
-            p.hidesOnDeactivate = false
-            p.level = overlayLevel
-            p.isOpaque = true
-            p.hasShadow = false
-            p.ignoresMouseEvents = true
-            p.animationBehavior = .none
-            p.collectionBehavior = .canJoinAllSpaces
-            p.backgroundColor = .black
-            panelPool.append(p)
+        panel.setFrame(screenFrame, display: false)
+        panel.backgroundColor = .black
+
+        guard let containerView = panel.contentView else { return }
+        containerView.frame = NSRect(origin: .zero, size: screenFrame.size)
+        containerView.wantsLayer = true
+        // Remove old mask
+        containerView.layer?.mask = nil
+        containerView.layer?.sublayers?.forEach { $0.removeFromSuperlayer() }
+
+        // Cut a hole where the target window is using even-odd fill
+        if let pos = target.position, let sz = target.size {
+            let maskLayer = CAShapeLayer()
+            let path = CGMutablePath()
+            // Fill the entire screen
+            path.addRect(CGRect(origin: .zero, size: screenFrame.size))
+            // Cut a hole at the target's position (even-odd makes this transparent)
+            let holeRect = CGRect(
+                x: pos.x - screenFrame.origin.x,
+                y: screenHeight - pos.y - sz.height - screenFrame.origin.y,
+                width: sz.width, height: sz.height)
+            path.addRect(holeRect)
+            maskLayer.path = path
+            maskLayer.fillRule = .evenOdd
+            containerView.layer?.mask = maskLayer
+            Diagnostics.log("OVERLAY", "hole at \(holeRect) for target=\(target.debugId ?? "?")")
         }
 
-        for (idx, window) in windows.enumerated() {
-            guard let pos = window.position, let sz = window.size else { continue }
-            let frame = NSRect(x: pos.x, y: screenHeight - pos.y - sz.height,
-                               width: sz.width, height: sz.height)
-            let panel = panelPool[idx]
-            panel.setFrame(frame, display: false)
-            panel.backgroundColor = .black  // opaque black hides OneNote
-            panel.orderFrontRegardless()
-        }
+        panel.orderFrontRegardless()
         CATransaction.flush()
-        overlayWindow = panelPool.first
-        Diagnostics.log("OVERLAY", "shown \(windows.count) opaque covers for \(duration)s")
+        overlayWindow = panel
+        Diagnostics.log("OVERLAY", "shown with hole, covering \(parWindows.count) Par windows for \(duration)s")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
             dismiss()
         }
+    }
+
+    static func showOverMultiple(_ windows: [Window], duration: TimeInterval = 2.0) {
+        guard let first = windows.first else { return }
+        showWithHole(target: first, covering: Array(windows.dropFirst()), duration: duration)
     }
 
     static func show(over window: Window, duration: TimeInterval = 2.0) {
@@ -354,9 +360,8 @@ class FocusOverlay {
     }
 
     static func dismiss() {
-        for panel in panelPool {
-            panel.orderOut(nil)
-        }
+        persistentPanel?.orderOut(nil)
+        persistentPanel?.contentView?.layer?.mask = nil
         overlayWindow = nil
     }
 }

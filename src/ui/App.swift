@@ -296,15 +296,15 @@ class App: AppCenterApplication {
     static func focusSelectedWindow(_ selectedWindow: Window?) {
         guard appIsBeingUsed else { return } // already hidden
         Diagnostics.log("KEY", "release → focusSelectedWindow target=\(selectedWindow?.debugId ?? "nil")")
-        // Cover ALL Parallels Coherence windows with opaque black panels
-        // at max level. Terminal renders naturally in uncovered space.
-        // No bitmap capture. Proven zero-flicker approach.
+        // Cover ALL Parallels Coherence windows with an opaque overlay
+        // that has a HOLE cut where the target window is, so Terminal
+        // renders naturally through the hole while OneNote is hidden.
         if let window = selectedWindow {
             let parWindows = Windows.list.filter {
                 $0.application.isParallelsCoherence && $0 !== window
             }
             if !parWindows.isEmpty {
-                FocusOverlay.showOverMultiple(parWindows, duration: 1.5)
+                FocusOverlay.showWithHole(target: window, covering: parWindows, duration: 1.5)
             }
         }
         hideUi(true)
