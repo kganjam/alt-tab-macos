@@ -249,6 +249,11 @@ class FocusOverlay {
             Diagnostics.log("OVERLAY", "no cached thumbnail for \(window.debugId ?? "?")")
             return
         }
+        // Verify thumbnail is actually a CGImage (not IOSurface etc.)
+        guard CFGetTypeID(thumbnail as CFTypeRef) == CGImage.typeID else {
+            Diagnostics.log("OVERLAY", "thumbnail not CGImage for \(window.debugId ?? "?")")
+            return
+        }
         // Convert from CG coordinates (top-left origin) to Cocoa (bottom-left)
         let screenHeight = NSScreen.screens.first?.frame.height ?? 0
         let frame = NSRect(x: position.x, y: screenHeight - position.y - size.height,
