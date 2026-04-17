@@ -304,11 +304,13 @@ class Window {
         Diagnostics.log("FOCUS", "enter focusMacOsWindowOverParallelsCoherence target=\(debugId ?? "?")")
         Diagnostics.logFrontmostSignals("before Par→mac")
         guard let targetWid = cgWindowId else { return }
+        // Show an AltTab-owned overlay screenshot of the target window
+        // at a high z-level. Since we OWN this window, the compositor
+        // enforces our level. Parallels' re-raise can't cover it.
+        // Auto-dismisses after 1.5s, by which time the counter-raise
+        // has settled the real window on top.
+        FocusOverlay.show(over: targetWid, duration: 1.5)
         scheduleDelayedReRaise(targetWid: targetWid)
-        // Register NSWorkspace observer as a BACKUP detection path.
-        // kAXApplicationActivatedNotification may not fire if AltTab
-        // didn't subscribe to the Parallels app's AX notifications.
-        // NSWorkspace.didActivateApplicationNotification is global.
         installWorkspaceActivationWatcher(targetWid: targetWid)
         Windows.armAltTabFocusGuard(for: self)
         let sourceWid = previouslyFrontmostWindowId()

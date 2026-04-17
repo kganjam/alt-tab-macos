@@ -213,6 +213,97 @@ class Diagnostics {
     }
 }
 
+/// Temporary overlay window that captures a target window's screenshot
+/// and displays it as an AltTab-owned window at a high z-level. Since
+/// WE own this window, CGSSetWindowLevel actually enforces the level
+/// at the compositor — Parallels can't fight our z-order on our own
+/// window.
+///
+/// Used during Par→mac transitions to "bridge" the visual gap while
+/// Parallels' timer-driven re-activation settles (~1-1.5s). After the
+/// overlay auto-dismisses, the real target window should be stable on
+/// top (via counter-raise).
+///
+/// Toggle: defaults write com.lwouis.alt-tab-macos focusOverlayEnabled -bool false
+/// Default: ON in this custom build.
+class FocusOverlay {
+    private static let enabledKey = "focusOverlayEnabled"
+    private static var overlayWindow: NSPanel?
+    private static let overlayLevel: NSWindow.Level = .init(rawValue: 102) // kCGOverlayWindowLevel
+
+    static var enabled: Bool {
+        if UserDefaults.standard.object(forKey: enabledKey) == nil { return true }
+        return UserDefaults.standard.bool(forKey: enabledKey)
+    }
+
+    /// Capture a screenshot of `wid` and show it as an overlay for `duration` seconds.
+    static func show(over wid: CGWindowID, duration: TimeInterval = 1.5) {
+        guard enabled else { return }
+        DispatchQueue.main.async {
+            dismiss()
+            guard let frame = windowFrame(wid),
+                  let image = captureWindow(wid, frame: frame) else {
+                Diagnostics.log("OVERLAY", "failed to capture wid=\(wid)")
+                return
+            }
+            let panel = NSPanel(
+                contentRect: frame,
+                styleMask: [.borderless, .nonactivatingPanel],
+                backing: .buffered,
+                defer: false
+            )
+            panel.isFloatingPanel = true
+            panel.level = overlayLevel
+            panel.backgroundColor = .clear
+            panel.isOpaque = false
+            panel.hasShadow = false
+            panel.ignoresMouseEvents = true
+            panel.animationBehavior = .none
+            panel.collectionBehavior = .canJoinAllSpaces
+
+            let imageView = NSImageView(frame: NSRect(origin: .zero, size: frame.size))
+            imageView.image = NSImage(cgImage: image, size: frame.size)
+            imageView.imageScaling = .scaleAxesIndependently
+            panel.contentView = imageView
+
+            panel.orderFrontRegardless()
+            overlayWindow = panel
+            Diagnostics.log("OVERLAY", "shown over wid=\(wid) frame=\(frame) for \(duration)s")
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
+                dismiss()
+            }
+        }
+    }
+
+    static func dismiss() {
+        guard let panel = overlayWindow else { return }
+        panel.orderOut(nil)
+        overlayWindow = nil
+    }
+
+    /// Get the Cocoa-coordinate frame of a window from the window server.
+    private static func windowFrame(_ wid: CGWindowID) -> NSRect? {
+        let options: CGWindowListOption = [.excludeDesktopElements]
+        guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return nil }
+        guard let entry = info.first(where: { ($0[kCGWindowNumber as String] as? Int) == Int(wid) }),
+              let bounds = entry[kCGWindowBounds as String] as? [String: Any],
+              let x = bounds["X"] as? CGFloat, let y = bounds["Y"] as? CGFloat,
+              let w = bounds["Width"] as? CGFloat, let h = bounds["Height"] as? CGFloat else { return nil }
+        // CGWindowList uses top-left origin; convert to Cocoa bottom-left
+        let screenHeight = NSScreen.screens.first?.frame.height ?? 0
+        return NSRect(x: x, y: screenHeight - y - h, width: w, height: h)
+    }
+
+    /// Capture the content of a specific window.
+    private static func captureWindow(_ wid: CGWindowID, frame: NSRect) -> CGImage? {
+        let cgRect = CGRect(x: frame.origin.x,
+                            y: (NSScreen.screens.first?.frame.height ?? 0) - frame.origin.y - frame.height,
+                            width: frame.width, height: frame.height)
+        return CGWindowListCreateImage(cgRect, .optionIncludingWindow, wid, [.boundsIgnoreFraming])
+    }
+}
+
 /// custom destination to display logs in the debug window
 class DebugWindowDestination: BaseDestination {
     var onNewEntry: ((SwiftyBeaver.Level, String) -> Void)?
