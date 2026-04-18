@@ -304,8 +304,12 @@ class Window {
         Diagnostics.log("FOCUS", "enter focusMacOsWindowOverParallelsCoherence target=\(debugId ?? "?")")
         Diagnostics.logFrontmostSignals("before Par→mac")
         guard let targetWid = cgWindowId else { return }
-        // Overlay already shown in focusSelectedWindow (before hideUi)
-        // to eliminate the frame gap between panel dismiss and overlay appear.
+        // Hide the source window instantly via CGSSetWindowAlpha(0).
+        // Prevents the source from flickering during the transition.
+        // Restored after 2s.
+        if let sourceWid = previouslyFrontmostWindowId() {
+            hideWindowTemporarily(sourceWid, duration: 2.0)
+        }
         scheduleDelayedReRaise(targetWid: targetWid)
         installWorkspaceActivationWatcher(targetWid: targetWid)
         Windows.armAltTabFocusGuard(for: self)
@@ -351,6 +355,10 @@ class Window {
     private func atomicallyPinAndActivate() {
         Diagnostics.log("FOCUS", "enter atomicallyPinAndActivate target=\(debugId ?? "?")")
         guard let targetWid = cgWindowId else { return }
+        // Hide the source window to prevent flicker during transition
+        if let sourceWid = previouslyFrontmostWindowId() {
+            hideWindowTemporarily(sourceWid, duration: 2.0)
+        }
         Windows.armAltTabFocusGuard(for: self)
         let sourceWid = previouslyFrontmostWindowId()
         CGSDisableUpdate(CGS_CONNECTION)
@@ -492,6 +500,22 @@ class Window {
         if let obs = workspaceObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(obs)
             workspaceObserver = nil
+        }
+    }
+
+    /// Instantly make a window invisible via CGSSetWindowAlpha(0).
+    /// Restores to full opacity after `duration` seconds.
+    /// If CGSSetWindowAlpha fails cross-process (error 1000), it's a no-op.
+    private func hideWindowTemporarily(_ wid: CGWindowID, duration: TimeInterval) {
+        let err = CGSSetWindowAlpha(CGS_CONNECTION, wid, 0)
+        if err == .success {
+            Diagnostics.log("HIDE", "hid wid=\(wid) for \(duration)s")
+            DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
+                CGSSetWindowAlpha(CGS_CONNECTION, wid, 1)
+                Diagnostics.log("HIDE", "restored wid=\(wid)")
+            }
+        } else {
+            Diagnostics.log("HIDE", "CGSSetWindowAlpha failed err=\(err.rawValue) for wid=\(wid)")
         }
     }
 

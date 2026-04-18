@@ -165,6 +165,12 @@ func CGSGetWindowLevel(_ cid: CGSConnectionID, _ wid: CGWindowID, _ level: Unsaf
 @_silgen_name("CGSSetWindowLevel") @discardableResult
 func CGSSetWindowLevel(_ cid: CGSConnectionID, _ wid: CGWindowID, _ level: CGWindowLevel) -> CGError
 
+/// Set a window's alpha/opacity. Works cross-process if the window
+/// server allows it. Setting to 0 makes the window invisible.
+/// * macOS 10.10+
+@_silgen_name("CGSSetWindowAlpha") @discardableResult
+func CGSSetWindowAlpha(_ cid: CGSConnectionID, _ wid: CGWindowID, _ alpha: Float) -> CGError
+
 /// Pause/resume window server compositing for this connection. Any window
 /// changes between the Disable and Reenable calls are batched and applied
 /// atomically when Reenable fires — users never see intermediate frames.
