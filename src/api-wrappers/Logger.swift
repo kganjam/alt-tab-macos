@@ -265,7 +265,11 @@ class Diagnostics {
 class FocusOverlay {
     private static let enabledKey = "focusOverlayEnabled"
     private static var overlayWindow: NSPanel?
-    private static let overlayLevel: NSWindow.Level = .init(rawValue: 2147483631) // just below cursor level — absolute max
+    // kCGScreenSaverWindowLevel (1000) — high enough to beat Parallels
+    // (L3) but LOW enough that system dialogs (permissions, alerts)
+    // can appear above. Previous max level (2147483631) covered system
+    // dialogs, preventing user interaction and causing macOS to kill us.
+    private static let overlayLevel: NSWindow.Level = .init(rawValue: 1000)
 
     static var enabled: Bool {
         if UserDefaults.standard.object(forKey: enabledKey) == nil { return true }
