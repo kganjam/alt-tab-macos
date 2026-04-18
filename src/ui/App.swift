@@ -410,12 +410,13 @@ class App: AppCenterApplication {
             }
             if !Windows.updatesBeforeShowing() { hideUi(); return }
             Windows.setInitialSelectedAndHoveredWindowIndex()
-            // Pre-capture top 3 most likely targets at retina resolution.
-            // Cached captures are 6-18ms; uncached 1-2s. By pre-capturing
-            // during switcher display, we warm the window server cache.
-            let topWindows = Windows.list.prefix(4).filter { $0.cgWindowId != nil && $0.position != nil && $0.size != nil }
-            for window in topWindows {
-                FocusOverlay.preCapture(wid: window.cgWindowId!, position: window.position!, size: window.size!)
+            // Pre-capture ONLY the selected window at retina. Multiple
+            // parallel CGWindowListCreateImage calls serialize on the
+            // window server lock — 4 parallel = 28s total. One = 1-2s.
+            if let selected = Windows.selectedWindow(),
+               let wid = selected.cgWindowId,
+               let pos = selected.position, let sz = selected.size {
+                FocusOverlay.preCapture(wid: wid, position: pos, size: sz)
             }
             if Preferences.windowDisplayDelay == DispatchTimeInterval.milliseconds(0) {
                 buildUiAndShowPanel()
