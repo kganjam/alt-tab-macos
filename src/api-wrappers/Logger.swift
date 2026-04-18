@@ -424,7 +424,7 @@ class FocusOverlay {
         let screenHeight = screenFrame.height
         // Full screen panel with translucent red outside target area
         panel.setFrame(screenFrame, display: false)
-        panel.backgroundColor = .black
+        panel.backgroundColor = .clear
 
         let targetFrame = NSRect(
             x: pos.x - screenFrame.origin.x,
