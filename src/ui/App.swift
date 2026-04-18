@@ -357,6 +357,7 @@ class App: AppCenterApplication {
         // fix — otherwise `Applications.frontmostPid` reads as AltTab's own pid
         // by the time `Window.focus()` runs.
         if !appIsBeingUsed {
+            FocusOverlay.dismissForSwitcher()
             Diagnostics.log("SESSION", "new session shortcutIndex=\(shortcutIndex)")
             Diagnostics.logFrontmostSignals("session-start pre")
             Diagnostics.logTrackedRecency("session-start pre")

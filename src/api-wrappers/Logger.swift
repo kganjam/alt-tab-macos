@@ -420,8 +420,17 @@ class FocusOverlay {
 
     static func dismiss() {
         persistentPanel?.orderOut(nil)
+        persistentPanel?.contentView?.layer?.sublayers?.forEach { $0.removeFromSuperlayer() }
         persistentPanel?.contentView?.subviews.forEach { $0.removeFromSuperview() }
         overlayWindow = nil
+    }
+
+    /// Dismiss overlay when switcher is about to show so it doesn't
+    /// cover the TilesPanel.
+    static func dismissForSwitcher() {
+        if overlayWindow != nil {
+            dismiss()
+        }
     }
 }
 
