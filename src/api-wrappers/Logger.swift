@@ -281,8 +281,9 @@ class FocusOverlay {
     /// transition. Avoids the panel-creation gap that let OneNote flash.
     private static var persistentPanel: NSPanel?
 
-    /// Pre-captured full-resolution CGImage cache. Accessed only from main thread.
-    static var preCaptureCache: [CGWindowID: CGImage] = [:]
+    /// Pre-captured full-resolution CVPixelBuffer cache (GPU-native IOSurface).
+    /// Accessed only from main thread.
+    static var preCaptureCache: [CGWindowID: CVPixelBuffer] = [:]
 
     /// Capture via ScreenCaptureKit at FULL retina resolution.
     /// Stores both CMSampleBuffer (for AVSampleBufferDisplayLayer)
@@ -304,17 +305,17 @@ class FocusOverlay {
                 let filter = SCContentFilter(desktopIndependentWindow: scWindow)
                 let sampleBuffer = try await SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config)
                 let ms = Int((CACurrentMediaTime() - t0) * 1000)
-                // Convert to CGImage and write to cache ON MAIN THREAD.
-                // Dictionary isn't thread-safe — concurrent writes from
-                // multiple Task instances caused EXC_BAD_ACCESS crash.
+                // Store CVPixelBuffer directly — NO GPU→CPU readback.
+                // IOSurface stays in VRAM. Display via CALayer.contents.
                 if let pb = sampleBuffer.pixelBuffer() ?? sampleBuffer.imageBuffer {
-                    let ci = CIImage(cvPixelBuffer: pb)
-                    if let cg = CIContext(options: [.useSoftwareRenderer: false]).createCGImage(ci, from: ci.extent) {
-                        await MainActor.run {
-                            preCaptureCache[wid] = cg
-                        }
-                        Diagnostics.log("OVERLAY", "SC pre-captured wid=\(wid) \(cg.width)x\(cg.height) in \(ms)ms")
+                    let w = CVPixelBufferGetWidth(pb)
+                    let h = CVPixelBufferGetHeight(pb)
+                    // CVPixelBuffer isn't Sendable — wrap in nonisolated(unsafe)
+                    nonisolated(unsafe) let safePb = pb
+                    await MainActor.run {
+                        preCaptureCache[wid] = safePb
                     }
+                    Diagnostics.log("OVERLAY", "SC pre-captured wid=\(wid) \(w)x\(h) in \(ms)ms (GPU-native, no readback)")
                 }
             } catch {
                 Diagnostics.log("OVERLAY", "SC preCapture error: \(error)")
@@ -386,19 +387,22 @@ class FocusOverlay {
         // Use pre-captured sharp image or thumbnail at target position.
         // CALayerHost didn't work (wid isn't a valid contextId,
         // CGSCopyWindowProperty("CtxID") returns nil on macOS 15+).
-        // Pre-captured CGImage (CIContext GPU conversion from CVPixelBuffer)
+        // Display pre-captured CVPixelBuffer via IOSurface (full GPU path)
         var rendered = false
-        if let wid = target.cgWindowId, let img = preCaptureCache[wid] {
-            let layer = CALayer()
-            layer.contents = img
-            layer.contentsGravity = .resizeAspectFill
-            layer.frame = frame
-            containerView.layer?.addSublayer(layer)
+        if let wid = target.cgWindowId, let pb = preCaptureCache[wid],
+           let surfaceRef = CVPixelBufferGetIOSurface(pb) {
+            let surface = unsafeBitCast(surfaceRef, to: IOSurface.self)
+            let w = IOSurfaceGetWidth(surface)
+            let h = IOSurfaceGetHeight(surface)
+            // Use a dedicated NSView with its own layer (sublayers didn't render IOSurface before)
+            let surfaceView = NSView(frame: frame)
+            surfaceView.wantsLayer = true
+            surfaceView.layer = CALayer()
+            surfaceView.layer?.contents = surface
+            surfaceView.layer?.contentsGravity = .resizeAspectFill
+            containerView.addSubview(surfaceView)
             rendered = true
-            Diagnostics.log("OVERLAY", "showing pre-capture \(img.width)x\(img.height)")
-            // Verify pixels by sampling center
-            let centerColor = img.cropping(to: CGRect(x: img.width/2, y: img.height/2, width: 1, height: 1))
-            Diagnostics.log("OVERLAY", "pixel check: center=\(centerColor != nil ? "has data" : "nil")")
+            Diagnostics.log("OVERLAY", "GPU-native IOSurface \(w)x\(h) from SC capture")
         }
         if !rendered {
             Diagnostics.log("OVERLAY", "no pre-capture ready for wid=\(target.cgWindowId ?? 0)")
