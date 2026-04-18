@@ -354,11 +354,19 @@ class FocusOverlay {
     static func startBackgroundRefresh() {
         guard ScreenRecordingPermission.status == .granted else { return }
         refreshTimer?.invalidate()
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { _ in
             Task {
                 do {
                     let content = try await getContent()
-                    let windows = await MainActor.run { Windows.list.filter { $0.cgWindowId != nil && $0.position != nil && $0.size != nil } }
+                    // Only cache top 5 most-recently-used windows (not all 66!)
+                    let windows = await MainActor.run {
+                        Windows.list
+                            .sorted { $0.lastFocusOrder < $1.lastFocusOrder }
+                            .prefix(5)
+                            .filter { $0.cgWindowId != nil && $0.position != nil && $0.size != nil }
+                    }
+                    // Clear stale entries
+                    await MainActor.run { preCaptureCache.removeAll() }
                     for window in windows {
                         guard let wid = window.cgWindowId, let _ = window.position, let sz = window.size else { continue }
                         guard let scWindow = content.windows.first(where: { $0.windowID == wid }) else { continue }
