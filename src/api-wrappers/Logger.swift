@@ -353,40 +353,47 @@ class FocusOverlay {
         // Use pre-captured sharp image or thumbnail at target position.
         // CALayerHost didn't work (wid isn't a valid contextId,
         // CGSCopyWindowProperty("CtxID") returns nil on macOS 15+).
+        // GPU-native path: CVPixelBuffer → IOSurface → CALayer.contents
+        // Zero GPU→CPU readback. Image stays in VRAM the entire time.
         var rendered = false
-        do {
-            var cgImage: CGImage? = nil
-            if let wid = target.cgWindowId, let sharp = preCaptureCache[wid] {
-                cgImage = sharp
-                Diagnostics.log("OVERLAY", "using pre-captured sharp \(sharp.width)x\(sharp.height)")
-            } else if let thumbnail = target.thumbnail {
-                switch thumbnail {
-                case .cgImage(let img): cgImage = img
-                case .pixelBuffer(let buf):
-                    if let buf { cgImage = CIContext().createCGImage(CIImage(cvPixelBuffer: buf), from: CIImage(cvPixelBuffer: buf).extent) }
+        if let thumbnail = target.thumbnail {
+            let layer = CALayer()
+            layer.contentsGravity = .resizeAspectFill
+            layer.frame = frame
+            switch thumbnail {
+            case .pixelBuffer(let buf):
+                if let buf, let surfaceRef = CVPixelBufferGetIOSurface(buf) {
+                    let surface = unsafeBitCast(surfaceRef, to: IOSurface.self)
+                    layer.contents = surface
+                    rendered = true
+                    Diagnostics.log("OVERLAY", "GPU-native IOSurface \(IOSurfaceGetWidth(surface))x\(IOSurfaceGetHeight(surface))")
                 }
-                Diagnostics.log("OVERLAY", "fallback: thumbnail")
+            case .cgImage(let img):
+                if let img {
+                    layer.contents = img
+                    rendered = true
+                    Diagnostics.log("OVERLAY", "CGImage \(img.width)x\(img.height)")
+                }
             }
-            if let cgImage {
-                let imageView = NSImageView(frame: frame)
-                // Use the CGImage's actual pixel dimensions divided by
-                // backing scale as the NSImage size — this tells AppKit
-                // the image is retina-density, avoiding blurry upscaling.
-                let scale = NSScreen.main?.backingScaleFactor ?? 2.0
-                let imgSize = NSSize(width: CGFloat(cgImage.width) / scale,
-                                     height: CGFloat(cgImage.height) / scale)
-                imageView.image = NSImage(cgImage: cgImage, size: imgSize)
-                imageView.imageScaling = .scaleAxesIndependently
-                containerView.addSubview(imageView)
-                rendered = true
+            if rendered {
+                containerView.layer?.addSublayer(layer)
             }
         }
+        // Fallback chain: pre-captured retina → blue
+        if !rendered, let wid = target.cgWindowId, let sharp = preCaptureCache[wid] {
+            let layer = CALayer()
+            layer.contents = sharp
+            layer.contentsGravity = .resizeAspectFill
+            layer.frame = frame
+            containerView.layer?.addSublayer(layer)
+            rendered = true
+            Diagnostics.log("OVERLAY", "pre-captured \(sharp.width)x\(sharp.height)")
+        }
         if !rendered {
-            // Blue fallback at target position
-            let blueLayer = CALayer()
-            blueLayer.backgroundColor = NSColor.blue.withAlphaComponent(0.7).cgColor
-            blueLayer.frame = frame
-            containerView.layer?.addSublayer(blueLayer)
+            let layer = CALayer()
+            layer.backgroundColor = NSColor.blue.withAlphaComponent(0.7).cgColor
+            layer.frame = frame
+            containerView.layer?.addSublayer(layer)
             Diagnostics.log("OVERLAY", "fallback blue")
         }
         clearPreCaptureCache()
