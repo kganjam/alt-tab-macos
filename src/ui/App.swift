@@ -357,15 +357,43 @@ class App: AppCenterApplication {
                 }
             }
         }
-        hideUi(true)
-        if let window = selectedWindow, MissionControl.state() == .inactive || MissionControl.state() == .showDesktop {
-            window.focus()
-            if Preferences.cursorFollowFocus == .always || (
-                Preferences.cursorFollowFocus == .differentScreen && (Spaces.screenSpacesMap.first { $0.value.contains { space in window.spaceIds.contains(space) } })?.key != NSScreen.active()?.cachedUuid()) {
-                moveCursorToSelectedWindow(window)
+        // For Parallels-involved transitions: raise the target FIRST
+        // while the switcher panel (L101) acts as a "curtain" covering
+        // everything. The target renders underneath. Then dismiss the
+        // panel after a short delay — target is already in place.
+        let isParInvolved: Bool = {
+            guard let w = selectedWindow else { return false }
+            if w.isParallelsCoherenceWindow { return true }
+            return App.sessionSourcePid.flatMap { pid in
+                Applications.list.first { $0.pid == pid }?.isParallelsCoherence
+            } ?? false
+        }()
+        if isParInvolved {
+            if let window = selectedWindow, MissionControl.state() == .inactive || MissionControl.state() == .showDesktop {
+                window.focus()
+                if Preferences.cursorFollowFocus == .always || (
+                    Preferences.cursorFollowFocus == .differentScreen && (Spaces.screenSpacesMap.first { $0.value.contains { space in window.spaceIds.contains(space) } })?.key != NSScreen.active()?.cachedUuid()) {
+                    moveCursorToSelectedWindow(window)
+                }
+            } else {
+                PreviewPanel.shared.orderOut(nil)
+            }
+            // Delay panel dismiss — target is now raising under the curtain
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(200)) {
+                hideUi(true)
             }
         } else {
-            PreviewPanel.shared.orderOut(nil)
+            // Non-Parallels: original order
+            hideUi(true)
+            if let window = selectedWindow, MissionControl.state() == .inactive || MissionControl.state() == .showDesktop {
+                window.focus()
+                if Preferences.cursorFollowFocus == .always || (
+                    Preferences.cursorFollowFocus == .differentScreen && (Spaces.screenSpacesMap.first { $0.value.contains { space in window.spaceIds.contains(space) } })?.key != NSScreen.active()?.cachedUuid()) {
+                    moveCursorToSelectedWindow(window)
+                }
+            } else {
+                PreviewPanel.shared.orderOut(nil)
+            }
         }
     }
 
