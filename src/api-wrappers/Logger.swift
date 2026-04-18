@@ -287,6 +287,7 @@ class FocusOverlay {
     /// and CGImage fallback.
     @available(macOS 14.0, *)
     static func preCapture(wid: CGWindowID, position: CGPoint, size: CGSize) {
+        guard ScreenRecordingPermission.status == .granted else { return }
         let t0 = CACurrentMediaTime()
         Task {
             do {
