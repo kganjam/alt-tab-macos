@@ -24,6 +24,7 @@ class Preferences {
             "showTabsAsWindows": "false",
             "hideColoredCircles": "false",
             "windowDisplayDelay": "100",
+            "coherenceDisplayDelay": "500",
             "appearanceStyle": AppearanceStylePreference.thumbnails.indexAsString,
             "appearanceSize": AppearanceSizePreference.auto.indexAsString,
             "appearanceTheme": AppearanceThemePreference.system.indexAsString,

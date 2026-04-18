@@ -507,9 +507,7 @@ class App: AppCenterApplication {
                 Applications.list.first { $0.pid == pid }?.isParallelsCoherence
             } ?? false
             let delay: DispatchTimeInterval = isCoherenceSource
-                ? .milliseconds(UserDefaults.standard.object(forKey: "coherenceDisplayDelay") != nil
-                    ? UserDefaults.standard.integer(forKey: "coherenceDisplayDelay")
-                    : 500)
+                ? .milliseconds(UserDefaults.standard.integer(forKey: "coherenceDisplayDelay"))
                 : Preferences.windowDisplayDelay
             if delay == .milliseconds(0) {
                 buildUiAndShowPanel()
