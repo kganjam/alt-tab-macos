@@ -500,11 +500,22 @@ class App: AppCenterApplication {
                     FocusOverlay.preCapture(wid: wid, position: pos, size: sz)
                 }
             }
-            if Preferences.windowDisplayDelay == DispatchTimeInterval.milliseconds(0) {
+            // Use longer delay when source is a Parallels Coherence window
+            // to allow fast-switch without showing the panel (reduces flicker).
+            // defaults write com.lwouis.alt-tab-macos coherenceDisplayDelay -int 500
+            let isCoherenceSource = App.sessionSourcePid.flatMap { pid in
+                Applications.list.first { $0.pid == pid }?.isParallelsCoherence
+            } ?? false
+            let delay: DispatchTimeInterval = isCoherenceSource
+                ? .milliseconds(UserDefaults.standard.object(forKey: "coherenceDisplayDelay") != nil
+                    ? UserDefaults.standard.integer(forKey: "coherenceDisplayDelay")
+                    : 500)
+                : Preferences.windowDisplayDelay
+            if delay == .milliseconds(0) {
                 buildUiAndShowPanel()
             } else {
                 delayedDisplayScheduled += 1
-                DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + Preferences.windowDisplayDelay) { () -> () in
+                DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + delay) { () -> () in
                     if delayedDisplayScheduled == 1 {
                         buildUiAndShowPanel()
                     }
