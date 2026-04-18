@@ -287,7 +287,7 @@ class FocusOverlay {
         DispatchQueue.global(qos: .userInteractive).async {
             let t0 = CACurrentMediaTime()
             let rect = CGRect(x: position.x, y: position.y, width: size.width, height: size.height)
-            if let img = CGWindowListCreateImage(rect, .optionIncludingWindow, wid, [.boundsIgnoreFraming, .bestResolution]) {
+            if let img = CGWindowListCreateImage(rect, .optionIncludingWindow, wid, [.boundsIgnoreFraming, .nominalResolution]) {
                 let ms = Int((CACurrentMediaTime() - t0) * 1000)
                 Diagnostics.log("OVERLAY", "pre-captured wid=\(wid) \(img.width)x\(img.height) in \(ms)ms")
                 preCapturedImage = img
