@@ -279,17 +279,20 @@ class FocusOverlay {
     static var preCapturedImage: CGImage?
     static var preCapturedWid: CGWindowID?
 
-    /// Start capturing the target window on a background thread NOW
-    /// (while switcher is showing). By release time, it's ready.
+    /// Start capturing the target window on a background thread NOW.
+    /// Uses bestResolution (retina) to match display pixel density.
+    /// Cached captures are 9-16ms; uncached 1-2s but pre-capturing
+    /// during switcher display gives us a head start.
     static func preCapture(wid: CGWindowID, position: CGPoint, size: CGSize) {
         preCapturedImage = nil
         preCapturedWid = wid
+        let scale = NSScreen.main?.backingScaleFactor ?? 2.0
         DispatchQueue.global(qos: .userInteractive).async {
             let t0 = CACurrentMediaTime()
             let rect = CGRect(x: position.x, y: position.y, width: size.width, height: size.height)
-            if let img = CGWindowListCreateImage(rect, .optionIncludingWindow, wid, [.boundsIgnoreFraming, .nominalResolution]) {
+            if let img = CGWindowListCreateImage(rect, .optionIncludingWindow, wid, [.boundsIgnoreFraming, .bestResolution]) {
                 let ms = Int((CACurrentMediaTime() - t0) * 1000)
-                Diagnostics.log("OVERLAY", "pre-captured wid=\(wid) \(img.width)x\(img.height) in \(ms)ms")
+                Diagnostics.log("OVERLAY", "pre-captured wid=\(wid) \(img.width)x\(img.height) scale=\(scale) in \(ms)ms")
                 preCapturedImage = img
                 preCapturedWid = wid
             }
@@ -369,7 +372,13 @@ class FocusOverlay {
             }
             if let cgImage {
                 let imageView = NSImageView(frame: frame)
-                imageView.image = NSImage(cgImage: cgImage, size: frame.size)
+                // Use the CGImage's actual pixel dimensions divided by
+                // backing scale as the NSImage size — this tells AppKit
+                // the image is retina-density, avoiding blurry upscaling.
+                let scale = NSScreen.main?.backingScaleFactor ?? 2.0
+                let imgSize = NSSize(width: CGFloat(cgImage.width) / scale,
+                                     height: CGFloat(cgImage.height) / scale)
+                imageView.image = NSImage(cgImage: cgImage, size: imgSize)
                 imageView.imageScaling = .scaleAxesIndependently
                 containerView.addSubview(imageView)
                 rendered = true
