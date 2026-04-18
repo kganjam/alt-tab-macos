@@ -489,7 +489,9 @@ class Windows {
         if let window = selectedWindow(),
            let wid = window.cgWindowId,
            let pos = window.position, let sz = window.size {
-            FocusOverlay.preCapture(wid: wid, position: pos, size: sz)
+            if #available(macOS 14.0, *) {
+                FocusOverlay.preCapture(wid: wid, position: pos, size: sz)
+            }
         }
     }
 

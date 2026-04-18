@@ -1,5 +1,6 @@
 import SwiftyBeaver
 import Foundation
+import ScreenCaptureKit
 
 class Logger {
     private static let logger = SwiftyBeaver.self
@@ -275,25 +276,45 @@ class FocusOverlay {
     /// transition. Avoids the panel-creation gap that let OneNote flash.
     private static var persistentPanel: NSPanel?
 
-    /// Pre-captured sharp images keyed by wid. Multiple windows can be
-    /// pre-captured in parallel during switcher display.
-    static var preCaptureCache: [CGWindowID: CGImage] = [:]
+    /// Pre-captured full-resolution CVPixelBuffer (GPU-native IOSurface).
+    static var preCaptureBuffer: [CGWindowID: CVPixelBuffer] = [:]
 
-    /// Start capturing a window on a background thread NOW.
+    /// Capture via ScreenCaptureKit at FULL retina resolution.
+    /// Returns CVPixelBuffer backed by IOSurface — stays in GPU memory.
+    @available(macOS 14.0, *)
     static func preCapture(wid: CGWindowID, position: CGPoint, size: CGSize) {
-        DispatchQueue.global(qos: .userInteractive).async {
-            let t0 = CACurrentMediaTime()
-            let rect = CGRect(x: position.x, y: position.y, width: size.width, height: size.height)
-            if let img = CGWindowListCreateImage(rect, .optionIncludingWindow, wid, [.boundsIgnoreFraming, .bestResolution]) {
-                let ms = Int((CACurrentMediaTime() - t0) * 1000)
-                Diagnostics.log("OVERLAY", "pre-captured wid=\(wid) \(img.width)x\(img.height) in \(ms)ms")
-                preCaptureCache[wid] = img
+        let t0 = CACurrentMediaTime()
+        Task {
+            do {
+                let content = try await SCShareableContent.current
+                guard let scWindow = content.windows.first(where: { $0.windowID == wid }) else {
+                    Diagnostics.log("OVERLAY", "preCapture: SCWindow not found for wid=\(wid)")
+                    return
+                }
+                let config = SCStreamConfiguration()
+                let scale = await MainActor.run { NSScreen.main?.backingScaleFactor ?? 2.0 }
+                config.width = Int(size.width * scale)
+                config.height = Int(size.height * scale)
+                config.pixelFormat = kCVPixelFormatType_32BGRA
+                config.showsCursor = false
+                let filter = SCContentFilter(desktopIndependentWindow: scWindow)
+                let sampleBuffer = try await SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config)
+                let pixelBuffer = sampleBuffer.pixelBuffer() ?? sampleBuffer.imageBuffer
+                if let pixelBuffer {
+                    let ms = Int((CACurrentMediaTime() - t0) * 1000)
+                    let w = CVPixelBufferGetWidth(pixelBuffer)
+                    let h = CVPixelBufferGetHeight(pixelBuffer)
+                    preCaptureBuffer[wid] = pixelBuffer
+                    Diagnostics.log("OVERLAY", "SC pre-captured wid=\(wid) \(w)x\(h) in \(ms)ms (GPU-native)")
+                }
+            } catch {
+                Diagnostics.log("OVERLAY", "SC preCapture error: \(error)")
             }
         }
     }
 
     static func clearPreCaptureCache() {
-        preCaptureCache.removeAll()
+        preCaptureBuffer.removeAll()
     }
 
     /// Call once at launch to create the persistent overlay panel.
@@ -353,23 +374,21 @@ class FocusOverlay {
         // Use pre-captured sharp image or thumbnail at target position.
         // CALayerHost didn't work (wid isn't a valid contextId,
         // CGSCopyWindowProperty("CtxID") returns nil on macOS 15+).
-        // Priority: pre-captured retina (2034x2288, 20-48ms cached)
-        // → IOSurface thumbnail (594x668, instant but blurry)
-        // → blue fallback
+        // Use SC pre-captured CVPixelBuffer → IOSurface (full GPU path)
         var rendered = false
-        if let wid = target.cgWindowId, let sharp = preCaptureCache[wid] {
+        if let wid = target.cgWindowId, let buf = preCaptureBuffer[wid],
+           let surfaceRef = CVPixelBufferGetIOSurface(buf) {
+            let surface = unsafeBitCast(surfaceRef, to: IOSurface.self)
             let layer = CALayer()
-            layer.contents = sharp
+            layer.contents = surface
             layer.contentsGravity = .resizeAspectFill
             layer.frame = frame
             containerView.layer?.addSublayer(layer)
             rendered = true
-            Diagnostics.log("OVERLAY", "retina pre-capture \(sharp.width)x\(sharp.height)")
+            Diagnostics.log("OVERLAY", "GPU-native \(IOSurfaceGetWidth(surface))x\(IOSurfaceGetHeight(surface))")
         }
         if !rendered {
-            // No pre-capture ready — skip blurry thumbnail entirely.
-            // Just show nothing (clear) and let the real window render.
-            Diagnostics.log("OVERLAY", "no pre-capture ready, skipping overlay content")
+            Diagnostics.log("OVERLAY", "no pre-capture ready")
         }
         clearPreCaptureCache()
 

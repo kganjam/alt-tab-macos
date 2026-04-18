@@ -416,7 +416,9 @@ class App: AppCenterApplication {
             if let selected = Windows.selectedWindow(),
                let wid = selected.cgWindowId,
                let pos = selected.position, let sz = selected.size {
-                FocusOverlay.preCapture(wid: wid, position: pos, size: sz)
+                if #available(macOS 14.0, *) {
+                    FocusOverlay.preCapture(wid: wid, position: pos, size: sz)
+                }
             }
             if Preferences.windowDisplayDelay == DispatchTimeInterval.milliseconds(0) {
                 buildUiAndShowPanel()
