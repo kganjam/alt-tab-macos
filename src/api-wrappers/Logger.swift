@@ -265,11 +265,11 @@ class Diagnostics {
 class FocusOverlay {
     private static let enabledKey = "focusOverlayEnabled"
     private static var overlayWindow: NSPanel?
-    // kCGScreenSaverWindowLevel (1000) — high enough to beat Parallels
-    // (L3) but LOW enough that system dialogs (permissions, alerts)
-    // can appear above. Previous max level (2147483631) covered system
-    // dialogs, preventing user interaction and causing macOS to kill us.
-    private static let overlayLevel: NSWindow.Level = .init(rawValue: 1000)
+    // Level 50: above Parallels (L3) but BELOW AltTab's switcher panel
+    // (.popUpMenu = L101). This means the overlay can stay visible
+    // DURING the switcher display — covering Parallels windows while
+    // the switcher draws on top. No need to dismiss for switcher.
+    private static let overlayLevel: NSWindow.Level = .init(rawValue: 50)
 
     static var enabled: Bool {
         if UserDefaults.standard.object(forKey: enabledKey) == nil { return true }
@@ -424,10 +424,7 @@ class FocusOverlay {
         let screenHeight = screenFrame.height
         // Full screen panel with translucent red outside target area
         panel.setFrame(screenFrame, display: false)
-        // Opaque enough to hide ALL Parallels windows (including Excel,
-        // other OneNote windows) that might flash during transition.
-        // The target's pre-captured image renders on top of this.
-        panel.backgroundColor = .black.withAlphaComponent(0.95)
+        panel.backgroundColor = .black
 
         let targetFrame = NSRect(
             x: pos.x - screenFrame.origin.x,
