@@ -243,6 +243,13 @@ class App: AppCenterApplication {
         Diagnostics.log("HIDE", "hide source window \(newValue ? "ON" : "OFF")")
     }
 
+    @objc static func toggleCoherencePreviews() {
+        let key = "disableCoherencePreviews"
+        let newDisabled = !UserDefaults.standard.bool(forKey: key)
+        UserDefaults.standard.set(newDisabled, forKey: key)
+        updateParallelsMenuStates()
+    }
+
     @objc static func toggleDiagnostics() {
         let key = "diagnosticsEnabled"
         let newValue = !Diagnostics.enabled
@@ -257,6 +264,7 @@ class App: AppCenterApplication {
             switch item.title {
             case "Enable Overlay Mode": item.state = FocusOverlay.overlayModeEnabled ? .on : .off
             case "Hide Source Window": item.state = UserDefaults.standard.bool(forKey: "hideSourceWindow") ? .on : .off
+            case "Coherence Thumbnails": item.state = !UserDefaults.standard.bool(forKey: "disableCoherencePreviews") ? .on : .off
             case "Diagnostics Logging": item.state = Diagnostics.enabled ? .on : .off
             default: break
             }

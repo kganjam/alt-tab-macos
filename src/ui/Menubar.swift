@@ -44,6 +44,10 @@ class Menubar {
         hideSourceToggle.target = App.self
         hideSourceToggle.state = UserDefaults.standard.bool(forKey: "hideSourceWindow") ? .on : .off
         overlayMenu.addItem(hideSourceToggle)
+        let previewToggle = NSMenuItem(title: "Coherence Thumbnails", action: #selector(App.toggleCoherencePreviews), keyEquivalent: "")
+        previewToggle.target = App.self
+        previewToggle.state = !UserDefaults.standard.bool(forKey: "disableCoherencePreviews") ? .on : .off
+        overlayMenu.addItem(previewToggle)
         let diagnosticsToggle = NSMenuItem(title: "Diagnostics Logging", action: #selector(App.toggleDiagnostics), keyEquivalent: "")
         diagnosticsToggle.target = App.self
         diagnosticsToggle.state = Diagnostics.enabled ? .on : .off

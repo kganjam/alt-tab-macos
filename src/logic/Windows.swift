@@ -237,9 +237,11 @@ class Windows {
                && !Preferences.onlyShowApplications()
                && (!Appearance.hideThumbnails || Preferences.previewSelectedWindow)
                && (Preferences.captureWindowsInBackground || App.appIsBeingUsed) else { return }
+        let skipCoherencePreviews = UserDefaults.standard.bool(forKey: "disableCoherencePreviews")
         var eligibleWindows = [Window]()
         for window in windows {
             if !window.isWindowlessApp, let cgWindowId = window.cgWindowId, cgWindowId != CGWindowID(bitPattern: -1) {
+                if skipCoherencePreviews && window.application.isParallelsCoherence { continue }
                 eligibleWindows.append(window)
             }
         }
