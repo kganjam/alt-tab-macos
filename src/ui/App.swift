@@ -299,17 +299,18 @@ class App: AppCenterApplication {
         // Show the TARGET window's cached content on an overlay at max
         // level. Terminal stays visible regardless of Parallels' re-raise.
         // IOSurface→CGImage conversion via CIContext (GPU, fast).
-        // Overlay only when THIS transition involves Parallels:
-        // target is Par, or source (sessionSourcePid) is Par.
-        if let window = selectedWindow {
-            let targetIsPar = window.isParallelsCoherenceWindow
-            let sourceIsPar = App.sessionSourcePid.flatMap { pid in
-                Applications.list.first { $0.pid == pid }?.isParallelsCoherence
-            } ?? false
-            if targetIsPar || sourceIsPar {
-                FocusOverlay.showTarget(window, duration: 1.5)
-            } else {
-                FocusOverlay.dismiss()
+        // Overlay mode: toggle via defaults write com.lwouis.alt-tab-macos overlayMode -bool true/false
+        if FocusOverlay.overlayModeEnabled {
+            if let window = selectedWindow {
+                let targetIsPar = window.isParallelsCoherenceWindow
+                let sourceIsPar = App.sessionSourcePid.flatMap { pid in
+                    Applications.list.first { $0.pid == pid }?.isParallelsCoherence
+                } ?? false
+                if targetIsPar || sourceIsPar {
+                    FocusOverlay.showTarget(window, duration: 1.5)
+                } else {
+                    FocusOverlay.dismiss()
+                }
             }
         }
         hideUi(true)

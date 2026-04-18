@@ -263,6 +263,13 @@ class Diagnostics {
 /// Toggle: defaults write com.lwouis.alt-tab-macos focusOverlayEnabled -bool false
 /// Default: ON in this custom build.
 class FocusOverlay {
+    /// Master toggle for overlay mode. Also controls background refresh.
+    /// defaults write com.lwouis.alt-tab-macos overlayMode -bool true/false
+    static var overlayModeEnabled: Bool {
+        if UserDefaults.standard.object(forKey: "overlayMode") == nil { return false }
+        return UserDefaults.standard.bool(forKey: "overlayMode")
+    }
+
     private static let enabledKey = "focusOverlayEnabled"
     private static var overlayWindow: NSPanel?
     // Level 50: above Parallels (L3) but BELOW AltTab's switcher panel
@@ -308,7 +315,7 @@ class FocusOverlay {
 
     @available(macOS 14.0, *)
     static func preCapture(wid: CGWindowID, position: CGPoint, size: CGSize) {
-        guard ScreenRecordingPermission.status == .granted else { return }
+        guard overlayModeEnabled, ScreenRecordingPermission.status == .granted else { return }
         let t0 = CACurrentMediaTime()
         Task {
             do {
@@ -352,7 +359,7 @@ class FocusOverlay {
 
     @available(macOS 14.0, *)
     static func startBackgroundRefresh() {
-        guard ScreenRecordingPermission.status == .granted else { return }
+        guard overlayModeEnabled, ScreenRecordingPermission.status == .granted else { return }
         refreshTimer?.invalidate()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { _ in
             Task {
