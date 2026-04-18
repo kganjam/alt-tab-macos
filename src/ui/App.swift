@@ -219,6 +219,25 @@ class App: AppCenterApplication {
         }
     }
 
+    @objc static func toggleOverlayMode() {
+        let newValue = !FocusOverlay.overlayModeEnabled
+        UserDefaults.standard.set(newValue, forKey: "overlayMode")
+        // Update menu checkmark
+        if let item = Menubar.menu.items.first(where: { $0.title == "Parallels Overlay Mode" }) {
+            item.state = newValue ? .on : .off
+        }
+        if newValue {
+            if #available(macOS 14.0, *) {
+                FocusOverlay.createPersistentOverlay()
+                FocusOverlay.startBackgroundRefresh()
+            }
+        } else {
+            FocusOverlay.dismiss()
+            FocusOverlay.clearPreCaptureCache()
+        }
+        Diagnostics.log("OVERLAY", "overlay mode \(newValue ? "ON" : "OFF")")
+    }
+
     @objc static func showAboutWindow() {
         initializeAboutWindowIfNeeded()
         showSecondaryWindow(AboutWindow.shared!)
@@ -521,12 +540,12 @@ extension App: NSApplicationDelegate {
         Logger.info { "Launching AltTab \(App.version)" }
         Diagnostics.log("INIT", "AltTab \(App.version) launched (custom build with diagnostics)")
         Diagnostics.startContinuousMonitoring()
-        FocusOverlay.createPersistentOverlay()
-        // Start background capture refresh — keeps ALL windows' caches
-        // warm so there's never a cold 1-2s hit on first alt-tab.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-            if #available(macOS 14.0, *) {
-                FocusOverlay.startBackgroundRefresh()
+        if FocusOverlay.overlayModeEnabled {
+            FocusOverlay.createPersistentOverlay()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                if #available(macOS 14.0, *) {
+                    FocusOverlay.startBackgroundRefresh()
+                }
             }
         }
         #if DEBUG
