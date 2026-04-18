@@ -240,6 +240,11 @@ class Windows {
         var eligibleWindows = [Window]()
         for window in windows {
             if !window.isWindowlessApp, let cgWindowId = window.cgWindowId, cgWindowId != CGWindowID(bitPattern: -1) {
+                // Skip Parallels Coherence windows — SC capture triggers
+                // Parallels to re-render its Coherence windows, causing
+                // visible flicker during focus transitions. These windows
+                // will show app icons or stale thumbnails instead.
+                if window.application.isParallelsCoherence { continue }
                 eligibleWindows.append(window)
             }
         }
