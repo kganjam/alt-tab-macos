@@ -353,10 +353,20 @@ class FocusOverlay {
         // Use pre-captured sharp image or thumbnail at target position.
         // CALayerHost didn't work (wid isn't a valid contextId,
         // CGSCopyWindowProperty("CtxID") returns nil on macOS 15+).
-        // GPU-native path: CVPixelBuffer → IOSurface → CALayer.contents
-        // Zero GPU→CPU readback. Image stays in VRAM the entire time.
+        // Priority: pre-captured retina (2034x2288, 20-48ms cached)
+        // → IOSurface thumbnail (594x668, instant but blurry)
+        // → blue fallback
         var rendered = false
-        if let thumbnail = target.thumbnail {
+        if let wid = target.cgWindowId, let sharp = preCaptureCache[wid] {
+            let layer = CALayer()
+            layer.contents = sharp
+            layer.contentsGravity = .resizeAspectFill
+            layer.frame = frame
+            containerView.layer?.addSublayer(layer)
+            rendered = true
+            Diagnostics.log("OVERLAY", "retina pre-capture \(sharp.width)x\(sharp.height)")
+        }
+        if !rendered, let thumbnail = target.thumbnail {
             let layer = CALayer()
             layer.contentsGravity = .resizeAspectFill
             layer.frame = frame
@@ -366,28 +376,14 @@ class FocusOverlay {
                     let surface = unsafeBitCast(surfaceRef, to: IOSurface.self)
                     layer.contents = surface
                     rendered = true
-                    Diagnostics.log("OVERLAY", "GPU-native IOSurface \(IOSurfaceGetWidth(surface))x\(IOSurfaceGetHeight(surface))")
+                    Diagnostics.log("OVERLAY", "IOSurface fallback \(IOSurfaceGetWidth(surface))x\(IOSurfaceGetHeight(surface))")
                 }
             case .cgImage(let img):
-                if let img {
-                    layer.contents = img
-                    rendered = true
-                    Diagnostics.log("OVERLAY", "CGImage \(img.width)x\(img.height)")
+                if let img { layer.contents = img; rendered = true
+                    Diagnostics.log("OVERLAY", "CGImage fallback \(img.width)x\(img.height)")
                 }
             }
-            if rendered {
-                containerView.layer?.addSublayer(layer)
-            }
-        }
-        // Fallback chain: pre-captured retina → blue
-        if !rendered, let wid = target.cgWindowId, let sharp = preCaptureCache[wid] {
-            let layer = CALayer()
-            layer.contents = sharp
-            layer.contentsGravity = .resizeAspectFill
-            layer.frame = frame
-            containerView.layer?.addSublayer(layer)
-            rendered = true
-            Diagnostics.log("OVERLAY", "pre-captured \(sharp.width)x\(sharp.height)")
+            if rendered { containerView.layer?.addSublayer(layer) }
         }
         if !rendered {
             let layer = CALayer()
