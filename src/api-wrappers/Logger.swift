@@ -281,9 +281,7 @@ class FocusOverlay {
     /// transition. Avoids the panel-creation gap that let OneNote flash.
     private static var persistentPanel: NSPanel?
 
-    /// Pre-captured CMSampleBuffer for AVSampleBufferDisplayLayer rendering.
-    static var preCapturedSample: [CGWindowID: CMSampleBuffer] = [:]
-    /// Also keep CGImage fallback
+    /// Pre-captured full-resolution CGImage cache. Accessed only from main thread.
     static var preCaptureCache: [CGWindowID: CGImage] = [:]
 
     /// Capture via ScreenCaptureKit at FULL retina resolution.
@@ -306,12 +304,15 @@ class FocusOverlay {
                 let filter = SCContentFilter(desktopIndependentWindow: scWindow)
                 let sampleBuffer = try await SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config)
                 let ms = Int((CACurrentMediaTime() - t0) * 1000)
-                preCapturedSample[wid] = sampleBuffer
-                // Also create CGImage fallback
+                // Convert to CGImage and write to cache ON MAIN THREAD.
+                // Dictionary isn't thread-safe — concurrent writes from
+                // multiple Task instances caused EXC_BAD_ACCESS crash.
                 if let pb = sampleBuffer.pixelBuffer() ?? sampleBuffer.imageBuffer {
                     let ci = CIImage(cvPixelBuffer: pb)
                     if let cg = CIContext(options: [.useSoftwareRenderer: false]).createCGImage(ci, from: ci.extent) {
-                        preCaptureCache[wid] = cg
+                        await MainActor.run {
+                            preCaptureCache[wid] = cg
+                        }
                         Diagnostics.log("OVERLAY", "SC pre-captured wid=\(wid) \(cg.width)x\(cg.height) in \(ms)ms")
                     }
                 }
@@ -322,7 +323,6 @@ class FocusOverlay {
     }
 
     static func clearPreCaptureCache() {
-        preCapturedSample.removeAll()
         preCaptureCache.removeAll()
     }
 
