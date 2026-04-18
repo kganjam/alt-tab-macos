@@ -515,16 +515,11 @@ extension App: NSApplicationDelegate {
         Diagnostics.log("INIT", "AltTab \(App.version) launched (custom build with diagnostics)")
         Diagnostics.startContinuousMonitoring()
         FocusOverlay.createPersistentOverlay()
-        // Pre-warm the capture cache for the top windows at launch.
-        // First SC capture is slow (~1-2s). Warming at launch means
-        // the first alt-tab has cached captures ready.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+        // Start background capture refresh — keeps ALL windows' caches
+        // warm so there's never a cold 1-2s hit on first alt-tab.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
             if #available(macOS 14.0, *) {
-                for window in Windows.list.prefix(3) {
-                    if let wid = window.cgWindowId, let pos = window.position, let sz = window.size {
-                        FocusOverlay.preCapture(wid: wid, position: pos, size: sz)
-                    }
-                }
+                FocusOverlay.startBackgroundRefresh()
             }
         }
         #if DEBUG

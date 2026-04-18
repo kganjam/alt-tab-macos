@@ -345,6 +345,45 @@ class FocusOverlay {
         preCaptureCache.removeAll()
     }
 
+    /// Background refresh loop: capture every window every ~5 seconds.
+    /// Keeps all caches warm so there's never a cold 1-2s hit.
+    /// Captures run sequentially to avoid window server lock contention.
+    private static var refreshTimer: Timer?
+
+    @available(macOS 14.0, *)
+    static func startBackgroundRefresh() {
+        guard ScreenRecordingPermission.status == .granted else { return }
+        refreshTimer?.invalidate()
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in
+            Task {
+                do {
+                    let content = try await getContent()
+                    let windows = await MainActor.run { Windows.list.filter { $0.cgWindowId != nil && $0.position != nil && $0.size != nil } }
+                    for window in windows {
+                        guard let wid = window.cgWindowId, let _ = window.position, let sz = window.size else { continue }
+                        guard let scWindow = content.windows.first(where: { $0.windowID == wid }) else { continue }
+                        let config = SCStreamConfiguration()
+                        let scale = await MainActor.run { NSScreen.main?.backingScaleFactor ?? 2.0 }
+                        config.width = Int(sz.width * scale)
+                        config.height = Int(sz.height * scale)
+                        config.pixelFormat = kCVPixelFormatType_32BGRA
+                        config.showsCursor = false
+                        let filter = SCContentFilter(desktopIndependentWindow: scWindow)
+                        let sample = try await SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config)
+                        if let pb = sample.pixelBuffer() ?? sample.imageBuffer {
+                            nonisolated(unsafe) let safePb = pb
+                            await MainActor.run { preCaptureCache[wid] = safePb }
+                        }
+                    }
+                    Diagnostics.log("OVERLAY", "refreshed \(windows.count) windows")
+                } catch {
+                    Diagnostics.log("OVERLAY", "refresh error: \(error)")
+                }
+            }
+        }
+        Diagnostics.log("OVERLAY", "background refresh started (5s interval)")
+    }
+
     /// Call once at launch to create the persistent overlay panel.
     static func createPersistentOverlay() {
         let panel = NSPanel(
