@@ -101,7 +101,7 @@ class Diagnostics {
     private static let startTime = Date()
 
     static var enabled: Bool {
-        if UserDefaults.standard.object(forKey: enabledKey) == nil { return true }
+        if UserDefaults.standard.object(forKey: enabledKey) == nil { return false }
         return UserDefaults.standard.bool(forKey: enabledKey)
     }
 
@@ -279,7 +279,7 @@ class FocusOverlay {
     private static let overlayLevel: NSWindow.Level = .init(rawValue: 50)
 
     static var enabled: Bool {
-        if UserDefaults.standard.object(forKey: enabledKey) == nil { return true }
+        if UserDefaults.standard.object(forKey: enabledKey) == nil { return false }
         return UserDefaults.standard.bool(forKey: enabledKey)
     }
 
