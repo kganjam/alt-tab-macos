@@ -366,31 +366,10 @@ class FocusOverlay {
             rendered = true
             Diagnostics.log("OVERLAY", "retina pre-capture \(sharp.width)x\(sharp.height)")
         }
-        if !rendered, let thumbnail = target.thumbnail {
-            let layer = CALayer()
-            layer.contentsGravity = .resizeAspectFill
-            layer.frame = frame
-            switch thumbnail {
-            case .pixelBuffer(let buf):
-                if let buf, let surfaceRef = CVPixelBufferGetIOSurface(buf) {
-                    let surface = unsafeBitCast(surfaceRef, to: IOSurface.self)
-                    layer.contents = surface
-                    rendered = true
-                    Diagnostics.log("OVERLAY", "IOSurface fallback \(IOSurfaceGetWidth(surface))x\(IOSurfaceGetHeight(surface))")
-                }
-            case .cgImage(let img):
-                if let img { layer.contents = img; rendered = true
-                    Diagnostics.log("OVERLAY", "CGImage fallback \(img.width)x\(img.height)")
-                }
-            }
-            if rendered { containerView.layer?.addSublayer(layer) }
-        }
         if !rendered {
-            let layer = CALayer()
-            layer.backgroundColor = NSColor.blue.withAlphaComponent(0.7).cgColor
-            layer.frame = frame
-            containerView.layer?.addSublayer(layer)
-            Diagnostics.log("OVERLAY", "fallback blue")
+            // No pre-capture ready — skip blurry thumbnail entirely.
+            // Just show nothing (clear) and let the real window render.
+            Diagnostics.log("OVERLAY", "no pre-capture ready, skipping overlay content")
         }
         clearPreCaptureCache()
 
