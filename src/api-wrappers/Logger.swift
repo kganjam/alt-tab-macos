@@ -1,6 +1,7 @@
 import SwiftyBeaver
 import Foundation
 import ScreenCaptureKit
+import AVFoundation
 
 class Logger {
     private static let logger = SwiftyBeaver.self
@@ -276,22 +277,21 @@ class FocusOverlay {
     /// transition. Avoids the panel-creation gap that let OneNote flash.
     private static var persistentPanel: NSPanel?
 
-    /// Pre-captured full-resolution CGImage (converted from CVPixelBuffer
-    /// immediately after capture so it's ready for CALayer.contents).
+    /// Pre-captured CMSampleBuffer for AVSampleBufferDisplayLayer rendering.
+    static var preCapturedSample: [CGWindowID: CMSampleBuffer] = [:]
+    /// Also keep CGImage fallback
     static var preCaptureCache: [CGWindowID: CGImage] = [:]
 
     /// Capture via ScreenCaptureKit at FULL retina resolution.
-    /// Returns CVPixelBuffer backed by IOSurface — stays in GPU memory.
+    /// Stores both CMSampleBuffer (for AVSampleBufferDisplayLayer)
+    /// and CGImage fallback.
     @available(macOS 14.0, *)
     static func preCapture(wid: CGWindowID, position: CGPoint, size: CGSize) {
         let t0 = CACurrentMediaTime()
         Task {
             do {
                 let content = try await SCShareableContent.current
-                guard let scWindow = content.windows.first(where: { $0.windowID == wid }) else {
-                    Diagnostics.log("OVERLAY", "preCapture: SCWindow not found for wid=\(wid)")
-                    return
-                }
+                guard let scWindow = content.windows.first(where: { $0.windowID == wid }) else { return }
                 let config = SCStreamConfiguration()
                 let scale = await MainActor.run { NSScreen.main?.backingScaleFactor ?? 2.0 }
                 config.width = Int(size.width * scale)
@@ -300,17 +300,14 @@ class FocusOverlay {
                 config.showsCursor = false
                 let filter = SCContentFilter(desktopIndependentWindow: scWindow)
                 let sampleBuffer = try await SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config)
-                let pixelBuffer = sampleBuffer.pixelBuffer() ?? sampleBuffer.imageBuffer
-                if let pixelBuffer {
-                    // Convert CVPixelBuffer → CGImage immediately (CIContext
-                    // GPU path). CALayer.contents with IOSurface sublayers
-                    // didn't render in our tests. CGImage always works.
-                    let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-                    let ctx = CIContext(options: [.useSoftwareRenderer: false])
-                    if let cgImage = ctx.createCGImage(ciImage, from: ciImage.extent) {
-                        let ms = Int((CACurrentMediaTime() - t0) * 1000)
-                        preCaptureCache[wid] = cgImage
-                        Diagnostics.log("OVERLAY", "SC pre-captured wid=\(wid) \(cgImage.width)x\(cgImage.height) in \(ms)ms")
+                let ms = Int((CACurrentMediaTime() - t0) * 1000)
+                preCapturedSample[wid] = sampleBuffer
+                // Also create CGImage fallback
+                if let pb = sampleBuffer.pixelBuffer() ?? sampleBuffer.imageBuffer {
+                    let ci = CIImage(cvPixelBuffer: pb)
+                    if let cg = CIContext(options: [.useSoftwareRenderer: false]).createCGImage(ci, from: ci.extent) {
+                        preCaptureCache[wid] = cg
+                        Diagnostics.log("OVERLAY", "SC pre-captured wid=\(wid) \(cg.width)x\(cg.height) in \(ms)ms")
                     }
                 }
             } catch {
@@ -320,6 +317,7 @@ class FocusOverlay {
     }
 
     static func clearPreCaptureCache() {
+        preCapturedSample.removeAll()
         preCaptureCache.removeAll()
     }
 
@@ -383,9 +381,19 @@ class FocusOverlay {
         // Use pre-captured sharp image or thumbnail at target position.
         // CALayerHost didn't work (wid isn't a valid contextId,
         // CGSCopyWindowProperty("CtxID") returns nil on macOS 15+).
-        // Use pre-captured CGImage (converted from CVPixelBuffer via CIContext)
+        // Try AVSampleBufferDisplayLayer (GPU-native video frame display)
         var rendered = false
-        if let wid = target.cgWindowId, let img = preCaptureCache[wid] {
+        if let wid = target.cgWindowId, let sample = preCapturedSample[wid] {
+            let displayLayer = AVSampleBufferDisplayLayer()
+            displayLayer.frame = frame
+            displayLayer.videoGravity = .resizeAspectFill
+            displayLayer.enqueue(sample)
+            containerView.layer?.addSublayer(displayLayer)
+            rendered = true
+            Diagnostics.log("OVERLAY", "AVSampleBufferDisplayLayer for wid=\(wid)")
+        }
+        // Fallback: pre-captured CGImage
+        if !rendered, let wid = target.cgWindowId, let img = preCaptureCache[wid] {
             let layer = CALayer()
             layer.contents = img
             layer.contentsGravity = .resizeAspectFill
