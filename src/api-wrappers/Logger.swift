@@ -288,13 +288,31 @@ class FocusOverlay {
     /// Capture via ScreenCaptureKit at FULL retina resolution.
     /// Stores both CMSampleBuffer (for AVSampleBufferDisplayLayer)
     /// and CGImage fallback.
+    /// Cached SCShareableContent to avoid re-enumerating all windows
+    /// on each capture (~100-500ms per call). Refreshed every 5s.
+    @available(macOS 14.0, *)
+    private static var cachedContent: SCShareableContent?
+    private static var contentCacheTime: CFAbsoluteTime = 0
+
+    @available(macOS 14.0, *)
+    private static func getContent() async throws -> SCShareableContent {
+        let now = CFAbsoluteTimeGetCurrent()
+        if let cached = cachedContent, now - contentCacheTime < 5.0 {
+            return cached
+        }
+        let content = try await SCShareableContent.current
+        cachedContent = content
+        contentCacheTime = now
+        return content
+    }
+
     @available(macOS 14.0, *)
     static func preCapture(wid: CGWindowID, position: CGPoint, size: CGSize) {
         guard ScreenRecordingPermission.status == .granted else { return }
         let t0 = CACurrentMediaTime()
         Task {
             do {
-                let content = try await SCShareableContent.current
+                let content = try await getContent()
                 guard let scWindow = content.windows.first(where: { $0.windowID == wid }) else { return }
                 let config = SCStreamConfiguration()
                 let scale = await MainActor.run { NSScreen.main?.backingScaleFactor ?? 2.0 }
