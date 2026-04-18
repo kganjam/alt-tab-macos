@@ -363,7 +363,10 @@ class FocusOverlay {
         let screenHeight = screenFrame.height
         // Full screen panel with translucent red outside target area
         panel.setFrame(screenFrame, display: false)
-        panel.backgroundColor = .red.withAlphaComponent(0.12)
+        // Opaque enough to hide ALL Parallels windows (including Excel,
+        // other OneNote windows) that might flash during transition.
+        // The target's pre-captured image renders on top of this.
+        panel.backgroundColor = .black.withAlphaComponent(0.95)
 
         let targetFrame = NSRect(
             x: pos.x - screenFrame.origin.x,
