@@ -276,8 +276,9 @@ class FocusOverlay {
     /// transition. Avoids the panel-creation gap that let OneNote flash.
     private static var persistentPanel: NSPanel?
 
-    /// Pre-captured full-resolution CVPixelBuffer (GPU-native IOSurface).
-    static var preCaptureBuffer: [CGWindowID: CVPixelBuffer] = [:]
+    /// Pre-captured full-resolution CGImage (converted from CVPixelBuffer
+    /// immediately after capture so it's ready for CALayer.contents).
+    static var preCaptureCache: [CGWindowID: CGImage] = [:]
 
     /// Capture via ScreenCaptureKit at FULL retina resolution.
     /// Returns CVPixelBuffer backed by IOSurface — stays in GPU memory.
@@ -301,11 +302,16 @@ class FocusOverlay {
                 let sampleBuffer = try await SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config)
                 let pixelBuffer = sampleBuffer.pixelBuffer() ?? sampleBuffer.imageBuffer
                 if let pixelBuffer {
-                    let ms = Int((CACurrentMediaTime() - t0) * 1000)
-                    let w = CVPixelBufferGetWidth(pixelBuffer)
-                    let h = CVPixelBufferGetHeight(pixelBuffer)
-                    preCaptureBuffer[wid] = pixelBuffer
-                    Diagnostics.log("OVERLAY", "SC pre-captured wid=\(wid) \(w)x\(h) in \(ms)ms (GPU-native)")
+                    // Convert CVPixelBuffer → CGImage immediately (CIContext
+                    // GPU path). CALayer.contents with IOSurface sublayers
+                    // didn't render in our tests. CGImage always works.
+                    let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+                    let ctx = CIContext(options: [.useSoftwareRenderer: false])
+                    if let cgImage = ctx.createCGImage(ciImage, from: ciImage.extent) {
+                        let ms = Int((CACurrentMediaTime() - t0) * 1000)
+                        preCaptureCache[wid] = cgImage
+                        Diagnostics.log("OVERLAY", "SC pre-captured wid=\(wid) \(cgImage.width)x\(cgImage.height) in \(ms)ms")
+                    }
                 }
             } catch {
                 Diagnostics.log("OVERLAY", "SC preCapture error: \(error)")
@@ -314,7 +320,7 @@ class FocusOverlay {
     }
 
     static func clearPreCaptureCache() {
-        preCaptureBuffer.removeAll()
+        preCaptureCache.removeAll()
     }
 
     /// Call once at launch to create the persistent overlay panel.
@@ -374,23 +380,24 @@ class FocusOverlay {
         // Use pre-captured sharp image or thumbnail at target position.
         // CALayerHost didn't work (wid isn't a valid contextId,
         // CGSCopyWindowProperty("CtxID") returns nil on macOS 15+).
-        // Use SC pre-captured CVPixelBuffer → IOSurface (full GPU path)
+        // Use pre-captured CGImage (converted from CVPixelBuffer via CIContext)
         var rendered = false
-        if let wid = target.cgWindowId, let buf = preCaptureBuffer[wid],
-           let surfaceRef = CVPixelBufferGetIOSurface(buf) {
-            let surface = unsafeBitCast(surfaceRef, to: IOSurface.self)
+        if let wid = target.cgWindowId, let img = preCaptureCache[wid] {
             let layer = CALayer()
-            layer.contents = surface
+            layer.contents = img
             layer.contentsGravity = .resizeAspectFill
             layer.frame = frame
             containerView.layer?.addSublayer(layer)
             rendered = true
-            Diagnostics.log("OVERLAY", "GPU-native \(IOSurfaceGetWidth(surface))x\(IOSurfaceGetHeight(surface))")
+            Diagnostics.log("OVERLAY", "showing pre-capture \(img.width)x\(img.height)")
+            // Verify pixels by sampling center
+            let centerColor = img.cropping(to: CGRect(x: img.width/2, y: img.height/2, width: 1, height: 1))
+            Diagnostics.log("OVERLAY", "pixel check: center=\(centerColor != nil ? "has data" : "nil")")
         }
         if !rendered {
-            Diagnostics.log("OVERLAY", "no pre-capture ready")
+            Diagnostics.log("OVERLAY", "no pre-capture ready for wid=\(target.cgWindowId ?? 0)")
         }
-        clearPreCaptureCache()
+        // DON'T clear cache — keep for next fast alt-tab
 
         panel.orderFrontRegardless()
         CATransaction.flush()
