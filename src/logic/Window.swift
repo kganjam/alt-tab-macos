@@ -504,9 +504,9 @@ class Window {
     }
 
     /// Instantly make a window invisible via CGSSetWindowAlpha(0).
-    /// Restores to full opacity after `duration` seconds.
-    /// If CGSSetWindowAlpha fails cross-process (error 1000), it's a no-op.
+    /// Gated behind "hideSourceWindow" UserDefaults toggle.
     private func hideWindowTemporarily(_ wid: CGWindowID, duration: TimeInterval) {
+        guard UserDefaults.standard.bool(forKey: "hideSourceWindow") else { return }
         let err = CGSSetWindowAlpha(CGS_CONNECTION, wid, 0)
         if err == .success {
             Diagnostics.log("HIDE", "hid wid=\(wid) for \(duration)s")

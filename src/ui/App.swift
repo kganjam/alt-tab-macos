@@ -222,10 +222,7 @@ class App: AppCenterApplication {
     @objc static func toggleOverlayMode() {
         let newValue = !FocusOverlay.overlayModeEnabled
         UserDefaults.standard.set(newValue, forKey: "overlayMode")
-        // Update menu checkmark
-        if let item = Menubar.menu.items.first(where: { $0.title == "Parallels Overlay Mode" }) {
-            item.state = newValue ? .on : .off
-        }
+        updateParallelsMenuStates()
         if newValue {
             if #available(macOS 14.0, *) {
                 FocusOverlay.createPersistentOverlay()
@@ -236,6 +233,34 @@ class App: AppCenterApplication {
             FocusOverlay.clearPreCaptureCache()
         }
         Diagnostics.log("OVERLAY", "overlay mode \(newValue ? "ON" : "OFF")")
+    }
+
+    @objc static func toggleHideSource() {
+        let key = "hideSourceWindow"
+        let newValue = !UserDefaults.standard.bool(forKey: key)
+        UserDefaults.standard.set(newValue, forKey: key)
+        updateParallelsMenuStates()
+        Diagnostics.log("HIDE", "hide source window \(newValue ? "ON" : "OFF")")
+    }
+
+    @objc static func toggleDiagnostics() {
+        let key = "diagnosticsEnabled"
+        let newValue = !Diagnostics.enabled
+        UserDefaults.standard.set(newValue, forKey: key)
+        updateParallelsMenuStates()
+    }
+
+    private static func updateParallelsMenuStates() {
+        guard let parallelsItem = Menubar.menu.items.first(where: { $0.title == "Parallels Mode" }),
+              let sub = parallelsItem.submenu else { return }
+        for item in sub.items {
+            switch item.title {
+            case "Enable Overlay Mode": item.state = FocusOverlay.overlayModeEnabled ? .on : .off
+            case "Hide Source Window": item.state = UserDefaults.standard.bool(forKey: "hideSourceWindow") ? .on : .off
+            case "Diagnostics Logging": item.state = Diagnostics.enabled ? .on : .off
+            default: break
+            }
+        }
     }
 
     @objc static func showAboutWindow() {

@@ -34,10 +34,23 @@ class Menubar {
         addMenuItem(NSLocalizedString("Send feedback…", comment: "Menubar option"), #selector(App.showFeedbackPanel), "", "text.bubble", nil, App.self)
         addMenuItem(NSLocalizedString("Support this project", comment: "Menubar option"), App.supportProjectAction, "", "heart.fill", .red, App.self)
         menu.addItem(NSMenuItem.separator())
-        let overlayItem = NSMenuItem(title: "Parallels Overlay Mode", action: #selector(App.toggleOverlayMode), keyEquivalent: "")
-        overlayItem.target = App.self
-        overlayItem.state = FocusOverlay.overlayModeEnabled ? .on : .off
-        menu.addItem(overlayItem)
+        let overlayMenu = NSMenu(title: "Parallels Mode")
+        let overlayToggle = NSMenuItem(title: "Enable Overlay Mode", action: #selector(App.toggleOverlayMode), keyEquivalent: "")
+        overlayToggle.target = App.self
+        overlayToggle.state = FocusOverlay.overlayModeEnabled ? .on : .off
+        overlayMenu.addItem(overlayToggle)
+        overlayMenu.addItem(NSMenuItem.separator())
+        let hideSourceToggle = NSMenuItem(title: "Hide Source Window", action: #selector(App.toggleHideSource), keyEquivalent: "")
+        hideSourceToggle.target = App.self
+        hideSourceToggle.state = UserDefaults.standard.bool(forKey: "hideSourceWindow") ? .on : .off
+        overlayMenu.addItem(hideSourceToggle)
+        let diagnosticsToggle = NSMenuItem(title: "Diagnostics Logging", action: #selector(App.toggleDiagnostics), keyEquivalent: "")
+        diagnosticsToggle.target = App.self
+        diagnosticsToggle.state = Diagnostics.enabled ? .on : .off
+        overlayMenu.addItem(diagnosticsToggle)
+        let parallelsItem = NSMenuItem(title: "Parallels Mode", action: nil, keyEquivalent: "")
+        parallelsItem.submenu = overlayMenu
+        menu.addItem(parallelsItem)
         menu.addItem(NSMenuItem.separator())
         addMenuItem(String(format: NSLocalizedString("Quit %@", comment: "Menubar option. %@ is AltTab"), App.name), #selector(NSApplication.terminate(_:)), "q", nil) // "xmark.rectangle" is not necessary; macos automatically recognizes Quit
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
