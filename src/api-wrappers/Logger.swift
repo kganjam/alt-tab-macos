@@ -275,28 +275,25 @@ class FocusOverlay {
     /// transition. Avoids the panel-creation gap that let OneNote flash.
     private static var persistentPanel: NSPanel?
 
-    /// Pre-captured sharp image, ready for instant display on release.
-    static var preCapturedImage: CGImage?
-    static var preCapturedWid: CGWindowID?
+    /// Pre-captured sharp images keyed by wid. Multiple windows can be
+    /// pre-captured in parallel during switcher display.
+    static var preCaptureCache: [CGWindowID: CGImage] = [:]
 
-    /// Start capturing the target window on a background thread NOW.
-    /// Uses bestResolution (retina) to match display pixel density.
-    /// Cached captures are 9-16ms; uncached 1-2s but pre-capturing
-    /// during switcher display gives us a head start.
+    /// Start capturing a window on a background thread NOW.
     static func preCapture(wid: CGWindowID, position: CGPoint, size: CGSize) {
-        preCapturedImage = nil
-        preCapturedWid = wid
-        let scale = NSScreen.main?.backingScaleFactor ?? 2.0
         DispatchQueue.global(qos: .userInteractive).async {
             let t0 = CACurrentMediaTime()
             let rect = CGRect(x: position.x, y: position.y, width: size.width, height: size.height)
             if let img = CGWindowListCreateImage(rect, .optionIncludingWindow, wid, [.boundsIgnoreFraming, .bestResolution]) {
                 let ms = Int((CACurrentMediaTime() - t0) * 1000)
-                Diagnostics.log("OVERLAY", "pre-captured wid=\(wid) \(img.width)x\(img.height) scale=\(scale) in \(ms)ms")
-                preCapturedImage = img
-                preCapturedWid = wid
+                Diagnostics.log("OVERLAY", "pre-captured wid=\(wid) \(img.width)x\(img.height) in \(ms)ms")
+                preCaptureCache[wid] = img
             }
         }
+    }
+
+    static func clearPreCaptureCache() {
+        preCaptureCache.removeAll()
     }
 
     /// Call once at launch to create the persistent overlay panel.
@@ -359,9 +356,9 @@ class FocusOverlay {
         var rendered = false
         do {
             var cgImage: CGImage? = nil
-            if let wid = target.cgWindowId, preCapturedWid == wid, let sharp = preCapturedImage {
+            if let wid = target.cgWindowId, let sharp = preCaptureCache[wid] {
                 cgImage = sharp
-                Diagnostics.log("OVERLAY", "fallback: pre-captured sharp")
+                Diagnostics.log("OVERLAY", "using pre-captured sharp \(sharp.width)x\(sharp.height)")
             } else if let thumbnail = target.thumbnail {
                 switch thumbnail {
                 case .cgImage(let img): cgImage = img
@@ -392,8 +389,7 @@ class FocusOverlay {
             containerView.layer?.addSublayer(blueLayer)
             Diagnostics.log("OVERLAY", "fallback blue")
         }
-        preCapturedImage = nil
-        preCapturedWid = nil
+        clearPreCaptureCache()
 
         panel.orderFrontRegardless()
         CATransaction.flush()
