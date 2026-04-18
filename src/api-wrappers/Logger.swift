@@ -381,19 +381,9 @@ class FocusOverlay {
         // Use pre-captured sharp image or thumbnail at target position.
         // CALayerHost didn't work (wid isn't a valid contextId,
         // CGSCopyWindowProperty("CtxID") returns nil on macOS 15+).
-        // Try AVSampleBufferDisplayLayer (GPU-native video frame display)
+        // Pre-captured CGImage (CIContext GPU conversion from CVPixelBuffer)
         var rendered = false
-        if let wid = target.cgWindowId, let sample = preCapturedSample[wid] {
-            let displayLayer = AVSampleBufferDisplayLayer()
-            displayLayer.frame = frame
-            displayLayer.videoGravity = .resizeAspectFill
-            displayLayer.enqueue(sample)
-            containerView.layer?.addSublayer(displayLayer)
-            rendered = true
-            Diagnostics.log("OVERLAY", "AVSampleBufferDisplayLayer for wid=\(wid)")
-        }
-        // Fallback: pre-captured CGImage
-        if !rendered, let wid = target.cgWindowId, let img = preCaptureCache[wid] {
+        if let wid = target.cgWindowId, let img = preCaptureCache[wid] {
             let layer = CALayer()
             layer.contents = img
             layer.contentsGravity = .resizeAspectFill
