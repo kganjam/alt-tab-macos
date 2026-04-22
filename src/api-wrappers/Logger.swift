@@ -213,6 +213,27 @@ class Diagnostics {
         log("TEST", "permanent test overlay shown at level 2147483631")
     }
 
+    /// Sample the TRUE window z-order every 200ms for 5 seconds.
+    /// Captures what's actually on top at the compositor level.
+    /// Call after a focus transition to see the z-order fight.
+    static func sampleZOrderOverTime(label: String, durationMs: Int = 5000, intervalMs: Int = 200) {
+        guard enabled else { return }
+        let samples = durationMs / intervalMs
+        for i in 0..<samples {
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(i * intervalMs)) {
+                logSystemZOrder("\(label) +\(i * intervalMs)ms")
+            }
+        }
+    }
+
+    /// Log which app is frontmost + which window is key, with timestamp.
+    /// Lightweight — no CGWindowList call.
+    static func logFrontmostQuick(_ label: String) {
+        guard enabled else { return }
+        let nsw = NSWorkspace.shared.frontmostApplication
+        log("ZQUICK", "\(label): pid=\(nsw?.processIdentifier ?? 0) app=\(nsw?.bundleIdentifier ?? "?") frontPid=\(Applications.frontmostPid ?? 0)")
+    }
+
     static func startContinuousMonitoring() {
         guard enabled else { return }
         // Default: OFF. Monitor only runs when explicitly enabled with

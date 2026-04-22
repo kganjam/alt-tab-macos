@@ -345,9 +345,21 @@ class App: AppCenterApplication {
         KeyRepeatTimer.startRepeatingKeyPreviousWindow()
     }
 
+    private static var lastFocusTime: CFAbsoluteTime = 0
+
     static func focusSelectedWindow(_ selectedWindow: Window?) {
         guard appIsBeingUsed else { return } // already hidden
+        // Debounce: ignore duplicate fires within 100ms
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - lastFocusTime < 0.1 {
+            Diagnostics.log("KEY", "DEBOUNCED duplicate focusSelectedWindow (gap=\(Int((now - lastFocusTime) * 1000))ms)")
+            return
+        }
+        lastFocusTime = now
         Diagnostics.log("KEY", "release → focusSelectedWindow target=\(selectedWindow?.debugId ?? "nil")")
+        Diagnostics.logFrontmostQuick("pre-focus")
+        // Sample z-order every 200ms for 5 sec to catch Parallels re-raises
+        Diagnostics.sampleZOrderOverTime(label: "focus-\(selectedWindow?.cgWindowId ?? 0)")
         // Show the TARGET window's cached content on an overlay at max
         // level. Terminal stays visible regardless of Parallels' re-raise.
         // IOSurface→CGImage conversion via CIContext (GPU, fast).
