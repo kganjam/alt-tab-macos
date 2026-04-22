@@ -21,7 +21,11 @@ class Windows {
     /// updates for any window OTHER than this target.
     static var altTabFocusTarget: Window?
     static var altTabFocusTargetUntil: CFAbsoluteTime = 0
-    static let altTabFocusGuardMs: Double = 2000
+    // Guard was 2000ms but that blocked user clicks on other windows
+    // for 2 seconds after every alt-tab. 500ms catches Parallels'
+    // immediate transient activation (~100ms) without interfering
+    // with user-initiated clicks (typically 500ms+ after release).
+    static let altTabFocusGuardMs: Double = 500
     /// Bumped on every Parallels-involved focus transition. Delayed
     /// snapshot-restore blocks check this and skip if a newer transition
     /// has started, so a late restore can't clobber the user's latest
