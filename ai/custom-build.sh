@@ -49,9 +49,9 @@ sudo cp -R DerivedData/Build/Products/Release/AltTab.app /Applications/AltTab.ap
 # Ensure diagnostics are on by default for this launch
 defaults delete com.lwouis.alt-tab-macos diagnosticsEnabled 2>/dev/null || true
 
-# Truncate the run log and launch
-: > /tmp/alttab-run.log
-/Applications/AltTab.app/Contents/MacOS/AltTab > /tmp/alttab-run.log 2>&1 &
+# Append to run log (don't truncate) with build marker
+echo "=== NEW BUILD: $BUILD_DATE (pid $$) ===" >> /tmp/alttab-run.log
+/Applications/AltTab.app/Contents/MacOS/AltTab >> /tmp/alttab-run.log 2>&1 &
 
 sleep 3
 PID=$(pgrep -f "/Applications/AltTab.app/Contents/MacOS/AltTab" | head -1)

@@ -487,9 +487,20 @@ class App: AppCenterApplication {
                 previousSessionSourceWid = sessionSourceWid
                 sessionSourceWid = newSourceWid
             }
-            Windows.normalizeFocusOrderAtSessionStart(
-                currentWid: sessionSourceWid,
-                previousWid: previousSessionSourceWid)
+            // Only normalize when the PREVIOUS session involved Parallels.
+            // For regular focus changes (clicking links, app launches),
+            // the AX-based updateLastFocusOrder already handles recency
+            // correctly. Our normalize OVERWRITES that with stale session
+            // data — causing e.g. OneNote to jump ahead of Outlook after
+            // opening a link from Outlook that activated Safari.
+            let prevSourceIsPar = previousSessionSourceWid.flatMap { wid in
+                Windows.list.first { $0.cgWindowId == wid }?.application.isParallelsCoherence
+            } ?? false
+            if prevSourceIsPar {
+                Windows.normalizeFocusOrderAtSessionStart(
+                    currentWid: sessionSourceWid,
+                    previousWid: previousSessionSourceWid)
+            }
             Diagnostics.logFrontmostSignals("session-start post")
             Diagnostics.logTrackedRecency("session-start post")
         }
