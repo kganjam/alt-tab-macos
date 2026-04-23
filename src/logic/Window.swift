@@ -590,7 +590,11 @@ class Window {
     /// process). When the app is already front, we don't need SLPS/
     /// makeKeyWindow/activate — just AX to change the key window.
     private func isSameProcessAsCurrentFrontmost() -> Bool {
-        application.pid == Applications.frontmostPid
+        // Check both current frontmost AND session source pid.
+        // During alt-tab, frontmostPid may be AltTab itself or stale.
+        // Session source captures the real pre-panel app.
+        application.pid == Applications.frontmostPid ||
+        application.pid == App.sessionSourcePid
     }
 
     /// Par→Par SAME PROCESS. Both source and target are Coherence windows
