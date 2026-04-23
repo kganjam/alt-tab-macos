@@ -486,20 +486,20 @@ class App: AppCenterApplication {
             if newSourceWid != sessionSourceWid {
                 previousSessionSourceWid = sessionSourceWid
                 sessionSourceWid = newSourceWid
-            }
-            // Only normalize when the PREVIOUS session involved Parallels.
-            // For regular focus changes (clicking links, app launches),
-            // the AX-based updateLastFocusOrder already handles recency
-            // correctly. Our normalize OVERWRITES that with stale session
-            // data — causing e.g. OneNote to jump ahead of Outlook after
-            // opening a link from Outlook that activated Safari.
-            let prevSourceIsPar = previousSessionSourceWid.flatMap { wid in
-                Windows.list.first { $0.cgWindowId == wid }?.application.isParallelsCoherence
-            } ?? false
-            if prevSourceIsPar {
-                Windows.normalizeFocusOrderAtSessionStart(
-                    currentWid: sessionSourceWid,
-                    previousWid: previousSessionSourceWid)
+                // Only normalize when the source actually changed AND
+                // the PREVIOUS session involved Parallels. When the source
+                // hasn't changed (e.g. rapid A→B→A round-trip), the
+                // manualUpdateFocusOrderForParallelsTransition already set
+                // the recency correctly — normalize would overwrite it
+                // with stale previousSessionSourceWid data.
+                let prevSourceIsPar = previousSessionSourceWid.flatMap { wid in
+                    Windows.list.first { $0.cgWindowId == wid }?.application.isParallelsCoherence
+                } ?? false
+                if prevSourceIsPar {
+                    Windows.normalizeFocusOrderAtSessionStart(
+                        currentWid: sessionSourceWid,
+                        previousWid: previousSessionSourceWid)
+                }
             }
             Diagnostics.logFrontmostSignals("session-start post")
             Diagnostics.logTrackedRecency("session-start post")
@@ -647,6 +647,12 @@ extension App: NSApplicationDelegate {
         #if !DEBUG
         PFMoveToApplicationsFolderIfNecessary()
         #endif
+        // Global mouse click monitor: tracks clicks to distinguish
+        // user-initiated window activations from Parallels' automatic
+        // re-activation during the focus guard period.
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { _ in
+            Windows.lastMouseClickTime = CFAbsoluteTimeGetCurrent()
+        }
         AXUIElement.setGlobalTimeout()
         Preferences.initialize()
         BackgroundWork.preStart()

@@ -304,29 +304,25 @@ class Window {
         Diagnostics.log("FOCUS", "enter focusMacOsWindowOverParallelsCoherence target=\(debugId ?? "?")")
         Diagnostics.logFrontmostSignals("before Par→mac")
         guard let targetWid = cgWindowId else { return }
-        // Hide the source window instantly via CGSSetWindowAlpha(0).
-        // Prevents the source from flickering during the transition.
-        // Restored after 2s.
         if let sourceWid = previouslyFrontmostWindowId() {
-            hideWindowTemporarily(sourceWid, duration: 2.0)
+            let err = CGSSetWindowAlpha(CGS_CONNECTION, sourceWid, 0)
+            Diagnostics.log("API", "CGSSetWindowAlpha(wid=\(sourceWid), 0) → \(err.rawValue)")
+            if err == .success {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                    CGSSetWindowAlpha(CGS_CONNECTION, sourceWid, 1)
+                    Diagnostics.log("API", "CGSSetWindowAlpha(wid=\(sourceWid), 1) restore")
+                }
+            }
         }
         scheduleDelayedReRaise(targetWid: targetWid)
         installWorkspaceActivationWatcher(targetWid: targetWid)
         Windows.armAltTabFocusGuard(for: self)
-        let sourceWid = previouslyFrontmostWindowId()
-        CGSDisableUpdate(CGS_CONNECTION)
-        pinTargetLevelTemporarily(sourceWid: sourceWid)
         var psn = ProcessSerialNumber()
         GetProcessForPID(application.pid, &psn)
-        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
-        // Add makeKeyWindow back. Originally removed because of a theory
-        // that its synthetic events confused Parallels; but with Cmd→Ctrl
-        // keymap fix, the Windows Start-menu trigger is gone, and
-        // without makeKeyWindow, cross-Space switches (target on a
-        // different Space than current) don't trigger properly — the
-        // target stays on its original Space and never becomes visible.
+        let slpsErr = _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
+        Diagnostics.log("API", "SLPS(pid=\(application.pid), wid=\(targetWid)) → \(slpsErr)")
         makeKeyWindow(&psn)
-        CGSReenableUpdate(CGS_CONNECTION)
+        Diagnostics.log("API", "makeKeyWindow(pid=\(application.pid), wid=\(targetWid))")
         manuallyUpdateFocusOrderForParallelsTransition()
         pollForTargetAppFrontmostAndRaise(attempt: 0)
     }
@@ -355,29 +351,30 @@ class Window {
     private func atomicallyPinAndActivate() {
         Diagnostics.log("FOCUS", "enter atomicallyPinAndActivate target=\(debugId ?? "?")")
         guard let targetWid = cgWindowId else { return }
-        // Hide the source window to prevent flicker during transition
         if let sourceWid = previouslyFrontmostWindowId() {
-            hideWindowTemporarily(sourceWid, duration: 2.0)
+            let err = CGSSetWindowAlpha(CGS_CONNECTION, sourceWid, 0)
+            Diagnostics.log("API", "CGSSetWindowAlpha(wid=\(sourceWid), 0) → \(err.rawValue)")
+            if err == .success {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                    CGSSetWindowAlpha(CGS_CONNECTION, sourceWid, 1)
+                    Diagnostics.log("API", "CGSSetWindowAlpha(wid=\(sourceWid), 1) restore")
+                }
+            }
         }
         Windows.armAltTabFocusGuard(for: self)
-        let sourceWid = previouslyFrontmostWindowId()
-        CGSDisableUpdate(CGS_CONNECTION)
-        pinTargetLevelTemporarily(sourceWid: sourceWid)
         var psn = ProcessSerialNumber()
         GetProcessForPID(application.pid, &psn)
-        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
+        let slpsErr = _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
+        Diagnostics.log("API", "SLPS(pid=\(application.pid), wid=\(targetWid)) → \(slpsErr)")
         makeKeyWindow(&psn)
-        CGSReenableUpdate(CGS_CONNECTION)
+        Diagnostics.log("API", "makeKeyWindow(pid=\(application.pid), wid=\(targetWid))")
         application.runningApplication.activate(options: [])
+        Diagnostics.log("API", "activate(options:[], pid=\(application.pid))")
         manuallyUpdateFocusOrderForParallelsTransition()
-        // AX raise is synchronous IPC into the target app. For Parallels
-        // Coherence windows, that IPC goes through Parallels' guest tools
-        // into the actual Windows app, which can block for seconds if the
-        // Windows app is busy. Run it on the background AX queue so it
-        // can't freeze the main thread / cursor.
         BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
             guard let self else { return }
             try? self.axUiElement?.focusWindow()
+            Diagnostics.log("API", "AX focusWindow(wid=\(targetWid)) done")
         }
     }
 
@@ -445,20 +442,18 @@ class Window {
     private func scheduleDelayedReRaise(targetWid: CGWindowID) {
         Windows.parallelsTransitionGeneration &+= 1
         let myGen = Windows.parallelsTransitionGeneration
-        let targetPid = application.pid
         for delayMs in [400, 700, 1000] {
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
                 guard let self, Windows.parallelsTransitionGeneration == myGen else { return }
-                var psn = ProcessSerialNumber()
-                GetProcessForPID(targetPid, &psn)
-                _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
-                self.makeKeyWindow(&psn)
+                // Use activate(options:[]) instead of SLPS to avoid
+                // bringing ALL process windows to front. Only the
+                // key window comes forward with empty options.
+                self.application.runningApplication.activate(options: [])
+                Diagnostics.log("API", "RERAISE +\(delayMs)ms activate(options:[], pid=\(self.application.pid))")
                 BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
                     guard let self else { return }
                     try? self.axUiElement?.focusWindow()
-                    Diagnostics.log("RERAISE", "+\(delayMs)ms re-raised target=\(self.debugId ?? "?")")
-                    // Don't dismiss overlay early — let it live for full
-                    // duration to prevent any late Parallels re-raise flash.
+                    Diagnostics.log("API", "RERAISE +\(delayMs)ms AX focusWindow(wid=\(targetWid)) done")
                 }
             }
         }
@@ -482,10 +477,9 @@ class Window {
             guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
                   app.processIdentifier != targetPid else { return }
             Diagnostics.log("WSCOUNTER", "NSWorkspace detected steal by pid=\(app.processIdentifier) \(app.bundleIdentifier ?? "?"), counter-raising \(self.debugId ?? "?")")
-            var psn = ProcessSerialNumber()
-            GetProcessForPID(targetPid, &psn)
-            _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
-            self.makeKeyWindow(&psn)
+            // Use activate(options:[]) instead of SLPS to avoid
+            // bringing ALL process windows to front.
+            self.application.runningApplication.activate(options: [])
             BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
                 try? self?.axUiElement?.focusWindow()
             }
@@ -520,9 +514,23 @@ class Window {
     }
 
     private func previouslyFrontmostWindowId() -> CGWindowID? {
-        guard let sourcePid = App.sessionSourcePid ?? Applications.frontmostPid,
-              sourcePid != application.pid,
-              let sourceApp = (Applications.list.first { $0.pid == sourcePid }) else { return nil }
+        // Try sessionSourcePid first; if it matches the target (rapid A→B→A),
+        // fall back to frontmostPid. Also try lastFocusedTargetWid directly
+        // as a final fallback for cross-process round-trips.
+        var sourcePid = App.sessionSourcePid
+        if sourcePid == application.pid {
+            sourcePid = Applications.frontmostPid
+        }
+        if sourcePid == nil || sourcePid == application.pid {
+            // Last resort: use lastFocusedTargetWid if it belongs to a different app
+            if let wid = App.lastFocusedTargetWid,
+               let w = Windows.list.first(where: { $0.cgWindowId == wid }),
+               w.application.pid != application.pid {
+                return wid
+            }
+            return nil
+        }
+        guard let sourceApp = (Applications.list.first { $0.pid == sourcePid }) else { return nil }
         return sourceApp.focusedWindow?.cgWindowId
     }
 
@@ -611,11 +619,14 @@ class Window {
     private func focusParallelsCoherenceWindowSameProcess() {
         Diagnostics.log("FOCUS", "enter focusParallelsCoherenceWindowSameProcess target=\(debugId ?? "?")")
         manuallyUpdateFocusOrderForParallelsTransition()
+        let targetWid = cgWindowId
         BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
             guard let self, let appAx = self.application.axUiElement,
                   let selfAx = self.axUiElement else { return }
             try? appAx.setAttribute(kAXFocusedWindowAttribute, selfAx)
+            Diagnostics.log("API", "AX setAttribute(focusedWindow, wid=\(targetWid ?? 0))")
             try? selfAx.focusWindow()
+            Diagnostics.log("API", "AX focusWindow(wid=\(targetWid ?? 0)) done")
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
             Windows.previewSelectedWindowIfNeeded()

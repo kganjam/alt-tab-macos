@@ -101,7 +101,7 @@ class Diagnostics {
     private static let startTime = Date()
 
     static var enabled: Bool {
-        if UserDefaults.standard.object(forKey: enabledKey) == nil { return false }
+        if UserDefaults.standard.object(forKey: enabledKey) == nil { return true }
         return UserDefaults.standard.bool(forKey: enabledKey)
     }
 
@@ -133,34 +133,31 @@ class Diagnostics {
 
     static func logSystemZOrder(_ label: String) {
         guard enabled else { return }
-        // Query ALL windows (not just .optionOnScreenOnly) so we can see
-        // targets that are on a different Space. Flag with [s=N] = on
-        // active space indicator so we can tell if the target is even
-        // visible on the current Space.
-        let options: CGWindowListOption = [.excludeDesktopElements]
+        // Use .optionOnScreenOnly — Apple only guarantees front-to-back
+        // z-order for "OnScreen" options. Without it, ordering is undefined.
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return }
         let filtered = info.filter { w in
             let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
             if sysZOwnerBlocklist.contains(owner) { return false }
-            // Drop hidden/off-screen / zero-alpha overlays
             let alpha = (w[kCGWindowAlpha as String] as? Double) ?? 1.0
             if alpha < 0.1 { return false }
-            // Drop zero-size helper windows
             if let bounds = w[kCGWindowBounds as String] as? [String: Any],
                let width = bounds["Width"] as? Double, width < 40 { return false }
             return true
         }
+        var idx = 0
         let top = filtered.prefix(8).map { (w: [String: Any]) -> String in
             let owner = (w[kCGWindowOwnerName as String] as? String) ?? "?"
             let name = (w[kCGWindowName as String] as? String) ?? ""
             let wid = (w[kCGWindowNumber as String] as? Int) ?? 0
             let layer = (w[kCGWindowLayer as String] as? Int) ?? 0
-            let onScreen = (w[kCGWindowIsOnscreen as String] as? Bool) ?? false
             var actualLevel: CGWindowLevel = -1
             CGSGetWindowLevel(CGS_CONNECTION, CGWindowID(wid), &actualLevel)
             let short = name.isEmpty ? "" : ":\(name.prefix(22))"
-            let vis = onScreen ? "on" : "OFF"
-            return "[\(vis)] cLv\(layer)/aLv\(actualLevel) #\(wid) \(owner)\(short)"
+            let result = "z\(idx) Lv\(layer) #\(wid) \(owner)\(short)"
+            idx += 1
+            return result
         }
         log("SYSZ", "\(label): \(top.joined(separator: " || "))")
     }
@@ -300,7 +297,7 @@ class FocusOverlay {
     private static let overlayLevel: NSWindow.Level = .init(rawValue: 50)
 
     static var enabled: Bool {
-        if UserDefaults.standard.object(forKey: enabledKey) == nil { return false }
+        if UserDefaults.standard.object(forKey: enabledKey) == nil { return true }
         return UserDefaults.standard.bool(forKey: enabledKey)
     }
 

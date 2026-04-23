@@ -21,11 +21,10 @@ class Windows {
     /// updates for any window OTHER than this target.
     static var altTabFocusTarget: Window?
     static var altTabFocusTargetUntil: CFAbsoluteTime = 0
-    // Guard was 2000ms but that blocked user clicks on other windows
-    // for 2 seconds after every alt-tab. 500ms catches Parallels'
-    // immediate transient activation (~100ms) without interfering
-    // with user-initiated clicks (typically 500ms+ after release).
-    static let altTabFocusGuardMs: Double = 500
+    // Guard must cover: Parallels' timer-driven re-activation (~500-1500ms),
+    // our RERAISE at 400/700/1000ms, AND the source-hide duration (3s).
+    // User clicks are detected via mouse monitor and bypass the guard.
+    static let altTabFocusGuardMs: Double = 3000
     /// Bumped on every Parallels-involved focus transition. Delayed
     /// snapshot-restore blocks check this and skip if a newer transition
     /// has started, so a late restore can't clobber the user's latest
@@ -114,23 +113,35 @@ class Windows {
     /// so AX IPC can't freeze main thread.
     static var counterRaiseCount = 0
     static let maxCounterRaises = 3
+    /// Timestamp of the last global mouse click, used to distinguish
+    /// user-initiated window activations from Parallels' automatic
+    /// re-activation. Updated by the global event monitor installed
+    /// at startup.
+    static var lastMouseClickTime: CFAbsoluteTime = 0
 
     static func shouldSuppressApplicationActivation(for app: Application) -> Bool {
         guard CFAbsoluteTimeGetCurrent() < altTabFocusTargetUntil,
               let target = altTabFocusTarget else { return false }
         guard target.application.pid != app.pid else { return false }
-        // Counter-raise: Parallels just stole front — take it back.
-        if counterRaiseCount < maxCounterRaises {
+        // If a mouse click happened recently, this is a user-initiated
+        // activation — allow it through and clear the guard so subsequent
+        // AX events from the clicked window also pass.
+        let timeSinceClick = CFAbsoluteTimeGetCurrent() - lastMouseClickTime
+        if timeSinceClick < 0.5 {
+            Diagnostics.log("CLICK", "mouse click detected \(Int(timeSinceClick * 1000))ms ago, allowing activation of pid=\(app.pid) \(app.bundleIdentifier ?? "?"), clearing guard")
+            clearAltTabFocusGuard()
+            return false
+        }
+        // Suppress ALL non-target activations during the guard, not just
+        // Parallels. During rapid double alt-tabs, the FIRST target's
+        // stale AXEVENT can arrive after we've switched to the second
+        // target, corrupting frontmostPid. User clicks are already
+        // handled above via the mouse click check.
+        // Counter-raise only for Parallels (they actively fight back).
+        if app.isParallelsCoherence, counterRaiseCount < maxCounterRaises {
             counterRaiseCount += 1
-            let targetWid = target.cgWindowId
-            let targetPid = target.application.pid
             Diagnostics.log("COUNTER", "Parallels stole front (attempt \(counterRaiseCount)/\(maxCounterRaises)), counter-raising \(target.debugId ?? "?")")
-            var psn = ProcessSerialNumber()
-            GetProcessForPID(targetPid, &psn)
-            if let wid = targetWid {
-                _SLPSSetFrontProcessWithOptions(&psn, wid, SLPSMode.userGenerated.rawValue)
-                target.makeKeyWindow(&psn)
-            }
+            target.application.runningApplication.activate(options: [])
             BackgroundWork.accessibilityCommandsQueue.addOperation { [weak target] in
                 guard let target else { return }
                 try? target.axUiElement?.focusWindow()
