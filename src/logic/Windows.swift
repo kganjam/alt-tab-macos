@@ -77,7 +77,6 @@ class Windows {
         let pid: pid_t
         let timestamp: CFAbsoluteTime
         weak var window: Window?
-        let knownSameAppWids: Set<CGWindowID>
         var raiseAttempts: Int = 0
         var wasEverAtZ0: Bool = false
         static let maxRaiseAttempts = 6
@@ -97,16 +96,9 @@ class Windows {
             recentZOrderIntents.removeAll { now - $0.timestamp > 5.0 }
             // Remove prior entry for same wid (update timestamp)
             recentZOrderIntents.removeAll { $0.wid == wid }
-            // Capture all tracked wids from the same app at focus time.
-            // If activate() raises them, ZENFORCE can distinguish them
-            // from new dialogs that appear after focus.
-            let sameAppWids = Set(list
-                .filter { $0.application.pid == target.application.pid && $0.cgWindowId != wid }
-                .compactMap { $0.cgWindowId })
             recentZOrderIntents.append(ZOrderIntent(
                 wid: wid, pid: target.application.pid,
-                timestamp: now, window: target,
-                knownSameAppWids: sameAppWids))
+                timestamp: now, window: target))
             startZOrderEnforcement()
         }
     }
@@ -162,7 +154,6 @@ class Windows {
             "LocalAuthenticationRemoteService",
         ]
         var targetZPos = -1
-        var sameAppAbove = false
         var pos = 0
         for w in info {
             let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
@@ -176,32 +167,13 @@ class Windows {
                 targetZPos = pos
                 break
             }
-            let ownerPid = (w[kCGWindowOwnerPID as String] as? Int32) ?? 0
-            let aboveWid = CGWindowID(wid)
-            if ownerPid == mostRecent.pid {
-                if mostRecent.knownSameAppWids.contains(aboveWid) {
-                    // This same-app window existed at focus time — it was
-                    // raised by activate(). ZENFORCE should push target
-                    // above it. Don't set sameAppAbove.
-                } else {
-                    // New same-app window (dialog, popup, confirmation).
-                    // Don't push it behind the target.
-                    Diagnostics.log("ZENFORCE", "new same-app wid=\(aboveWid) above target — skipping (dialog?)")
-                    sameAppAbove = true
-                }
-            }
             pos += 1
         }
         if targetZPos == 0 {
-            // Target at z0. If this is the first time it reached z0,
-            // reset the attempt counter so Parallels re-steals get
-            // fresh attempts.
             if !mostRecent.wasEverAtZ0 {
                 recentZOrderIntents[recentZOrderIntents.count - 1].wasEverAtZ0 = true
                 recentZOrderIntents[recentZOrderIntents.count - 1].raiseAttempts = 0
             }
-        } else if targetZPos > 0 && sameAppAbove {
-            Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos) but same-app window above — skipping (dialog?)")
         } else if targetZPos > 0 {
             guard mostRecent.raiseAttempts < ZOrderIntent.maxRaiseAttempts else {
                 Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), max \(ZOrderIntent.maxRaiseAttempts) attempts — stopping")

@@ -547,14 +547,15 @@ class App: AppCenterApplication {
             let isCoherenceSource = App.sessionSourcePid.flatMap { pid in
                 Applications.list.first { $0.pid == pid }?.isParallelsCoherence
             } ?? false
-            let topTargets = Windows.list
+            // Check only the fast-switch target (position 1 = what a quick
+            // alt-tab selects). Don't check top 3 — that triggers coherence
+            // delay for ALL sessions when any Parallels window is recent.
+            let fastSwitchTarget = Windows.list
                 .sorted { $0.lastFocusOrder < $1.lastFocusOrder }
-                .prefix(3)
-            let isCoherenceTarget = topTargets.contains { $0.application.isParallelsCoherence }
-            // Also use coherence delay if recent ZENFORCE activity (indicates
-            // Parallels transitions in the last few seconds).
-            let recentParActivity = !Windows.recentZOrderIntents.isEmpty
-            let isCoherenceInvolved = isCoherenceSource || isCoherenceTarget || recentParActivity
+                .dropFirst() // skip position 0 (current)
+                .first
+            let isCoherenceTarget = fastSwitchTarget?.application.isParallelsCoherence ?? false
+            let isCoherenceInvolved = isCoherenceSource || isCoherenceTarget
             let coherenceMs = UserDefaults.standard.integer(forKey: "coherenceDisplayDelay")
             let delay: DispatchTimeInterval = isCoherenceInvolved
                 ? .milliseconds(coherenceMs)
