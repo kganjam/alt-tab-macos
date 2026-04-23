@@ -350,18 +350,22 @@ class Window {
         Windows.armAltTabFocusGuard(for: self)
         var psn = ProcessSerialNumber()
         GetProcessForPID(application.pid, &psn)
-        // SLPS activates the process with a specific wid hint. It raises
-        // all process windows, but the immediate AX raise afterward pushes
-        // our target to z0. activate(options:[]) was worse — it brings
-        // both "main" and "key" windows forward (Inbox + target email).
-        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
-        Diagnostics.log("API", "SLPS(pid=\(application.pid), wid=\(targetWid))")
+        // Use noWindows mode — activates the process without raising ANY
+        // windows. Then makeKeyWindow + AX raise bring only the target
+        // window forward. userGenerated mode raises ALL process windows.
+        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.noWindows.rawValue)
+        Diagnostics.log("API", "SLPS(pid=\(application.pid), wid=\(targetWid), noWindows)")
         makeKeyWindow(&psn)
         Diagnostics.log("API", "makeKeyWindow(pid=\(application.pid), wid=\(targetWid))")
-        // Synchronous AX raise TWICE — first to set z-order after SLPS,
-        // second after a brief settle to override any Parallels re-ordering.
         try? self.axUiElement?.focusWindow()
-        Diagnostics.log("API", "immediate AX focusWindow(wid=\(targetWid)) #1 done")
+        Diagnostics.log("API", "immediate AX focusWindow(wid=\(targetWid)) done")
+        // Second AX raise after 50ms — the first one sometimes doesn't
+        // stick because the window server hasn't fully processed the
+        // SLPS activation yet.
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in
+            try? self?.axUiElement?.focusWindow()
+            Diagnostics.log("API", "delayed AX focusWindow(wid=\(targetWid)) done")
+        }
         manuallyUpdateFocusOrderForParallelsTransition()
     }
 

@@ -111,10 +111,9 @@ class Windows {
         let myGen = zOrderEnforcementGeneration
         Diagnostics.log("ZENFORCE", "starting timer gen=\(myGen), \(recentZOrderIntents.count) intents")
         let timer = DispatchSource.makeTimerSource(queue: .main)
-        // First check at +500ms (after SLPS + AX raise have settled),
-        // then every 500ms. Faster polling causes flashing as ZENFORCE
-        // and Parallels fight back-and-forth at 200ms intervals.
-        timer.schedule(deadline: .now() + .milliseconds(500),
+        // First check at +200ms to catch initial z-order issues quickly,
+        // then every 500ms for ongoing enforcement.
+        timer.schedule(deadline: .now() + .milliseconds(200),
                        repeating: .milliseconds(500))
         timer.setEventHandler {
             guard zOrderEnforcementGeneration == myGen else { return }
