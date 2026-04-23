@@ -156,6 +156,7 @@ class Windows {
         var targetZPos = -1
         var sameAppDialogAbove = false
         var pos = 0
+        var topWids = [(Int, String)]() // for logging
         for w in info {
             let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
             if blocklist.contains(owner) { continue }
@@ -164,6 +165,8 @@ class Windows {
             if let bounds = w[kCGWindowBounds as String] as? [String: Any],
                let width = bounds["Width"] as? Double, width < 40 { continue }
             let wid = (w[kCGWindowNumber as String] as? Int) ?? 0
+            let name = (w[kCGWindowName as String] as? String) ?? ""
+            if pos < 4 { topWids.append((wid, "\(owner.prefix(8)):\(name.prefix(15))")) }
             if CGWindowID(wid) == mostRecent.wid {
                 targetZPos = pos
                 break
@@ -183,6 +186,8 @@ class Windows {
             }
             pos += 1
         }
+        let zSummary = topWids.enumerated().map { "z\($0.0)=#\($0.1.0) \($0.1.1)" }.joined(separator: " | ")
+        Diagnostics.log("ZENFORCE", "target=\(mostRecent.wid) at z\(targetZPos) [\(zSummary)]")
         if targetZPos == 0 {
             if !mostRecent.wasEverAtZ0 {
                 recentZOrderIntents[recentZOrderIntents.count - 1].wasEverAtZ0 = true
