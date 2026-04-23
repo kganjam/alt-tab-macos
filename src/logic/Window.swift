@@ -302,25 +302,15 @@ class Window {
     /// well-behaved macOS app.
     private func focusMacOsWindowOverParallelsCoherence() {
         Diagnostics.log("FOCUS", "enter focusMacOsWindowOverParallelsCoherence target=\(debugId ?? "?")")
-        Diagnostics.logFrontmostSignals("before Par→mac")
         guard let targetWid = cgWindowId else { return }
-        // No RERAISE — ZENFORCE handles z-order enforcement per-window
-        // without process-level activation side effects.
-        installWorkspaceActivationWatcher(targetWid: targetWid)
         Windows.armAltTabFocusGuard(for: self)
         var psn = ProcessSerialNumber()
         GetProcessForPID(application.pid, &psn)
-        let slpsErr = _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
-        Diagnostics.log("API", "SLPS(pid=\(application.pid), wid=\(targetWid)) → \(slpsErr)")
+        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
         makeKeyWindow(&psn)
-        Diagnostics.log("API", "makeKeyWindow(pid=\(application.pid), wid=\(targetWid))")
-        // Immediate AX raise on MAIN thread — synchronous so it settles
-        // before the compositor can show intermediate z-order (which causes
-        // non-target windows like Edge Beta to flash briefly).
         try? self.axUiElement?.focusWindow()
-        Diagnostics.log("API", "immediate AX focusWindow(wid=\(targetWid)) done")
+        Diagnostics.log("API", "Par→mac: SLPS+makeKey+AX(wid=\(targetWid))")
         manuallyUpdateFocusOrderForParallelsTransition()
-        pollForTargetAppFrontmostAndRaise(attempt: 0)
     }
 
     /// Atomically pin the target to kCGScreenSaverWindowLevel AND set it as
@@ -350,29 +340,14 @@ class Window {
         Windows.armAltTabFocusGuard(for: self)
         var psn = ProcessSerialNumber()
         GetProcessForPID(application.pid, &psn)
-        // Use noWindows mode — activates the process without raising ANY
-        // windows. Then makeKeyWindow + AX raise bring only the target
-        // window forward. userGenerated mode raises ALL process windows.
+        // noWindows mode: activates process without raising ANY windows.
+        // makeKeyWindow: routes keyboard into Windows guest.
+        // AX raise: brings only the target window to z0.
+        // ZENFORCE handles any subsequent Parallels z-order steals.
         _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.noWindows.rawValue)
-        Diagnostics.log("API", "SLPS(pid=\(application.pid), wid=\(targetWid), noWindows)")
         makeKeyWindow(&psn)
-        Diagnostics.log("API", "makeKeyWindow(pid=\(application.pid), wid=\(targetWid))")
         try? self.axUiElement?.focusWindow()
-        Diagnostics.log("API", "immediate AX focusWindow(wid=\(targetWid)) done")
-        // Push the source window above any same-pid siblings that are
-        // between it and the target. Then re-raise the target.
-        // This prevents other Outlook emails from being visually between
-        // the target and the source (Edge Beta).
-        if let sourceWid = previouslyFrontmostWindowId(),
-           let sourceWindow = Windows.list.first(where: { $0.cgWindowId == sourceWid }) {
-            try? sourceWindow.axUiElement?.performAction(kAXRaiseAction as String)
-            try? self.axUiElement?.focusWindow()
-            Diagnostics.log("API", "source-push: raised source wid=\(sourceWid) then re-raised target wid=\(targetWid)")
-        }
-        // Third AX raise after 50ms for any Parallels re-ordering
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in
-            try? self?.axUiElement?.focusWindow()
-        }
+        Diagnostics.log("API", "mac→Par: SLPS(noWin)+makeKey+AX(wid=\(targetWid))")
         manuallyUpdateFocusOrderForParallelsTransition()
     }
 
@@ -436,169 +411,6 @@ class Window {
     /// After SLPS + makeKeyWindow, Parallels has window-level focus but
     /// the Windows-side element-level focus may be wrong (e.g., toolbar
     /// vs content area). Send a benign Shift press/release to trigger
-    /// Parallels' keyboard routing reconciliation without any visible
-    /// side effect in the Windows app.
-    private func nudgeParallelsFocus() {
-        let source = CGEventSource(stateID: .hidSystemState)
-        // Shift key (keycode 56) — benign in all Windows apps
-        let down = CGEvent(keyboardEventSource: source, virtualKey: 56, keyDown: true)
-        let up = CGEvent(keyboardEventSource: source, virtualKey: 56, keyDown: false)
-        down?.flags = .maskShift
-        up?.flags = []
-        down?.post(tap: .cghidEventTap)
-        up?.post(tap: .cghidEventTap)
-        Diagnostics.log("API", "nudgeParallelsFocus: Shift press/release sent")
-    }
-
-    /// NSWorkspace-based activation watcher. Fires when ANY app becomes
-    /// frontmost. If it's not our target's app, counter-raise.
-    private static var workspaceObserver: NSObjectProtocol?
-    private func installWorkspaceActivationWatcher(targetWid: CGWindowID) {
-        Window.removeWorkspaceActivationWatcher()
-        let targetPid = application.pid
-        let myGen = Windows.parallelsTransitionGeneration
-        Window.workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification,
-            object: nil, queue: .main
-        ) { [weak self] note in
-            guard let self, Windows.parallelsTransitionGeneration == myGen else {
-                Window.removeWorkspaceActivationWatcher()
-                return
-            }
-            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                  app.processIdentifier != targetPid else { return }
-            Diagnostics.log("WSCOUNTER", "NSWorkspace detected steal by pid=\(app.processIdentifier) \(app.bundleIdentifier ?? "?"), counter-raising \(self.debugId ?? "?")")
-            // AX raise only — no activate() which is process-level
-            // and raises ALL app windows. ZENFORCE also handles this.
-            BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
-                try? self?.axUiElement?.focusWindow()
-                Diagnostics.log("API", "WSCOUNTER AX focusWindow(wid=\(targetWid)) done")
-            }
-        }
-        // Auto-remove after guard expires
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(Windows.altTabFocusGuardMs))) {
-            Window.removeWorkspaceActivationWatcher()
-        }
-    }
-
-    private static func removeWorkspaceActivationWatcher() {
-        if let obs = workspaceObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(obs)
-            workspaceObserver = nil
-        }
-    }
-
-    /// Pending restore timers per-wid. When hiding a wid that already has
-    /// a pending restore, the old restore is cancelled so overlapping
-    /// hide/restore cycles don't cause premature visibility.
-    private static var pendingRestores = [CGWindowID: DispatchWorkItem]()
-
-    /// Hide a window and schedule a restore. Cancels any prior pending
-    /// restore for the same wid to prevent overlapping timers.
-    static func hideSourceWindow(_ wid: CGWindowID, duration: TimeInterval) {
-        // Cancel any pending restore for this wid
-        pendingRestores[wid]?.cancel()
-        let err = CGSSetWindowAlpha(CGS_CONNECTION, wid, 0)
-        Diagnostics.log("API", "CGSSetWindowAlpha(wid=\(wid), 0) → \(err.rawValue)")
-        if err == .success {
-            let restoreItem = DispatchWorkItem {
-                CGSSetWindowAlpha(CGS_CONNECTION, wid, 1)
-                Diagnostics.log("API", "CGSSetWindowAlpha(wid=\(wid), 1) restore")
-                pendingRestores.removeValue(forKey: wid)
-            }
-            pendingRestores[wid] = restoreItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: restoreItem)
-        }
-    }
-
-    private func previouslyFrontmostWindowId() -> CGWindowID? {
-        // Try sessionSourcePid first; if it matches the target (rapid A→B→A),
-        // fall back to frontmostPid. Also try lastFocusedTargetWid directly
-        // as a final fallback for cross-process round-trips.
-        var sourcePid = App.sessionSourcePid
-        if sourcePid == application.pid {
-            sourcePid = Applications.frontmostPid
-        }
-        if sourcePid == nil || sourcePid == application.pid {
-            // Last resort: use lastFocusedTargetWid if it belongs to a different app
-            if let wid = App.lastFocusedTargetWid,
-               let w = Windows.list.first(where: { $0.cgWindowId == wid }),
-               w.application.pid != application.pid {
-                return wid
-            }
-            return nil
-        }
-        guard let sourceApp = (Applications.list.first { $0.pid == sourcePid }) else { return nil }
-        return sourceApp.focusedWindow?.cgWindowId
-    }
-
-    private static let parallelsOutboundPollAttempts = 10 // 10 × 5ms = 50ms budget
-    private static let parallelsOutboundPollIntervalMs = 5
-    /// No settle needed: overlay covers the visual gap, counter-raise
-    /// handles Parallels' delayed re-activation, and makeKeyWindow in
-    /// the initial SLPS call ensures keyboard routing. Fire AX raise
-    /// immediately when frontmost flips.
-    private static let parallelsOutboundSettleMs = 0
-    private func pollForTargetAppFrontmostAndRaise(attempt: Int) {
-        let targetPid = application.pid
-        let targetIsFrontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPid
-        if targetIsFrontmost || attempt >= Window.parallelsOutboundPollAttempts {
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + .milliseconds(Window.parallelsOutboundSettleMs)
-            ) { [weak self] in
-                guard let self else { return }
-                BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
-                    guard let self else { return }
-                    try? self.axUiElement!.focusWindow()
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
-                    Windows.previewSelectedWindowIfNeeded()
-                }
-            }
-            return
-        }
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + .milliseconds(Window.parallelsOutboundPollIntervalMs)
-        ) { [weak self] in
-            self?.pollForTargetAppFrontmostAndRaise(attempt: attempt + 1)
-        }
-    }
-
-    /// Pin the target window at kCGFloatingWindowLevel (3) for 3s so
-    /// it draws above Parallels' Coherence window at normal level.
-    /// Level 3 is what inspector panels use — high enough to beat
-    /// normal windows, LOW enough that Cocoa still treats the window
-    /// as interactive and routes keyboard input to it.
-    ///
-    /// Previously pinned at kCGScreenSaverWindowLevel (1000), which
-    /// Cocoa classifies as non-interactive (decorative screensaver
-    /// class). Keyboard input bypassed the pinned window and landed
-    /// on whichever window was still at a normal interactive level —
-    /// so typing after switching to OneNote sent keystrokes to
-    /// Terminal.
-    ///
-    /// Restore after 3s with an atomic reorder so if Parallels raised
-    /// its source window to the top of level-0 during the pin, the
-    /// drop doesn't show a z-order flip.
-    private func pinTargetLevelTemporarily(sourceWid: CGWindowID?) {
-        guard let targetWid = cgWindowId else { return }
-        var originalLevel: CGWindowLevel = 0
-        CGSGetWindowLevel(CGS_CONNECTION, targetWid, &originalLevel)
-        // Pin to kCGModalPanelWindowLevel (8) rather than kCGFloatingWindowLevel (3).
-        // Parallels pins its Coherence windows at L3 and has a timer-driven
-        // self-activation that kicks in ~800-1500ms after any focus change,
-        // bringing OneNote back to front within L3. Pinning target at L8
-        // keeps it visually above Parallels' entire L3 tier regardless of
-        // how many times Parallels re-activates. L8 is still Cocoa-
-        // interactive (modal panel class) so keyboard routing works.
-        CGSSetWindowLevel(CGS_CONNECTION, targetWid, 8)
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(3000)) {
-            CGSDisableUpdate(CGS_CONNECTION)
-            CGSSetWindowLevel(CGS_CONNECTION, targetWid, originalLevel)
-            CGSReenableUpdate(CGS_CONNECTION)
-        }
-    }
-
     /// True if the target window's app is already the frontmost process.
     /// Used to take a lighter-weight focus path for Par→Par (same OneNote
     /// process). When the app is already front, we don't need SLPS/

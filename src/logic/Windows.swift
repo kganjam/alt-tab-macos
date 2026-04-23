@@ -93,7 +93,7 @@ class Windows {
         if let wid = target.cgWindowId {
             let now = CFAbsoluteTimeGetCurrent()
             // Prune entries older than 5s
-            recentZOrderIntents.removeAll { now - $0.timestamp > 5.0 }
+            recentZOrderIntents.removeAll { now - $0.timestamp > 3.0 }
             // Remove prior entry for same wid (update timestamp)
             recentZOrderIntents.removeAll { $0.wid == wid }
             recentZOrderIntents.append(ZOrderIntent(
@@ -111,14 +111,15 @@ class Windows {
         let myGen = zOrderEnforcementGeneration
         Diagnostics.log("ZENFORCE", "starting timer gen=\(myGen), \(recentZOrderIntents.count) intents")
         let timer = DispatchSource.makeTimerSource(queue: .main)
-        // First check at +200ms to catch initial z-order issues quickly,
-        // then every 500ms for ongoing enforcement.
-        timer.schedule(deadline: .now() + .milliseconds(200),
-                       repeating: .milliseconds(500))
+        // First check at +100ms, then every 200ms. Parallels re-orders
+        // at ~400ms — we need to catch and correct within that window.
+        // Each check is one CGWindowListCopyWindowInfo + potential AX raise.
+        timer.schedule(deadline: .now() + .milliseconds(100),
+                       repeating: .milliseconds(200))
         timer.setEventHandler {
             guard zOrderEnforcementGeneration == myGen else { return }
             let now = CFAbsoluteTimeGetCurrent()
-            recentZOrderIntents.removeAll { now - $0.timestamp > 5.0 }
+            recentZOrderIntents.removeAll { now - $0.timestamp > 3.0 }
             guard !recentZOrderIntents.isEmpty else {
                 Diagnostics.log("ZENFORCE", "no intents left, stopping timer")
                 zOrderEnforcementTimer?.cancel()
@@ -129,8 +130,8 @@ class Windows {
         }
         timer.resume()
         zOrderEnforcementTimer = timer
-        // Auto-stop after 5s, guarded by generation
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
+        // Auto-stop after 3s (aligned with focus guard duration)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
             guard zOrderEnforcementGeneration == myGen else { return }
             Diagnostics.log("ZENFORCE", "5s auto-stop gen=\(myGen)")
             zOrderEnforcementTimer?.cancel()
