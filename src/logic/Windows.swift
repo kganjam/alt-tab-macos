@@ -210,8 +210,23 @@ class Windows {
             if err == .success {
                 Diagnostics.log("ZENFORCE", "CGSOrderWindow(wid=\(mostRecent.wid)) fixed z\(targetZPos)→z0")
             } else {
-                Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), AX raise #\(attempt)/\(ZOrderIntent.maxRaiseAttempts)")
+                // For same-pid windows (e.g., multiple Outlook emails),
+                // kAXRaiseAction doesn't work — Parallels ignores it.
+                // Use setAttribute(kAXFocusedWindowAttribute) which TELLS
+                // the app which window should be focused.
+                // For same-pid Parallels windows, use makeKeyWindow
+                // (synthetic HID event) which Parallels responds to even
+                // after settling its internal z-order. AX raise alone
+                // doesn't work for same-pid reordering.
+                var psn = ProcessSerialNumber()
+                GetProcessForPID(mostRecent.pid, &psn)
+                window.makeKeyWindow(&psn)
+                if let appAx = window.application.axUiElement,
+                   let selfAx = window.axUiElement {
+                    try? appAx.setAttribute(kAXFocusedWindowAttribute, selfAx)
+                }
                 try? window.axUiElement?.performAction(kAXRaiseAction as String)
+                Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), makeKey+setFocused+raise #\(attempt)/\(ZOrderIntent.maxRaiseAttempts)")
             }
         } else {
             Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) not found in z-order (offscreen?)")
