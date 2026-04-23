@@ -70,10 +70,152 @@ class Windows {
         }
     }
 
+    /// Recent focus targets with intended z-order. The guard periodically
+    /// verifies actual z-order matches intent and re-raises if needed.
+    struct ZOrderIntent {
+        let wid: CGWindowID
+        let pid: pid_t
+        let timestamp: CFAbsoluteTime
+        weak var window: Window?
+        let knownSameAppWids: Set<CGWindowID>
+        var raiseAttempts: Int = 0
+        static let maxRaiseAttempts = 2
+    }
+    static var recentZOrderIntents = [ZOrderIntent]()
+    private static var zOrderEnforcementTimer: DispatchSourceTimer?
+    private static var zOrderEnforcementGeneration: UInt64 = 0
+
     static func armAltTabFocusGuard(for target: Window) {
         altTabFocusTarget = target
         altTabFocusTargetUntil = CFAbsoluteTimeGetCurrent() + altTabFocusGuardMs / 1000.0
         counterRaiseCount = 0
+        // Record this target's intended z-position (topmost)
+        if let wid = target.cgWindowId {
+            let now = CFAbsoluteTimeGetCurrent()
+            // Prune entries older than 5s
+            recentZOrderIntents.removeAll { now - $0.timestamp > 5.0 }
+            // Remove prior entry for same wid (update timestamp)
+            recentZOrderIntents.removeAll { $0.wid == wid }
+            // Capture all tracked wids from the same app at focus time.
+            // If activate() raises them, ZENFORCE can distinguish them
+            // from new dialogs that appear after focus.
+            let sameAppWids = Set(list
+                .filter { $0.application.pid == target.application.pid && $0.cgWindowId != wid }
+                .compactMap { $0.cgWindowId })
+            recentZOrderIntents.append(ZOrderIntent(
+                wid: wid, pid: target.application.pid,
+                timestamp: now, window: target,
+                knownSameAppWids: sameAppWids))
+            startZOrderEnforcement()
+        }
+    }
+
+    /// Poll actual z-order every 500ms for 5s after last focus target.
+    /// If the most recent target isn't at z0 among app windows, re-raise.
+    private static func startZOrderEnforcement() {
+        zOrderEnforcementTimer?.cancel()
+        zOrderEnforcementGeneration &+= 1
+        let myGen = zOrderEnforcementGeneration
+        Diagnostics.log("ZENFORCE", "starting timer gen=\(myGen), \(recentZOrderIntents.count) intents")
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        // First check at +500ms (after SLPS + AX raise have settled),
+        // then every 500ms. Faster polling causes flashing as ZENFORCE
+        // and Parallels fight back-and-forth at 200ms intervals.
+        timer.schedule(deadline: .now() + .milliseconds(500),
+                       repeating: .milliseconds(500))
+        timer.setEventHandler {
+            guard zOrderEnforcementGeneration == myGen else { return }
+            let now = CFAbsoluteTimeGetCurrent()
+            recentZOrderIntents.removeAll { now - $0.timestamp > 5.0 }
+            guard !recentZOrderIntents.isEmpty else {
+                Diagnostics.log("ZENFORCE", "no intents left, stopping timer")
+                zOrderEnforcementTimer?.cancel()
+                zOrderEnforcementTimer = nil
+                return
+            }
+            enforceZOrder()
+        }
+        timer.resume()
+        zOrderEnforcementTimer = timer
+        // Auto-stop after 5s, guarded by generation
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
+            guard zOrderEnforcementGeneration == myGen else { return }
+            Diagnostics.log("ZENFORCE", "5s auto-stop gen=\(myGen)")
+            zOrderEnforcementTimer?.cancel()
+            zOrderEnforcementTimer = nil
+        }
+    }
+
+    /// Check that the most recent target is at z0 in the actual window
+    /// list. If not, use CGSOrderWindow to directly reorder it without
+    /// process-level activation side effects.
+    private static func enforceZOrder() {
+        guard let mostRecent = recentZOrderIntents.last,
+              let window = mostRecent.window else { return }
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return }
+        let blocklist: Set<String> = [
+            "Window Server", "Control Center", "Dock", "AltTab",
+            "Notification Center", "SystemUIServer", "Spotlight",
+            "Menubar", "Wallpaper", "CursorUIViewService",
+            "LocalAuthenticationRemoteService",
+        ]
+        var targetZPos = -1
+        var sameAppAbove = false
+        var pos = 0
+        for w in info {
+            let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
+            if blocklist.contains(owner) { continue }
+            let alpha = (w[kCGWindowAlpha as String] as? Double) ?? 1.0
+            if alpha < 0.1 { continue }
+            if let bounds = w[kCGWindowBounds as String] as? [String: Any],
+               let width = bounds["Width"] as? Double, width < 40 { continue }
+            let wid = (w[kCGWindowNumber as String] as? Int) ?? 0
+            if CGWindowID(wid) == mostRecent.wid {
+                targetZPos = pos
+                break
+            }
+            let ownerPid = (w[kCGWindowOwnerPID as String] as? Int32) ?? 0
+            let aboveWid = CGWindowID(wid)
+            if ownerPid == mostRecent.pid {
+                if mostRecent.knownSameAppWids.contains(aboveWid) {
+                    // This same-app window existed at focus time — it was
+                    // raised by activate(). ZENFORCE should push target
+                    // above it. Don't set sameAppAbove.
+                } else {
+                    // New same-app window (dialog, popup, confirmation).
+                    // Don't push it behind the target.
+                    Diagnostics.log("ZENFORCE", "new same-app wid=\(aboveWid) above target — skipping (dialog?)")
+                    sameAppAbove = true
+                }
+            }
+            pos += 1
+        }
+        if targetZPos == 0 {
+            // Target at z0 — nothing to do.
+        } else if targetZPos > 0 && sameAppAbove {
+            // A window from the same app is above the target — likely a
+            // dialog/popup. Don't AX-raise the target over it.
+            Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos) but same-app window above — skipping (dialog?)")
+        } else if targetZPos > 0 {
+            guard mostRecent.raiseAttempts < ZOrderIntent.maxRaiseAttempts else {
+                Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), max attempts reached — stopping")
+                recentZOrderIntents.removeAll()
+                return
+            }
+            recentZOrderIntents[recentZOrderIntents.count - 1].raiseAttempts += 1
+            let err = CGSOrderWindow(CGS_CONNECTION, mostRecent.wid,
+                                     CGSWindowOrderingMode.above.rawValue, 0)
+            if err == .success {
+                Diagnostics.log("ZENFORCE", "CGSOrderWindow(wid=\(mostRecent.wid), above, 0) fixed z\(targetZPos)→z0")
+            } else {
+                Diagnostics.log("ZENFORCE", "CGSOrderWindow failed err=\(err.rawValue) for wid=\(mostRecent.wid) at z\(targetZPos), AX raise attempt \(mostRecent.raiseAttempts + 1)")
+                try? window.axUiElement?.performAction(kAXRaiseAction as String)
+                Diagnostics.log("ZENFORCE", "AX raise(wid=\(mostRecent.wid)) done")
+            }
+        } else {
+            Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) not found in z-order (offscreen?)")
+        }
     }
 
     /// Clear the guard at the start of each new focus() call so a 2-second
@@ -92,6 +234,13 @@ class Windows {
         altTabFocusTarget = nil
         altTabFocusTargetUntil = 0
         parallelsTransitionGeneration &+= 1
+        // Stop z-order enforcement — a new focus() call means the user
+        // switched to a different window; enforcing the old target's
+        // z-position would fight the user's intent.
+        recentZOrderIntents.removeAll()
+        zOrderEnforcementGeneration &+= 1
+        zOrderEnforcementTimer?.cancel()
+        zOrderEnforcementTimer = nil
     }
 
     static func shouldSuppressFocusOrderUpdate(for window: Window) -> Bool {
@@ -127,7 +276,7 @@ class Windows {
         // activation — allow it through and clear the guard so subsequent
         // AX events from the clicked window also pass.
         let timeSinceClick = CFAbsoluteTimeGetCurrent() - lastMouseClickTime
-        if timeSinceClick < 0.5 {
+        if timeSinceClick < 0.3 {
             Diagnostics.log("CLICK", "mouse click detected \(Int(timeSinceClick * 1000))ms ago, allowing activation of pid=\(app.pid) \(app.bundleIdentifier ?? "?"), clearing guard")
             clearAltTabFocusGuard()
             return false
@@ -141,10 +290,12 @@ class Windows {
         if app.isParallelsCoherence, counterRaiseCount < maxCounterRaises {
             counterRaiseCount += 1
             Diagnostics.log("COUNTER", "Parallels stole front (attempt \(counterRaiseCount)/\(maxCounterRaises)), counter-raising \(target.debugId ?? "?")")
-            target.application.runningApplication.activate(options: [])
+            // AX raise only — no activate() which raises ALL app windows.
+            // ZENFORCE also enforces z-order independently.
             BackgroundWork.accessibilityCommandsQueue.addOperation { [weak target] in
                 guard let target else { return }
                 try? target.axUiElement?.focusWindow()
+                Diagnostics.log("API", "COUNTER AX focusWindow done")
             }
         }
         return true

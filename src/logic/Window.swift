@@ -304,17 +304,8 @@ class Window {
         Diagnostics.log("FOCUS", "enter focusMacOsWindowOverParallelsCoherence target=\(debugId ?? "?")")
         Diagnostics.logFrontmostSignals("before Par→mac")
         guard let targetWid = cgWindowId else { return }
-        if let sourceWid = previouslyFrontmostWindowId() {
-            let err = CGSSetWindowAlpha(CGS_CONNECTION, sourceWid, 0)
-            Diagnostics.log("API", "CGSSetWindowAlpha(wid=\(sourceWid), 0) → \(err.rawValue)")
-            if err == .success {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-                    CGSSetWindowAlpha(CGS_CONNECTION, sourceWid, 1)
-                    Diagnostics.log("API", "CGSSetWindowAlpha(wid=\(sourceWid), 1) restore")
-                }
-            }
-        }
-        scheduleDelayedReRaise(targetWid: targetWid)
+        // No RERAISE — ZENFORCE handles z-order enforcement per-window
+        // without process-level activation side effects.
         installWorkspaceActivationWatcher(targetWid: targetWid)
         Windows.armAltTabFocusGuard(for: self)
         var psn = ProcessSerialNumber()
@@ -323,6 +314,14 @@ class Window {
         Diagnostics.log("API", "SLPS(pid=\(application.pid), wid=\(targetWid)) → \(slpsErr)")
         makeKeyWindow(&psn)
         Diagnostics.log("API", "makeKeyWindow(pid=\(application.pid), wid=\(targetWid))")
+        // Immediate AX raise — window-specific, no process-level activation.
+        // SLPS alone often leaves target at z7+ because Parallels immediately
+        // re-orders. This gives ZENFORCE a head start.
+        BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+            guard let self else { return }
+            try? self.axUiElement?.focusWindow()
+            Diagnostics.log("API", "immediate AX focusWindow(wid=\(targetWid)) done")
+        }
         manuallyUpdateFocusOrderForParallelsTransition()
         pollForTargetAppFrontmostAndRaise(attempt: 0)
     }
@@ -351,16 +350,6 @@ class Window {
     private func atomicallyPinAndActivate() {
         Diagnostics.log("FOCUS", "enter atomicallyPinAndActivate target=\(debugId ?? "?")")
         guard let targetWid = cgWindowId else { return }
-        if let sourceWid = previouslyFrontmostWindowId() {
-            let err = CGSSetWindowAlpha(CGS_CONNECTION, sourceWid, 0)
-            Diagnostics.log("API", "CGSSetWindowAlpha(wid=\(sourceWid), 0) → \(err.rawValue)")
-            if err == .success {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-                    CGSSetWindowAlpha(CGS_CONNECTION, sourceWid, 1)
-                    Diagnostics.log("API", "CGSSetWindowAlpha(wid=\(sourceWid), 1) restore")
-                }
-            }
-        }
         Windows.armAltTabFocusGuard(for: self)
         var psn = ProcessSerialNumber()
         GetProcessForPID(application.pid, &psn)
@@ -368,8 +357,8 @@ class Window {
         Diagnostics.log("API", "SLPS(pid=\(application.pid), wid=\(targetWid)) → \(slpsErr)")
         makeKeyWindow(&psn)
         Diagnostics.log("API", "makeKeyWindow(pid=\(application.pid), wid=\(targetWid))")
-        application.runningApplication.activate(options: [])
-        Diagnostics.log("API", "activate(options:[], pid=\(application.pid))")
+        // No activate() — it raises ALL app windows. SLPS + makeKeyWindow
+        // should be sufficient for Parallels keyboard routing.
         manuallyUpdateFocusOrderForParallelsTransition()
         BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
             guard let self else { return }
@@ -435,28 +424,21 @@ class Window {
     /// CGSOrderWindow are both no-ops for cross-process windows (the
     /// level-pin was a database-only change, not compositor-enforced).
     ///
-    /// Schedule a SECOND full focus attempt (SLPS + makeKeyWindow + AX
-    /// raise) at ~1500ms, timed to land right after Parallels' re-
-    /// activation settles. If Parallels only fires once, our second
-    /// attempt wins permanently.
-    private func scheduleDelayedReRaise(targetWid: CGWindowID) {
-        Windows.parallelsTransitionGeneration &+= 1
-        let myGen = Windows.parallelsTransitionGeneration
-        for delayMs in [400, 700, 1000] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
-                guard let self, Windows.parallelsTransitionGeneration == myGen else { return }
-                // Use activate(options:[]) instead of SLPS to avoid
-                // bringing ALL process windows to front. Only the
-                // key window comes forward with empty options.
-                self.application.runningApplication.activate(options: [])
-                Diagnostics.log("API", "RERAISE +\(delayMs)ms activate(options:[], pid=\(self.application.pid))")
-                BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
-                    guard let self else { return }
-                    try? self.axUiElement?.focusWindow()
-                    Diagnostics.log("API", "RERAISE +\(delayMs)ms AX focusWindow(wid=\(targetWid)) done")
-                }
-            }
-        }
+    /// After SLPS + makeKeyWindow, Parallels has window-level focus but
+    /// the Windows-side element-level focus may be wrong (e.g., toolbar
+    /// vs content area). Send a benign Shift press/release to trigger
+    /// Parallels' keyboard routing reconciliation without any visible
+    /// side effect in the Windows app.
+    private func nudgeParallelsFocus() {
+        let source = CGEventSource(stateID: .hidSystemState)
+        // Shift key (keycode 56) — benign in all Windows apps
+        let down = CGEvent(keyboardEventSource: source, virtualKey: 56, keyDown: true)
+        let up = CGEvent(keyboardEventSource: source, virtualKey: 56, keyDown: false)
+        down?.flags = .maskShift
+        up?.flags = []
+        down?.post(tap: .cghidEventTap)
+        up?.post(tap: .cghidEventTap)
+        Diagnostics.log("API", "nudgeParallelsFocus: Shift press/release sent")
     }
 
     /// NSWorkspace-based activation watcher. Fires when ANY app becomes
@@ -477,11 +459,11 @@ class Window {
             guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
                   app.processIdentifier != targetPid else { return }
             Diagnostics.log("WSCOUNTER", "NSWorkspace detected steal by pid=\(app.processIdentifier) \(app.bundleIdentifier ?? "?"), counter-raising \(self.debugId ?? "?")")
-            // Use activate(options:[]) instead of SLPS to avoid
-            // bringing ALL process windows to front.
-            self.application.runningApplication.activate(options: [])
+            // AX raise only — no activate() which is process-level
+            // and raises ALL app windows. ZENFORCE also handles this.
             BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
                 try? self?.axUiElement?.focusWindow()
+                Diagnostics.log("API", "WSCOUNTER AX focusWindow(wid=\(targetWid)) done")
             }
         }
         // Auto-remove after guard expires
@@ -497,19 +479,26 @@ class Window {
         }
     }
 
-    /// Instantly make a window invisible via CGSSetWindowAlpha(0).
-    /// Gated behind "hideSourceWindow" UserDefaults toggle.
-    private func hideWindowTemporarily(_ wid: CGWindowID, duration: TimeInterval) {
-        guard UserDefaults.standard.bool(forKey: "hideSourceWindow") else { return }
+    /// Pending restore timers per-wid. When hiding a wid that already has
+    /// a pending restore, the old restore is cancelled so overlapping
+    /// hide/restore cycles don't cause premature visibility.
+    private static var pendingRestores = [CGWindowID: DispatchWorkItem]()
+
+    /// Hide a window and schedule a restore. Cancels any prior pending
+    /// restore for the same wid to prevent overlapping timers.
+    static func hideSourceWindow(_ wid: CGWindowID, duration: TimeInterval) {
+        // Cancel any pending restore for this wid
+        pendingRestores[wid]?.cancel()
         let err = CGSSetWindowAlpha(CGS_CONNECTION, wid, 0)
+        Diagnostics.log("API", "CGSSetWindowAlpha(wid=\(wid), 0) → \(err.rawValue)")
         if err == .success {
-            Diagnostics.log("HIDE", "hid wid=\(wid) for \(duration)s")
-            DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
+            let restoreItem = DispatchWorkItem {
                 CGSSetWindowAlpha(CGS_CONNECTION, wid, 1)
-                Diagnostics.log("HIDE", "restored wid=\(wid)")
+                Diagnostics.log("API", "CGSSetWindowAlpha(wid=\(wid), 1) restore")
+                pendingRestores.removeValue(forKey: wid)
             }
-        } else {
-            Diagnostics.log("HIDE", "CGSSetWindowAlpha failed err=\(err.rawValue) for wid=\(wid)")
+            pendingRestores[wid] = restoreItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: restoreItem)
         }
     }
 

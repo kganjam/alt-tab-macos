@@ -93,6 +93,7 @@ class App: AppCenterApplication {
     static func hideUi(_ keepPreview: Bool = false) {
         Logger.info { "appIsBeingUsed:\(appIsBeingUsed)" }
         guard appIsBeingUsed else { return } // already hidden
+        Diagnostics.log("PANEL", "hideUi keepPreview=\(keepPreview)")
         appIsBeingUsed = false
         // note: `sessionSourcePid` is intentionally NOT cleared here because
         // `focusSelectedWindow` calls `hideUi(true)` immediately BEFORE
@@ -486,16 +487,15 @@ class App: AppCenterApplication {
             if newSourceWid != sessionSourceWid {
                 previousSessionSourceWid = sessionSourceWid
                 sessionSourceWid = newSourceWid
-                // Only normalize when the source actually changed AND
-                // the PREVIOUS session involved Parallels. When the source
-                // hasn't changed (e.g. rapid A→B→A round-trip), the
-                // manualUpdateFocusOrderForParallelsTransition already set
-                // the recency correctly — normalize would overwrite it
-                // with stale previousSessionSourceWid data.
-                let prevSourceIsPar = previousSessionSourceWid.flatMap { wid in
+                // Only normalize when the LAST ALT-TAB TARGET was a
+                // Parallels window (meaning AX recency may be unreliable
+                // for that transition). Don't normalize based on session
+                // source — a link click in Outlook opening Safari changes
+                // the source but AX recency is already correct.
+                let lastTargetIsPar = lastFocusedTargetWid.flatMap { wid in
                     Windows.list.first { $0.cgWindowId == wid }?.application.isParallelsCoherence
                 } ?? false
-                if prevSourceIsPar {
+                if lastTargetIsPar {
                     Windows.normalizeFocusOrderAtSessionStart(
                         currentWid: sessionSourceWid,
                         previousWid: previousSessionSourceWid)
@@ -537,9 +537,11 @@ class App: AppCenterApplication {
             let isCoherenceSource = App.sessionSourcePid.flatMap { pid in
                 Applications.list.first { $0.pid == pid }?.isParallelsCoherence
             } ?? false
+            let coherenceMs = UserDefaults.standard.integer(forKey: "coherenceDisplayDelay")
             let delay: DispatchTimeInterval = isCoherenceSource
-                ? .milliseconds(UserDefaults.standard.integer(forKey: "coherenceDisplayDelay"))
+                ? .milliseconds(coherenceMs)
                 : Preferences.windowDisplayDelay
+            Diagnostics.log("PANEL", "display delay: \(isCoherenceSource ? "\(coherenceMs)ms (coherence)" : "\(Preferences.windowDisplayDelay) (normal)")")
             if delay == .milliseconds(0) {
                 buildUiAndShowPanel()
             } else {
@@ -563,6 +565,7 @@ class App: AppCenterApplication {
         guard appIsBeingUsed else { return }
         refreshUi()
         guard appIsBeingUsed else { return }
+        Diagnostics.log("PANEL", "showPanel (window count=\(Windows.list.count))")
         TilesPanel.shared.show()
         Windows.previewSelectedWindowIfNeeded()
         if TilesView.isSearchEditing {
@@ -650,8 +653,44 @@ extension App: NSApplicationDelegate {
         // Global mouse click monitor: tracks clicks to distinguish
         // user-initiated window activations from Parallels' automatic
         // re-activation during the focus guard period.
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { _ in
-            Windows.lastMouseClickTime = CFAbsoluteTimeGetCurrent()
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .leftMouseUp, .rightMouseUp]) { event in
+            let isDown = event.type == .leftMouseDown || event.type == .rightMouseDown
+            let button = (event.type == .leftMouseDown || event.type == .leftMouseUp) ? "left" : "right"
+            let action = isDown ? "down" : "up"
+            if isDown {
+                Windows.lastMouseClickTime = CFAbsoluteTimeGetCurrent()
+            }
+            // Log click target: find topmost window at cursor position
+            let pt = NSEvent.mouseLocation
+            let screenHeight = NSScreen.main?.frame.height ?? 0
+            let cgPoint = CGPoint(x: pt.x, y: screenHeight - pt.y)
+            let skipOwners: Set<String> = [
+                "Window Server", "Control Center", "Dock", "AltTab",
+                "Notification Center", "SystemUIServer", "Spotlight",
+                "Menubar", "Wallpaper", "CursorUIViewService",
+                "LocalAuthenticationRemoteService",
+            ]
+            if isDown, let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+                for w in list {
+                    let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
+                    if skipOwners.contains(owner) { continue }
+                    let alpha = (w[kCGWindowAlpha as String] as? Double) ?? 1.0
+                    if alpha < 0.1 { continue }
+                    guard let bounds = w[kCGWindowBounds as String] as? [String: Any],
+                          let x = bounds["X"] as? Double, let y = bounds["Y"] as? Double,
+                          let width = bounds["Width"] as? Double, let height = bounds["Height"] as? Double else { continue }
+                    let rect = CGRect(x: x, y: y, width: width, height: height)
+                    if rect.contains(cgPoint) {
+                        let name = (w[kCGWindowName as String] as? String) ?? ""
+                        let wid = (w[kCGWindowNumber as String] as? Int) ?? 0
+                        let short = name.isEmpty ? owner : "\(owner):\(name.prefix(30))"
+                        Diagnostics.log("MOUSE", "\(button) \(action) at (\(Int(cgPoint.x)),\(Int(cgPoint.y))) → wid=\(wid) \(short)")
+                        break
+                    }
+                }
+            } else {
+                Diagnostics.log("MOUSE", "\(button) \(action) at (\(Int(cgPoint.x)),\(Int(cgPoint.y)))")
+            }
         }
         AXUIElement.setGlobalTimeout()
         Preferences.initialize()

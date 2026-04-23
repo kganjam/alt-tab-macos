@@ -25,13 +25,17 @@ func handleKeyboardEvent(_ globalId: Int?, _ shortcutState: ShortcutState?, _ ke
 
 private func logKeyboardEvent(_ globalId: Int?, _ shortcutState: ShortcutState?, _ keyCode: UInt32?, _ modifiers: NSEvent.ModifierFlags?, _ isARepeat: Bool) {
     if let globalId, let shortcutState {
-        Logger.debug {
-            let shortcut = KeyboardEventsTestable.globalShortcutsIds.first { $0.value == globalId }
-            return "globalShortcut:\(shortcut?.key ?? "") state:\(shortcutState)"
-        }
+        let shortcut = KeyboardEventsTestable.globalShortcutsIds.first { $0.value == globalId }
+        Diagnostics.log("KEYEVENT", "hotkey \(shortcut?.key ?? "?") \(shortcutState) (globalId=\(globalId))")
+        Logger.debug { "globalShortcut:\(shortcut?.key ?? "") state:\(shortcutState)" }
         return
     }
-    // TODO: use proper pattern from SwiftBeaver to not compute SymbolicModifierFlagsTransformer when logs are off
+    if let keyCode {
+        let dir = (modifiers != nil) ? "flags" : "key"
+        Diagnostics.log("KEYEVENT", "\(dir) code=\(keyCode) isRepeat=\(isARepeat)")
+    } else if let modifiers {
+        Diagnostics.log("KEYEVENT", "modifiers=\(modifiers.rawValue)")
+    }
     Logger.debug {
         let modifiersAsString = modifiers.flatMap { SymbolicModifierFlagsTransformer.shared.transformedValue(NSNumber(value: $0.rawValue)) }
         let keyCodeAsString = keyCode.flatMap { SymbolicKeyCodeTransformer.shared.transformedValue(NSNumber(value: $0)) }

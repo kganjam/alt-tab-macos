@@ -164,17 +164,34 @@ class Diagnostics {
 
     static func logFrontmostSignals(_ label: String) {
         guard enabled else { return }
-        let nsWorkspace = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let nswApp = NSWorkspace.shared.frontmostApplication
+        let nswPid = nswApp?.processIdentifier
         let atFront = Applications.frontmostPid
-        // Query actual window-server level for the last-focused target.
-        // If this stays at 0 despite our CGSSetWindowLevel(.., 3) call,
-        // the pin isn't crossing process boundaries and z-order
-        // enforcement relies solely on the CGSOrderWindow fight loop.
+        // Query the system-canonical focused window: frontmost app's AX
+        // focused window attribute → CGWindowID.
+        var sysFocusedWid: CGWindowID = 0
+        var sysFocusedName: String = "?"
+        if let pid = nswPid {
+            let appRef = AXUIElementCreateApplication(pid)
+            var focusedValue: AnyObject?
+            if AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedValue) == .success,
+               let windowRef = focusedValue {
+                var widValue: CGWindowID = 0
+                if _AXUIElementGetWindow(windowRef as! AXUIElement, &widValue) == .success {
+                    sysFocusedWid = widValue
+                }
+                var titleValue: AnyObject?
+                if AXUIElementCopyAttributeValue(windowRef as! AXUIElement, kAXTitleAttribute as CFString, &titleValue) == .success,
+                   let title = titleValue as? String {
+                    sysFocusedName = String(title.prefix(25))
+                }
+            }
+        }
         var targetLevel: CGWindowLevel = -1
         if let wid = App.lastFocusedTargetWid {
             CGSGetWindowLevel(CGS_CONNECTION, wid, &targetLevel)
         }
-        log("FRONT", "\(label): nsw=\(nsWorkspace?.description ?? "nil") atFront=\(atFront?.description ?? "nil") sessionWid=\(App.sessionSourceWid?.description ?? "nil") prevWid=\(App.previousSessionSourceWid?.description ?? "nil") lastTargetWid=\(App.lastFocusedTargetWid?.description ?? "nil") targetActualLevel=\(targetLevel)")
+        log("FRONT", "\(label): nsw=\(nswPid?.description ?? "nil")(\(nswApp?.localizedName ?? "?")) sysFocus=\(sysFocusedWid):\(sysFocusedName) atFront=\(atFront?.description ?? "nil") lastTargetWid=\(App.lastFocusedTargetWid?.description ?? "nil")")
     }
 
     /// Permanent test overlay — a bright red box pinned at max level.
@@ -333,6 +350,7 @@ class FocusOverlay {
 
     @available(macOS 14.0, *)
     static func preCapture(wid: CGWindowID, position: CGPoint, size: CGSize) {
+        Diagnostics.log("OVERLAY", "preCapture wid=\(wid)")
         guard overlayModeEnabled, ScreenRecordingPermission.status == .granted else { return }
         let t0 = CACurrentMediaTime()
         Task {
@@ -449,6 +467,7 @@ class FocusOverlay {
     /// This keeps Terminal visible regardless of what Parallels does.
     /// Converts IOSurface thumbnail to CGImage via CIContext (GPU path).
     static func showTarget(_ target: Window, duration: TimeInterval = 1.5) {
+        Diagnostics.log("OVERLAY", "showTarget wid=\(target.cgWindowId ?? 0) duration=\(duration)s")
         guard enabled, let panel = persistentPanel else { return }
         guard let pos = target.position, let sz = target.size else { return }
 
@@ -516,6 +535,7 @@ class FocusOverlay {
     }
 
     static func dismiss() {
+        Diagnostics.log("OVERLAY", "dismiss")
         persistentPanel?.orderOut(nil)
         persistentPanel?.contentView?.layer?.sublayers?.forEach { $0.removeFromSuperlayer() }
         persistentPanel?.contentView?.subviews.forEach { $0.removeFromSuperview() }
