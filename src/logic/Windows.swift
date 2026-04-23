@@ -79,7 +79,8 @@ class Windows {
         weak var window: Window?
         let knownSameAppWids: Set<CGWindowID>
         var raiseAttempts: Int = 0
-        static let maxRaiseAttempts = 2
+        var wasEverAtZ0: Bool = false
+        static let maxRaiseAttempts = 6
     }
     static var recentZOrderIntents = [ZOrderIntent]()
     private static var zOrderEnforcementTimer: DispatchSourceTimer?
@@ -192,29 +193,124 @@ class Windows {
             pos += 1
         }
         if targetZPos == 0 {
-            // Target at z0 — nothing to do.
+            // Target at z0. If this is the first time it reached z0,
+            // reset the attempt counter so Parallels re-steals get
+            // fresh attempts.
+            if !mostRecent.wasEverAtZ0 {
+                recentZOrderIntents[recentZOrderIntents.count - 1].wasEverAtZ0 = true
+                recentZOrderIntents[recentZOrderIntents.count - 1].raiseAttempts = 0
+            }
         } else if targetZPos > 0 && sameAppAbove {
-            // A window from the same app is above the target — likely a
-            // dialog/popup. Don't AX-raise the target over it.
             Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos) but same-app window above — skipping (dialog?)")
         } else if targetZPos > 0 {
             guard mostRecent.raiseAttempts < ZOrderIntent.maxRaiseAttempts else {
-                Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), max attempts reached — stopping")
+                Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), max \(ZOrderIntent.maxRaiseAttempts) attempts — stopping")
                 recentZOrderIntents.removeAll()
                 return
             }
             recentZOrderIntents[recentZOrderIntents.count - 1].raiseAttempts += 1
+            let attempt = recentZOrderIntents[recentZOrderIntents.count - 1].raiseAttempts
             let err = CGSOrderWindow(CGS_CONNECTION, mostRecent.wid,
                                      CGSWindowOrderingMode.above.rawValue, 0)
             if err == .success {
-                Diagnostics.log("ZENFORCE", "CGSOrderWindow(wid=\(mostRecent.wid), above, 0) fixed z\(targetZPos)→z0")
+                Diagnostics.log("ZENFORCE", "CGSOrderWindow(wid=\(mostRecent.wid)) fixed z\(targetZPos)→z0")
             } else {
-                Diagnostics.log("ZENFORCE", "CGSOrderWindow failed err=\(err.rawValue) for wid=\(mostRecent.wid) at z\(targetZPos), AX raise attempt \(mostRecent.raiseAttempts + 1)")
+                Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), AX raise #\(attempt)/\(ZOrderIntent.maxRaiseAttempts)")
                 try? window.axUiElement?.performAction(kAXRaiseAction as String)
-                Diagnostics.log("ZENFORCE", "AX raise(wid=\(mostRecent.wid)) done")
             }
         } else {
             Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) not found in z-order (offscreen?)")
+        }
+    }
+
+    /// Restore the correct z-order after a Parallels window close. macOS
+    /// raises a random same-process window; we override by raising the top
+    /// windows from our recency list in reverse order (so position 0 ends
+    /// up on top). Query actual z-order first to only raise windows that
+    /// are out of position.
+    static func restoreZOrderFromRecency() {
+        let topWindows = list
+            .sorted { $0.lastFocusOrder < $1.lastFocusOrder }
+            .prefix(5)
+            .compactMap { w -> (Window, CGWindowID)? in
+                guard let wid = w.cgWindowId else { return nil }
+                return (w, wid)
+            }
+        guard !topWindows.isEmpty else { return }
+
+        // Query actual z-order to find what's out of place
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        let blocklist: Set<String> = [
+            "Window Server", "Control Center", "Dock", "AltTab",
+            "Notification Center", "SystemUIServer", "Spotlight",
+            "Menubar", "Wallpaper", "CursorUIViewService",
+            "LocalAuthenticationRemoteService",
+        ]
+        guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return }
+        var actualZOrder = [CGWindowID]()
+        for w in info {
+            let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
+            if blocklist.contains(owner) { continue }
+            let alpha = (w[kCGWindowAlpha as String] as? Double) ?? 1.0
+            if alpha < 0.1 { continue }
+            if let bounds = w[kCGWindowBounds as String] as? [String: Any],
+               let width = bounds["Width"] as? Double, width < 40 { continue }
+            let wid = CGWindowID((w[kCGWindowNumber as String] as? Int) ?? 0)
+            actualZOrder.append(wid)
+        }
+
+        // Raise top recency windows in REVERSE order so #0 ends up on top.
+        // Only raise if the window is out of position (lower in z than expected).
+        let topWid = topWindows[0].1
+        let topZPos = actualZOrder.firstIndex(of: topWid) ?? Int.max
+        if topZPos == 0 {
+            Diagnostics.log("ZRESTORE", "top window wid=\(topWid) already at z0, no restore needed")
+            return
+        }
+
+        Diagnostics.log("ZRESTORE", "restoring z-order: top recency wid=\(topWid) at z\(topZPos)")
+
+        // Try CGSOrderWindow to set exact z-order. Place each window
+        // above the one that should be below it, working from bottom up.
+        // This builds the correct stack: position 2 at bottom, 1 above it, 0 on top.
+        var lastPlacedWid: CGWindowID = 0
+        var cgsWorked = false
+        for (_, wid) in topWindows.reversed() {
+            guard actualZOrder.contains(wid) else { continue }
+            if lastPlacedWid == 0 {
+                // First window — place at top of z-order
+                let err = CGSOrderWindow(CGS_CONNECTION, wid, CGSWindowOrderingMode.above.rawValue, 0)
+                Diagnostics.log("ZRESTORE", "CGSOrderWindow(wid=\(wid), above, 0) → \(err.rawValue)")
+                if err == .success { cgsWorked = true }
+            } else {
+                // Place above the previously placed window
+                let err = CGSOrderWindow(CGS_CONNECTION, wid, CGSWindowOrderingMode.above.rawValue, lastPlacedWid)
+                Diagnostics.log("ZRESTORE", "CGSOrderWindow(wid=\(wid), above, \(lastPlacedWid)) → \(err.rawValue)")
+                if err == .success { cgsWorked = true }
+            }
+            lastPlacedWid = wid
+        }
+
+        // If CGSOrderWindow failed (err 1000), fall back to AX raise
+        // in reverse order (position 2, then 1, then 0).
+        if !cgsWorked {
+            Diagnostics.log("ZRESTORE", "CGSOrderWindow failed, falling back to AX raise")
+            for (window, wid) in topWindows.reversed() {
+                guard actualZOrder.contains(wid) else { continue }
+                try? window.axUiElement?.performAction(kAXRaiseAction as String)
+            }
+        }
+
+        // Activate the top window SYNCHRONOUSLY via SLPS before Parallels
+        // can raise its own window. Also AX raise immediately.
+        let (topWindow, _) = topWindows[0]
+        var psn = ProcessSerialNumber()
+        GetProcessForPID(topWindow.application.pid, &psn)
+        if let wid = topWindow.cgWindowId {
+            _SLPSSetFrontProcessWithOptions(&psn, wid, SLPSMode.userGenerated.rawValue)
+            topWindow.makeKeyWindow(&psn)
+            try? topWindow.axUiElement?.focusWindow()
+            Diagnostics.log("ZRESTORE", "SLPS + makeKeyWindow + AX raise for top wid=\(wid) \(topWindow.debugId ?? "?")")
         }
     }
 

@@ -131,7 +131,16 @@ class AccessibilityEvents {
 
     private static func windowDestroyed(_ windowAxUiElement: AXUIElement, _ pid: pid_t, _ wid: CGWindowID) {
         if let window = (Windows.list.first { $0.isEqualRobust(windowAxUiElement, wid) }) {
+            let wasFrontmost = window.application.runningApplication.isActive
+            let wasParallels = window.application.isParallelsCoherence
+            Diagnostics.log("AXEVENT", "windowDestroyed wid=\(wid) \(window.debugId ?? "?") wasFront=\(wasFrontmost) par=\(wasParallels)")
             Windows.removeWindows([window], true)
+            // When a Parallels window is closed while frontmost, macOS raises
+            // the next window from the same process — which may not match our
+            // recency order. Restore the correct z-order from our recency list.
+            if wasFrontmost && wasParallels {
+                Windows.restoreZOrderFromRecency()
+            }
         }
     }
 

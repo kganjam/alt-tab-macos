@@ -347,16 +347,21 @@ class App: AppCenterApplication {
     }
 
     private static var lastFocusTime: CFAbsoluteTime = 0
+    private static var lastFocusWid: CGWindowID?
 
     static func focusSelectedWindow(_ selectedWindow: Window?) {
         guard appIsBeingUsed else { return } // already hidden
-        // Debounce: ignore duplicate fires within 100ms
+        // Debounce: ignore duplicate fires for the SAME target within 200ms.
+        // Ghost fires happen from redundant holdShortcut/flagsChanged handlers.
+        // Different targets always pass (legitimate fast switch).
         let now = CFAbsoluteTimeGetCurrent()
-        if now - lastFocusTime < 0.1 {
+        let targetWid = selectedWindow?.cgWindowId
+        if now - lastFocusTime < 0.2 && targetWid == lastFocusWid {
             Diagnostics.log("KEY", "DEBOUNCED duplicate focusSelectedWindow (gap=\(Int((now - lastFocusTime) * 1000))ms)")
             return
         }
         lastFocusTime = now
+        lastFocusWid = targetWid
         Diagnostics.log("KEY", "release → focusSelectedWindow target=\(selectedWindow?.debugId ?? "nil")")
         Diagnostics.logFrontmostQuick("pre-focus")
         // Sample z-order every 200ms for 5 sec to catch Parallels re-raises
@@ -534,14 +539,23 @@ class App: AppCenterApplication {
             // Use longer delay when source is a Parallels Coherence window
             // to allow fast-switch without showing the panel (reduces flicker).
             // defaults write com.lwouis.alt-tab-macos coherenceDisplayDelay -int 500
+            // Use coherence delay when EITHER source or any top-2 target
+            // is a Parallels window. Parallels transitions are visually
+            // noisy, so suppress the panel for fast switches in both
+            // directions (Par→mac AND mac→Par).
             let isCoherenceSource = App.sessionSourcePid.flatMap { pid in
                 Applications.list.first { $0.pid == pid }?.isParallelsCoherence
             } ?? false
+            let topTargets = Windows.list
+                .sorted { $0.lastFocusOrder < $1.lastFocusOrder }
+                .prefix(2)
+            let isCoherenceTarget = topTargets.contains { $0.application.isParallelsCoherence }
+            let isCoherenceInvolved = isCoherenceSource || isCoherenceTarget
             let coherenceMs = UserDefaults.standard.integer(forKey: "coherenceDisplayDelay")
-            let delay: DispatchTimeInterval = isCoherenceSource
+            let delay: DispatchTimeInterval = isCoherenceInvolved
                 ? .milliseconds(coherenceMs)
                 : Preferences.windowDisplayDelay
-            Diagnostics.log("PANEL", "display delay: \(isCoherenceSource ? "\(coherenceMs)ms (coherence)" : "\(Preferences.windowDisplayDelay) (normal)")")
+            Diagnostics.log("PANEL", "display delay: \(isCoherenceInvolved ? "\(coherenceMs)ms (coherence src=\(isCoherenceSource) tgt=\(isCoherenceTarget))" : "\(Preferences.windowDisplayDelay) (normal)")")
             if delay == .milliseconds(0) {
                 buildUiAndShowPanel()
             } else {

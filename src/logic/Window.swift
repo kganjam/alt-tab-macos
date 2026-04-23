@@ -314,14 +314,11 @@ class Window {
         Diagnostics.log("API", "SLPS(pid=\(application.pid), wid=\(targetWid)) → \(slpsErr)")
         makeKeyWindow(&psn)
         Diagnostics.log("API", "makeKeyWindow(pid=\(application.pid), wid=\(targetWid))")
-        // Immediate AX raise — window-specific, no process-level activation.
-        // SLPS alone often leaves target at z7+ because Parallels immediately
-        // re-orders. This gives ZENFORCE a head start.
-        BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
-            guard let self else { return }
-            try? self.axUiElement?.focusWindow()
-            Diagnostics.log("API", "immediate AX focusWindow(wid=\(targetWid)) done")
-        }
+        // Immediate AX raise on MAIN thread — synchronous so it settles
+        // before the compositor can show intermediate z-order (which causes
+        // non-target windows like Edge Beta to flash briefly).
+        try? self.axUiElement?.focusWindow()
+        Diagnostics.log("API", "immediate AX focusWindow(wid=\(targetWid)) done")
         manuallyUpdateFocusOrderForParallelsTransition()
         pollForTargetAppFrontmostAndRaise(attempt: 0)
     }
@@ -357,14 +354,12 @@ class Window {
         Diagnostics.log("API", "SLPS(pid=\(application.pid), wid=\(targetWid)) → \(slpsErr)")
         makeKeyWindow(&psn)
         Diagnostics.log("API", "makeKeyWindow(pid=\(application.pid), wid=\(targetWid))")
-        // No activate() — it raises ALL app windows. SLPS + makeKeyWindow
-        // should be sufficient for Parallels keyboard routing.
+        // Immediate synchronous AX raise to minimize z-order transition gap.
+        // Without this, the background queue AX raise takes 100-200ms during
+        // which intermediate z-order windows flash visually.
+        try? self.axUiElement?.focusWindow()
+        Diagnostics.log("API", "immediate AX focusWindow(wid=\(targetWid)) done")
         manuallyUpdateFocusOrderForParallelsTransition()
-        BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
-            guard let self else { return }
-            try? self.axUiElement?.focusWindow()
-            Diagnostics.log("API", "AX focusWindow(wid=\(targetWid)) done")
-        }
     }
 
     /// SLPS-with-wid is a direct window-server call that doesn't reliably
