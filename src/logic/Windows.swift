@@ -154,6 +154,7 @@ class Windows {
             "LocalAuthenticationRemoteService",
         ]
         var targetZPos = -1
+        var sameAppDialogAbove = false
         var pos = 0
         for w in info {
             let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
@@ -167,6 +168,19 @@ class Windows {
                 targetZPos = pos
                 break
             }
+            // If a same-pid window above the target is NOT tracked in
+            // Windows.list, it's a genuinely new window (dialog, popup,
+            // confirmation). Don't push it behind the target.
+            let ownerPid = (w[kCGWindowOwnerPID as String] as? Int32) ?? 0
+            let aboveWid = CGWindowID(wid)
+            if ownerPid == mostRecent.pid {
+                let isTracked = list.contains { $0.cgWindowId == aboveWid }
+                if !isTracked {
+                    sameAppDialogAbove = true
+                    let name = (w[kCGWindowName as String] as? String) ?? ""
+                    Diagnostics.log("ZENFORCE", "untracked same-app wid=\(aboveWid) \(owner):\(name.prefix(20)) above target — dialog?")
+                }
+            }
             pos += 1
         }
         if targetZPos == 0 {
@@ -174,6 +188,10 @@ class Windows {
                 recentZOrderIntents[recentZOrderIntents.count - 1].wasEverAtZ0 = true
                 recentZOrderIntents[recentZOrderIntents.count - 1].raiseAttempts = 0
             }
+        } else if targetZPos > 0 && sameAppDialogAbove {
+            // Untracked same-app window above target — likely a dialog.
+            // Don't push it behind.
+            Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos) — untracked same-app dialog above, skipping")
         } else if targetZPos > 0 {
             guard mostRecent.raiseAttempts < ZOrderIntent.maxRaiseAttempts else {
                 Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), max \(ZOrderIntent.maxRaiseAttempts) attempts — stopping")
