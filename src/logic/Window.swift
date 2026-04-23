@@ -359,12 +359,19 @@ class Window {
         Diagnostics.log("API", "makeKeyWindow(pid=\(application.pid), wid=\(targetWid))")
         try? self.axUiElement?.focusWindow()
         Diagnostics.log("API", "immediate AX focusWindow(wid=\(targetWid)) done")
-        // Second AX raise after 50ms — the first one sometimes doesn't
-        // stick because the window server hasn't fully processed the
-        // SLPS activation yet.
+        // Push the source window above any same-pid siblings that are
+        // between it and the target. Then re-raise the target.
+        // This prevents other Outlook emails from being visually between
+        // the target and the source (Edge Beta).
+        if let sourceWid = previouslyFrontmostWindowId(),
+           let sourceWindow = Windows.list.first(where: { $0.cgWindowId == sourceWid }) {
+            try? sourceWindow.axUiElement?.performAction(kAXRaiseAction as String)
+            try? self.axUiElement?.focusWindow()
+            Diagnostics.log("API", "source-push: raised source wid=\(sourceWid) then re-raised target wid=\(targetWid)")
+        }
+        // Third AX raise after 50ms for any Parallels re-ordering
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in
             try? self?.axUiElement?.focusWindow()
-            Diagnostics.log("API", "delayed AX focusWindow(wid=\(targetWid)) done")
         }
         manuallyUpdateFocusOrderForParallelsTransition()
     }
