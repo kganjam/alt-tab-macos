@@ -548,9 +548,12 @@ class App: AppCenterApplication {
             } ?? false
             let topTargets = Windows.list
                 .sorted { $0.lastFocusOrder < $1.lastFocusOrder }
-                .prefix(2)
+                .prefix(3)
             let isCoherenceTarget = topTargets.contains { $0.application.isParallelsCoherence }
-            let isCoherenceInvolved = isCoherenceSource || isCoherenceTarget
+            // Also use coherence delay if recent ZENFORCE activity (indicates
+            // Parallels transitions in the last few seconds).
+            let recentParActivity = !Windows.recentZOrderIntents.isEmpty
+            let isCoherenceInvolved = isCoherenceSource || isCoherenceTarget || recentParActivity
             let coherenceMs = UserDefaults.standard.integer(forKey: "coherenceDisplayDelay")
             let delay: DispatchTimeInterval = isCoherenceInvolved
                 ? .milliseconds(coherenceMs)
