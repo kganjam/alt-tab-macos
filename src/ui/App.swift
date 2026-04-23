@@ -364,8 +364,9 @@ class App: AppCenterApplication {
         lastFocusWid = targetWid
         Diagnostics.log("KEY", "release → focusSelectedWindow target=\(selectedWindow?.debugId ?? "nil")")
         Diagnostics.logFrontmostQuick("pre-focus")
-        // Sample z-order every 200ms for 5 sec to catch Parallels re-raises
-        Diagnostics.sampleZOrderOverTime(label: "focus-\(selectedWindow?.cgWindowId ?? 0)")
+        // SYSZ sampling disabled — 25 CGWindowListCopyWindowInfo calls per
+        // focus (88 windows each) causes GPU/CPU churn and visual stuttering.
+        // ZENFORCE handles z-order enforcement independently.
         // Show the TARGET window's cached content on an overlay at max
         // level. Terminal stays visible regardless of Parallels' re-raise.
         // IOSurface→CGImage conversion via CIContext (GPU, fast).
