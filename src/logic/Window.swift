@@ -350,15 +350,18 @@ class Window {
         Windows.armAltTabFocusGuard(for: self)
         var psn = ProcessSerialNumber()
         GetProcessForPID(application.pid, &psn)
-        let slpsErr = _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
-        Diagnostics.log("API", "SLPS(pid=\(application.pid), wid=\(targetWid)) → \(slpsErr)")
+        // SLPS activates the process with a specific wid hint. It raises
+        // all process windows, but the immediate AX raise afterward pushes
+        // our target to z0. activate(options:[]) was worse — it brings
+        // both "main" and "key" windows forward (Inbox + target email).
+        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
+        Diagnostics.log("API", "SLPS(pid=\(application.pid), wid=\(targetWid))")
         makeKeyWindow(&psn)
         Diagnostics.log("API", "makeKeyWindow(pid=\(application.pid), wid=\(targetWid))")
-        // Immediate synchronous AX raise to minimize z-order transition gap.
-        // Without this, the background queue AX raise takes 100-200ms during
-        // which intermediate z-order windows flash visually.
+        // Synchronous AX raise TWICE — first to set z-order after SLPS,
+        // second after a brief settle to override any Parallels re-ordering.
         try? self.axUiElement?.focusWindow()
-        Diagnostics.log("API", "immediate AX focusWindow(wid=\(targetWid)) done")
+        Diagnostics.log("API", "immediate AX focusWindow(wid=\(targetWid)) #1 done")
         manuallyUpdateFocusOrderForParallelsTransition()
     }
 
