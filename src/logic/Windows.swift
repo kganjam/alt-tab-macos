@@ -153,6 +153,19 @@ class Windows {
             "Menubar", "Wallpaper", "CursorUIViewService",
             "LocalAuthenticationRemoteService",
         ]
+        // First pass: find target's window level. Ignore any windows above
+        // the target's level when computing its z-position — they're on a
+        // higher compositor layer (screenshot previews at kCGMainMenuWindowLevel
+        // Lv24, modal panels, etc.) that cannot be pushed under by any
+        // API we have. Target-at-top-of-its-own-level counts as success.
+        var targetLayer = 0
+        for w in info {
+            if let wid = w[kCGWindowNumber as String] as? Int,
+               CGWindowID(wid) == mostRecent.wid {
+                targetLayer = (w[kCGWindowLayer as String] as? Int) ?? 0
+                break
+            }
+        }
         var targetZPos = -1
         var sameAppDialogAbove = false
         var pos = 0
@@ -164,6 +177,8 @@ class Windows {
             if alpha < 0.1 { continue }
             if let bounds = w[kCGWindowBounds as String] as? [String: Any],
                let width = bounds["Width"] as? Double, width < 40 { continue }
+            let layer = (w[kCGWindowLayer as String] as? Int) ?? 0
+            if layer > targetLayer { continue } // unreachable overlay
             let wid = (w[kCGWindowNumber as String] as? Int) ?? 0
             let name = (w[kCGWindowName as String] as? String) ?? ""
             if pos < 4 { topWids.append((wid, "\(owner.prefix(8)):\(name.prefix(15))")) }
@@ -494,8 +509,26 @@ class Windows {
         // workaround: when Preferences > Mission Control > "Displays have separate Spaces" is unchecked,
         // switching between displays doesn't trigger .activeSpaceDidChangeNotification; we get the latest manually
         Spaces.refresh()
+        // One bulk query of live window names keyed by wid. Parallels
+        // Coherence rewrites titles without firing AX notifications and
+        // without updating the per-window CGS title property, so this
+        // bulk CGWindowListCopyWindowInfo call is the only source of
+        // truth for the currently-displayed title.
+        var liveTitles = [CGWindowID: String]()
+        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        if let info = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] {
+            for w in info {
+                if let wid = w[kCGWindowNumber as String] as? Int,
+                   let name = w[kCGWindowName as String] as? String {
+                    liveTitles[CGWindowID(wid)] = name
+                }
+            }
+        }
         for window in list {
             window.updateSpacesAndScreen()
+            if window.isParallelsCoherenceWindow, let wid = window.cgWindowId {
+                window.refreshTitleIfChanged(liveTitles[wid])
+            }
             refreshIfWindowShouldBeShownToTheUser(window)
         }
         refreshWhichWindowsToShowTheUser()
@@ -510,10 +543,18 @@ class Windows {
                && (!Appearance.hideThumbnails || Preferences.previewSelectedWindow)
                && (Preferences.captureWindowsInBackground || App.appIsBeingUsed) else { return }
         let skipCoherencePreviews = UserDefaults.standard.bool(forKey: "disableCoherencePreviews")
+        // Background captures of Parallels Coherence windows hit
+        // CGSHWCaptureWindowList → WindowServer compositor → guest pixel
+        // blit, and on macOS 15 visibly flicker the mouse cursor when fired
+        // at high rates. OneNote rewrites its title on each keystroke,
+        // which fans out to a capture every ~200ms while the user types.
+        // Skip Coherence captures on background AX events; the panel-open
+        // path (.refreshOnlyThumbnailsAfterShowUi) still captures fresh.
+        let skipCoherenceForBackground = source == .refreshUiAfterExternalEvent && !App.appIsBeingUsed
         var eligibleWindows = [Window]()
         for window in windows {
             if !window.isWindowlessApp, let cgWindowId = window.cgWindowId, cgWindowId != CGWindowID(bitPattern: -1) {
-                if skipCoherencePreviews && window.application.isParallelsCoherence { continue }
+                if (skipCoherencePreviews || skipCoherenceForBackground) && window.application.isParallelsCoherence { continue }
                 eligibleWindows.append(window)
             }
         }

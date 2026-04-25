@@ -89,6 +89,21 @@ class Window {
         lastSearchQuery = nil
     }
 
+    /// Parallels Coherence rewrites the window title on guest page/tab
+    /// navigation but does not reliably fire kAXTitleChangedNotification,
+    /// nor does the per-window CGSCopyWindowProperty("kCGSWindowTitle")
+    /// reflect the live value. Only `kCGWindowName` from
+    /// CGWindowListCopyWindowInfo returns the current guest-side title.
+    /// Caller supplies the fresh title; we update if it differs.
+    func refreshTitleIfChanged(_ liveTitle: String?) {
+        guard let wid = cgWindowId, let liveTitle, !liveTitle.isEmpty,
+              liveTitle != title else { return }
+        Diagnostics.log("TITLE", "wid=\(wid) '\(title ?? "")' → '\(liveTitle)'")
+        title = liveTitle
+        lastSearchQuery = nil
+        debugId = "\(application.debugId) (wid:\(wid) title:\(liveTitle))"
+    }
+
     func isEqualRobust(_ otherWindowAxUiElement: AXUIElement, _ otherWindowWid: CGWindowID?) -> Bool {
         // the window can be deallocated by the OS, in which case its `CGWindowID` will be `-1`
         // we check for equality both on the AXUIElement, and the CGWindowID, in order to catch all scenarios
@@ -308,8 +323,18 @@ class Window {
         GetProcessForPID(application.pid, &psn)
         _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
         makeKeyWindow(&psn)
-        try? self.axUiElement?.focusWindow()
-        Diagnostics.log("API", "Par→mac: SLPS+makeKey+AX(wid=\(targetWid))")
+        Diagnostics.log("API", "Par→mac: SLPS+makeKey(wid=\(targetWid))")
+        // AX `focusWindow()` is synchronous AX RPC with a 1s timeout; if the
+        // target app is inactive (Safari WebApps especially), this blocks the
+        // main thread for hundreds of ms — the panel freezes, queued
+        // keystrokes fire late, and Parallels' coherence reconciliation can
+        // win the z-order race during the freeze. SLPS-with-wid already
+        // raised the target; this AX raise is supplementary, so safe to
+        // run off-thread.
+        BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+            try? self?.axUiElement?.focusWindow()
+            Diagnostics.log("API", "Par→mac: AX raise(wid=\(targetWid)) done")
+        }
         manuallyUpdateFocusOrderForParallelsTransition()
     }
 
@@ -346,8 +371,13 @@ class Window {
         // ZENFORCE handles any subsequent Parallels z-order steals.
         _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.noWindows.rawValue)
         makeKeyWindow(&psn)
-        try? self.axUiElement?.focusWindow()
-        Diagnostics.log("API", "mac→Par: SLPS(noWin)+makeKey+AX(wid=\(targetWid))")
+        Diagnostics.log("API", "mac→Par: SLPS(noWin)+makeKey(wid=\(targetWid))")
+        // Same rationale as `focusMacOsWindowOverParallelsCoherence`: keep
+        // the slow AX RPC off the main thread.
+        BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+            try? self?.axUiElement?.focusWindow()
+            Diagnostics.log("API", "mac→Par: AX raise(wid=\(targetWid)) done")
+        }
         manuallyUpdateFocusOrderForParallelsTransition()
     }
 
@@ -416,11 +446,17 @@ class Window {
     /// process). When the app is already front, we don't need SLPS/
     /// makeKeyWindow/activate — just AX to change the key window.
     private func isSameProcessAsCurrentFrontmost() -> Bool {
-        // Check both current frontmost AND session source pid.
-        // During alt-tab, frontmostPid may be AltTab itself or stale.
-        // Session source captures the real pre-panel app.
-        application.pid == Applications.frontmostPid ||
-        application.pid == App.sessionSourcePid
+        // Live `frontmostPid` is the truth: updated by AX activation events
+        // and by `manuallyUpdateFocusOrderForParallelsTransition`. Use
+        // `sessionSourcePid` ONLY when frontmostPid is unusable (nil or
+        // AltTab itself during panel display). Session source is a frozen
+        // snapshot from session start, so it becomes stale if the user
+        // alt-tabs through multiple windows within one panel session.
+        let altTabPid = ProcessInfo.processInfo.processIdentifier
+        if let fp = Applications.frontmostPid, fp != altTabPid {
+            return application.pid == fp
+        }
+        return application.pid == App.sessionSourcePid
     }
 
     /// Par→Par SAME PROCESS. Both source and target are Coherence windows
