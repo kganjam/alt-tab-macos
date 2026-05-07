@@ -54,6 +54,7 @@ class AccessibilityEvents {
 
     private static func applicationActivated(_ app: Application, _ pid: pid_t, _ type: String, _ appFocusedWindow: AXUIElement?, _ wid: CGWindowID?) {
         Diagnostics.log("AXEVENT", "applicationActivated pid=\(pid) app=\(app.bundleIdentifier ?? "?") guardActive=\(CFAbsoluteTimeGetCurrent() < Windows.altTabFocusTargetUntil) target=\(Windows.altTabFocusTarget?.debugId ?? "nil")")
+        diagnoseCrossProcessActivation(activatedApp: app, activatedPid: pid)
         if Windows.shouldSuppressApplicationActivation(for: app) { return }
         Applications.frontmostPid = pid
         if app.hasBeenActiveOnce != true {
@@ -77,6 +78,33 @@ class AccessibilityEvents {
                 }
             }
         }
+    }
+
+    /// Owners of transient overlay windows whose pid disappears milliseconds
+    /// after the click. Their activations look like misroutes but are just
+    /// the underlying app re-foregrounding after the overlay dismisses.
+    private static let transientClickOwners: Set<String> = ["Screenshot", "screencaptureui"]
+
+    /// Detect Parallels Coherence cross-process divergence: AltTab targeted one
+    /// Parallels Windows-app proxy pid, but a *different* Parallels proxy pid
+    /// was activated. Symptom: window appears front but Parallels routes
+    /// keys/clicks/repaints to the wrong Windows app — looks like a render hang.
+    /// For Coherence→Coherence click-misroutes, actively restore the clicked
+    /// window's pid to frontmost so the user's input lands on the right app.
+    private static func diagnoseCrossProcessActivation(activatedApp: Application, activatedPid: pid_t) {
+        guard activatedApp.isParallelsCoherence else { return }
+        if let target = Windows.altTabFocusTarget,
+           target.application.isParallelsCoherence,
+           target.application.pid != activatedPid {
+            Diagnostics.log("XPROC", "Parallels divergence: activated pid=\(activatedPid) (\(activatedApp.bundleIdentifier?.suffix(40) ?? "?")) but altTab target pid=\(target.application.pid) (\(target.debugId)) — input may route wrong")
+        }
+        let dt = CFAbsoluteTimeGetCurrent() - Windows.lastMouseClickTime
+        guard dt < 1.0, Windows.lastMouseClickPid != 0, Windows.lastMouseClickPid != activatedPid else { return }
+        guard !transientClickOwners.contains(Windows.lastMouseClickOwner) else { return }
+        Diagnostics.log("XPROC", "click-misroute (+\(Int(dt*1000))ms): clicked wid=\(Windows.lastMouseClickWid) pid=\(Windows.lastMouseClickPid) (\(Windows.lastMouseClickOwner)) but activated pid=\(activatedPid) (\(activatedApp.bundleIdentifier?.suffix(40) ?? "?"))")
+        guard let clickedWindow = Windows.list.first(where: { $0.cgWindowId == Windows.lastMouseClickWid }),
+              clickedWindow.application.isParallelsCoherence else { return }
+        Windows.restoreFrontmostToTarget(targetWid: Windows.lastMouseClickWid, targetPid: Windows.lastMouseClickPid, frontPid: activatedPid, source: "XPROC", bypassThrottle: true)
     }
 
     private static func applicationHiddenOrShown(_ app: Application, _ pid: pid_t, _ type: String) {

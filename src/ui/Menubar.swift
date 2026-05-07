@@ -52,6 +52,10 @@ class Menubar {
         diagnosticsToggle.target = App.self
         diagnosticsToggle.state = Diagnostics.enabled ? .on : .off
         overlayMenu.addItem(diagnosticsToggle)
+        let winsideToggle = NSMenuItem(title: "Windows Helper (Phase 3 IPC)", action: #selector(App.toggleWinsideHelper), keyEquivalent: "")
+        winsideToggle.target = App.self
+        winsideToggle.state = Winside.isEnabled ? .on : .off
+        overlayMenu.addItem(winsideToggle)
         let parallelsItem = NSMenuItem(title: "Parallels Mode", action: nil, keyEquivalent: "")
         parallelsItem.submenu = overlayMenu
         menu.addItem(parallelsItem)

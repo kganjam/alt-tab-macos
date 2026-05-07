@@ -81,12 +81,22 @@ class Window {
     }
 
     func updateFromAxAttributes(_ title: String?, _ size: CGSize?, _ position: CGPoint?, _ isFullscreen: Bool?, _ isMinimized: Bool?) {
-        self.title = bestEffortTitle(title)
+        let newTitle = bestEffortTitle(title)
+        self.title = newTitle
         self.size = size
         self.position = position
         self.isFullscreen = isFullscreen ?? false
         self.isMinimized = isMinimized ?? false
         lastSearchQuery = nil
+        // Keep debugId in sync with title. Tile labels and focus logs derive
+        // from debugId; RECENCY/MOUSE logs read self.title. Without this the
+        // two drift on Parallels Coherence pages and AltTab shows stale page
+        // names that no longer match the live window.
+        if let wid = cgWindowId {
+            debugId = "\(application.debugId) (wid:\(wid) title:\(newTitle))"
+        } else {
+            debugId = "\(application.debugId) (title:\(newTitle))"
+        }
     }
 
     /// Parallels Coherence rewrites the window title on guest page/tab
@@ -221,6 +231,7 @@ class Window {
     }
 
     func focus() {
+        Diagnostics.markSwitchPhase("Window.focus")
         // Clear any stale focus guard from a prior Parallels transition.
         // Parallels-involved paths below re-arm for their own target;
         // standard macOS→macOS SLPS path correctly runs with no guard.
@@ -245,16 +256,27 @@ class Window {
         } else if isOutboundFromParallelsCoherence() {
             focusMacOsWindowOverParallelsCoherence()
         } else {
-            // macOS bug: when switching to a System Preferences window in another space, it switches to that space,
-            // but quickly switches back to another window in that space
-            // You can reproduce this buggy behaviour by clicking on the dock icon, proving it's an OS bug
+            // SLPS + makeKeyWindow are fast WindowServer IPCs (~sub-ms);
+            // run them inline for minimum switch latency. Only the AX
+            // call (an RPC into the target process, can block 10-100ms)
+            // is dispatched to the accessibilityCommandsQueue.
+            //
+            // macOS bug context (still relevant): when switching to a
+            // System Preferences window in another space, it switches
+            // to that space, but quickly switches back to another window
+            // in that space. Reproducible via Dock-icon click → it's an
+            // OS bug, not threading-related.
+            var psn = ProcessSerialNumber()
+            GetProcessForPID(application.pid, &psn)
+            _SLPSSetFrontProcessWithOptions(&psn, cgWindowId!, SLPSMode.userGenerated.rawValue)
+            Diagnostics.markSwitchPhase("slpsDone")
+            makeKeyWindow(&psn)
+            Diagnostics.markSwitchPhase("makeKeyDone")
             BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
                 guard let self else { return }
-                var psn = ProcessSerialNumber()
-                GetProcessForPID(self.application.pid, &psn)
-                _SLPSSetFrontProcessWithOptions(&psn, self.cgWindowId!, SLPSMode.userGenerated.rawValue)
-                self.makeKeyWindow(&psn)
+                Diagnostics.markSwitchPhase("axQueueEntry")
                 try? self.axUiElement!.focusWindow()
+                Diagnostics.markSwitchPhase("axDone", extra: "wid=\(self.cgWindowId ?? 0)")
                 DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
                     Windows.previewSelectedWindowIfNeeded()
                 }
@@ -372,6 +394,28 @@ class Window {
         _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.noWindows.rawValue)
         makeKeyWindow(&psn)
         Diagnostics.log("API", "mac→Par: SLPS(noWin)+makeKey(wid=\(targetWid))")
+        // kAXFrontmost setter: explicit AX-side "this app is frontmost"
+        // signal. Distinct from kAXFocusedWindowAttribute (which sets the
+        // window WITHIN the app). Empirically, when the source app holds
+        // a stale AX-frontmost claim, kAXFocusedWindow and SLPS alone
+        // aren't enough to fully transfer input routing — characters
+        // typed during the gap leak into the source. This setter closes
+        // that specific divergence.
+        if let appAx = application.axUiElement {
+            let err = AXUIElementSetAttributeValue(appAx, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+            Diagnostics.log("FRONTMOSTSET", "atomicallyPinAndActivate kAXFrontmost=true pid=\(application.pid) wid=\(targetWid) → \(err == .success ? "OK" : "err=\(err.rawValue)")")
+        }
+        // Phase 3 IPC: tell the Windows guest to SetForegroundWindow on
+        // the corresponding Win32 hwnd. This is the most authoritative
+        // foreground-transfer mechanism we have — it goes through the
+        // actual Windows OS focus pipeline rather than the macOS
+        // compositor's host↔guest sync. Async on Winside.queue; safe
+        // no-op if helper isn't running. Title-based lookup; helper
+        // caches LIST results, so steady-state cost is one TCP round
+        // trip (~30ms via nc).
+        if let title = self.title {
+            Winside.setForegroundForTitleAsync(title, label: "atomicallyPinAndActivate wid=\(targetWid)")
+        }
         // Same rationale as `focusMacOsWindowOverParallelsCoherence`: keep
         // the slow AX RPC off the main thread.
         BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
@@ -401,6 +445,8 @@ class Window {
         application.focusedWindow = self
         Applications.frontmostPid = application.pid
         App.lastFocusedTargetWid = cgWindowId
+        App.lastFocusedTargetPid = application.pid
+        App.lastFocusedTargetTime = CFAbsoluteTimeGetCurrent()
         let source = sessionSourceWindow()
         Diagnostics.log("MANUAL", "manualUpdate target=\(debugId ?? "?") source=\(source?.debugId ?? "nil")")
         Windows.setTargetAndSourceAsMostRecent(target: self, source: source)
@@ -470,6 +516,25 @@ class Window {
         Diagnostics.log("FOCUS", "enter focusParallelsCoherenceWindowSameProcess target=\(debugId ?? "?")")
         manuallyUpdateFocusOrderForParallelsTransition()
         let targetWid = cgWindowId
+        // kAXFrontmost setter: same rationale as in atomicallyPinAndActivate.
+        // The same-process path doesn't fire SLPS — it goes purely
+        // through AX. Without setting kAXFrontmost on the app, the
+        // app-level "this window is on top" claim can lag and other
+        // siblings of the same Parallels app can briefly assert
+        // foreground. Cheap call; runs before the AX-raise.
+        if let appAx = application.axUiElement {
+            let err = AXUIElementSetAttributeValue(appAx, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+            Diagnostics.log("FRONTMOSTSET", "sameProcess kAXFrontmost=true pid=\(application.pid) wid=\(targetWid ?? 0) → \(err == .success ? "OK" : "err=\(err.rawValue)")")
+        }
+        // Phase 3 IPC: send-key-event-equivalent into the guest. For
+        // same-process Parallels switches (e.g. two OneNote pages),
+        // the macOS-side AX raise is the only mechanism that
+        // historically worked, but Parallels' guest-side z-order
+        // doesn't always sync immediately — Winside.SET issues the
+        // authoritative SetForegroundWindow inside Windows.
+        if let title = self.title {
+            Winside.setForegroundForTitleAsync(title, label: "sameProcess wid=\(targetWid ?? 0)")
+        }
         BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
             guard let self, let appAx = self.application.axUiElement,
                   let selfAx = self.axUiElement else { return }

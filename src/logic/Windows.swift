@@ -23,8 +23,10 @@ class Windows {
     static var altTabFocusTargetUntil: CFAbsoluteTime = 0
     // Guard must cover: Parallels' timer-driven re-activation (~500-1500ms),
     // our RERAISE at 400/700/1000ms, AND the source-hide duration (3s).
-    // User clicks are detected via mouse monitor and bypass the guard.
-    static let altTabFocusGuardMs: Double = 3000
+    // Aligned to ZENFORCE auto-stop (5s) so a late AX activation can't slip
+    // through the gap. User clicks are detected via mouse monitor and
+    // bypass the guard.
+    static let altTabFocusGuardMs: Double = 5000
     /// Bumped on every Parallels-involved focus transition. Delayed
     /// snapshot-restore blocks check this and skip if a newer transition
     /// has started, so a late restore can't clobber the user's latest
@@ -79,7 +81,56 @@ class Windows {
         weak var window: Window?
         var raiseAttempts: Int = 0
         var wasEverAtZ0: Bool = false
+        /// Snapshot of the top window-list z-order taken BEFORE we
+        /// fired any focus call. Used to compute the *expected*
+        /// post-focus order = [target] + preZ.filter{ != target }.
+        /// After target reaches z0 the first time, we walk this and
+        /// pairwise-CGSOrderWindow each entry to its expected slot,
+        /// undoing any sibling-promotion side-effects of process-level
+        /// activation.
+        var preZRanking: [PreZEntry] = []
         static let maxRaiseAttempts = 6
+    }
+
+    struct PreZEntry {
+        let wid: CGWindowID
+        let pid: pid_t
+        let owner: String
+    }
+
+    /// Capture visible app-level windows in current z-order.
+    /// Same filtering as enforceZOrder/SYSZ: skip overlay/system owners,
+    /// near-zero alpha, tiny widths, and non-zero compositor layers.
+    /// Default 200 covers any realistic working set; ZRESTORE needs the
+    /// full ranking (not just top-8) so corrections below the fold still
+    /// reflect the user-expected order. CGWindowList itself is the only
+    /// real cost; filtering and an Array of structs are free in
+    /// comparison, so there is no perf reason to truncate aggressively.
+    static func captureTopZRanking(maxCount: Int = 200) -> [PreZEntry] {
+        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let info = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return [] }
+        let blocklist: Set<String> = [
+            "Window Server", "Control Center", "Dock", "AltTab",
+            "Notification Center", "SystemUIServer", "Spotlight",
+            "Menubar", "Wallpaper", "CursorUIViewService",
+            "LocalAuthenticationRemoteService",
+        ]
+        var out: [PreZEntry] = []
+        for w in info {
+            let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
+            if blocklist.contains(owner) { continue }
+            let alpha = (w[kCGWindowAlpha as String] as? Double) ?? 1.0
+            if alpha < 0.1 { continue }
+            if let bounds = w[kCGWindowBounds as String] as? [String: Any],
+               let width = bounds["Width"] as? Double, width < 40 { continue }
+            let layer = (w[kCGWindowLayer as String] as? Int) ?? 0
+            if layer != 0 { continue }
+            let wid = (w[kCGWindowNumber as String] as? Int) ?? 0
+            let pid = (w[kCGWindowOwnerPID as String] as? Int32) ?? 0
+            out.append(PreZEntry(wid: CGWindowID(wid), pid: pid, owner: owner))
+            if out.count >= maxCount { break }
+        }
+        return out
     }
     static var recentZOrderIntents = [ZOrderIntent]()
     private static var zOrderEnforcementTimer: DispatchSourceTimer?
@@ -94,11 +145,25 @@ class Windows {
             let now = CFAbsoluteTimeGetCurrent()
             // Prune entries older than 5s
             recentZOrderIntents.removeAll { now - $0.timestamp > 3.0 }
-            // Remove prior entry for same wid (update timestamp)
+            // Preserve preZRanking from a prior recent call for the same
+            // wid. atomicallyPinAndActivate calls us BEFORE SLPS fires
+            // (correct snapshot moment), then manuallyUpdateFocusOrderForParallelsTransition
+            // calls us again AFTER SLPS already started moving the
+            // z-order — re-snapshotting at that point would capture a
+            // mid-transition state. Reuse the first call's snapshot.
+            let prior = recentZOrderIntents.first { $0.wid == wid }
+            let preZ: [PreZEntry]
+            if let prior, !prior.preZRanking.isEmpty {
+                preZ = prior.preZRanking
+            } else {
+                preZ = Self.captureTopZRanking()
+                let preZSummary = preZ.prefix(8).enumerated().map { "z\($0.0)=#\($0.1.wid) \($0.1.owner.prefix(10))" }.joined(separator: " | ")
+                Diagnostics.log("ZRESTORE", "preZ snapshot for target=#\(wid) (n=\(preZ.count)): \(preZSummary)")
+            }
             recentZOrderIntents.removeAll { $0.wid == wid }
             recentZOrderIntents.append(ZOrderIntent(
                 wid: wid, pid: target.application.pid,
-                timestamp: now, window: target))
+                timestamp: now, window: target, preZRanking: preZ))
             startZOrderEnforcement()
         }
     }
@@ -110,11 +175,37 @@ class Windows {
         zOrderEnforcementGeneration &+= 1
         let myGen = zOrderEnforcementGeneration
         Diagnostics.log("ZENFORCE", "starting timer gen=\(myGen), \(recentZOrderIntents.count) intents")
+        // Early-phase pre-emptive checks. Two regimes of bounces observed:
+        //   1. 2026-04-27 19:54:08: Parallels-adjacent windows bounce at
+        //      ~+200ms and ~+400ms after focus (Coherence settling timer).
+        //   2. 2026-05-05 02:02 profiler Run 3: when source is Parallels and
+        //      target is Mac (focusMacOsWindowOverParallelsCoherence), the
+        //      Parallels source's process briefly re-raises in the +10..50ms
+        //      window before the SLPS+makeKey settles. Profiler caught it
+        //      with checkpoints at 5/10/15/20/30/40/50ms.
+        // Schedule densely from +5ms to cover both regimes. Each tick is
+        // ~1 CGWindowListCopyWindowInfo on main + a possible CGSOrderWindow,
+        // gated to do nothing when target is already z0 — so the no-op
+        // case is cheap. Logs only fire under `trace` level.
+        // TEMPORARY A/B revert to validate the fix actually matters:
+        // if profiler bounces re-appear at ~10-25ms, the dense early ticks
+        // are demonstrably the corrective intervention.
+        let zenforceEarlyABMode = UserDefaults.standard.string(forKey: "zenforceEarlyABMode") ?? "fast"
+        let earlyOffsetsMs: [Int] = (zenforceEarlyABMode == "slow")
+            ? [30, 80, 150, 250, 350, 450]
+            : [5, 12, 25, 50, 100, 200, 350]
+        for ms in earlyOffsetsMs {
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(ms)) {
+                guard zOrderEnforcementGeneration == myGen else { return }
+                guard !recentZOrderIntents.isEmpty else { return }
+                enforceZOrder()
+            }
+        }
         let timer = DispatchSource.makeTimerSource(queue: .main)
-        // First check at +100ms, then every 200ms. Parallels re-orders
-        // at ~400ms — we need to catch and correct within that window.
-        // Each check is one CGWindowListCopyWindowInfo + potential AX raise.
-        timer.schedule(deadline: .now() + .milliseconds(100),
+        // Late-phase polling: regular 200ms cadence after the dense
+        // early window. Each check is one CGWindowListCopyWindowInfo
+        // + potential AX raise.
+        timer.schedule(deadline: .now() + .milliseconds(550),
                        repeating: .milliseconds(200))
         timer.setEventHandler {
             guard zOrderEnforcementGeneration == myGen else { return }
@@ -167,7 +258,11 @@ class Windows {
             }
         }
         var targetZPos = -1
-        var sameAppDialogAbove = false
+        var sameAppBlockerWid: CGWindowID? = nil
+        var sameAppBlockerName: String = ""
+        var z0Wid: CGWindowID? = nil
+        var z0Owner: String = "?"
+        var z0Name: String = ""
         var pos = 0
         var topWids = [(Int, String)]() // for logging
         for w in info {
@@ -181,6 +276,11 @@ class Windows {
             if layer > targetLayer { continue } // unreachable overlay
             let wid = (w[kCGWindowNumber as String] as? Int) ?? 0
             let name = (w[kCGWindowName as String] as? String) ?? ""
+            if pos == 0 {
+                z0Wid = CGWindowID(wid)
+                z0Owner = owner
+                z0Name = name
+            }
             if pos < 4 { topWids.append((wid, "\(owner.prefix(8)):\(name.prefix(15))")) }
             if CGWindowID(wid) == mostRecent.wid {
                 targetZPos = pos
@@ -188,14 +288,18 @@ class Windows {
             }
             // If a same-pid window above the target is NOT tracked in
             // Windows.list, it's a genuinely new window (dialog, popup,
-            // confirmation). Don't push it behind the target.
+            // confirmation) OR a stale Parallels/Teams sub-window. We
+            // record the topmost such blocker so we can either skip
+            // (after target was already at z0 — likely a fresh modal)
+            // or pairwise-raise above it (before target ever reached
+            // z0 — user explicitly asked for the target).
             let ownerPid = (w[kCGWindowOwnerPID as String] as? Int32) ?? 0
             let aboveWid = CGWindowID(wid)
             if ownerPid == mostRecent.pid {
                 let isTracked = list.contains { $0.cgWindowId == aboveWid }
-                if !isTracked {
-                    sameAppDialogAbove = true
-                    let name = (w[kCGWindowName as String] as? String) ?? ""
+                if !isTracked && sameAppBlockerWid == nil {
+                    sameAppBlockerWid = aboveWid
+                    sameAppBlockerName = "\(owner):\(name.prefix(20))"
                     Diagnostics.log("ZENFORCE", "untracked same-app wid=\(aboveWid) \(owner):\(name.prefix(20)) above target — dialog?")
                 }
             }
@@ -203,15 +307,34 @@ class Windows {
         }
         let zSummary = topWids.enumerated().map { "z\($0.0)=#\($0.1.0) \($0.1.1)" }.joined(separator: " | ")
         Diagnostics.log("ZENFORCE", "target=\(mostRecent.wid) at z\(targetZPos) [\(zSummary)]")
+        // ZALIGN: comprehensive per-tick alignment check the user asked for.
+        // Captures all three signals (target, z0, AX-focused) live and logs
+        // any divergence. Fires on every tick so we can see whether
+        // interventions are actually correcting the state.
+        logZAlignment(target: mostRecent.wid, z0Wid: z0Wid, z0Label: "\(z0Owner):\(z0Name.prefix(20))")
+        diagnoseFrontmostMismatch(targetWid: mostRecent.wid, targetPid: mostRecent.pid, atZ0: targetZPos == 0)
         if targetZPos == 0 {
             if !mostRecent.wasEverAtZ0 {
                 recentZOrderIntents[recentZOrderIntents.count - 1].wasEverAtZ0 = true
                 recentZOrderIntents[recentZOrderIntents.count - 1].raiseAttempts = 0
+                // Target just reached z0 for the first time this session.
+                // Some focus paths (`_SLPSSetFrontProcessWithOptions`,
+                // process activation) inadvertently bring multiple
+                // windows of the target's app above OTHER apps' windows
+                // — visible as `[DIAG SAMEAPP]`. The user-expected
+                // z-order is: target on top, all OTHER apps' windows
+                // preserved below in their prior relative order, the
+                // target's siblings staying where they were. Any
+                // sibling that's now sandwiched ABOVE a non-target-app
+                // window is a regression introduced by our intervention
+                // → push it below the divider.
+                restoreExpectedZOrder(targetWid: mostRecent.wid, targetPid: mostRecent.pid, preZ: mostRecent.preZRanking)
             }
-        } else if targetZPos > 0 && sameAppDialogAbove {
-            // Untracked same-app window above target — likely a dialog.
-            // Don't push it behind.
-            Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos) — untracked same-app dialog above, skipping")
+        } else if targetZPos > 0 && sameAppBlockerWid != nil && mostRecent.wasEverAtZ0 {
+            // Target was already at z0 once; an untracked same-app window
+            // appeared on top AFTERWARDS — most likely a legitimate
+            // dialog/sheet. Don't fight it.
+            Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos) — same-app dialog above (target was at z0 prior); skipping")
         } else if targetZPos > 0 {
             guard mostRecent.raiseAttempts < ZOrderIntent.maxRaiseAttempts else {
                 Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), max \(ZOrderIntent.maxRaiseAttempts) attempts — stopping")
@@ -220,10 +343,20 @@ class Windows {
             }
             recentZOrderIntents[recentZOrderIntents.count - 1].raiseAttempts += 1
             let attempt = recentZOrderIntents[recentZOrderIntents.count - 1].raiseAttempts
+            // Pairwise raise above the specific blocker first (when a
+            // same-app window is sitting above the target). More precise
+            // than `relativeTo: 0` and works in cases where a generic
+            // .above-of-everything fails because of WindowServer's
+            // per-process ordering rules.
+            if let blocker = sameAppBlockerWid {
+                let pwErr = CGSOrderWindow(CGS_CONNECTION, mostRecent.wid,
+                                           CGSWindowOrderingMode.above.rawValue, blocker)
+                Diagnostics.log("ZENFORCE", "INTERVENE pairwise CGSOrderWindow(wid=\(mostRecent.wid) above #\(blocker) \(sameAppBlockerName)) → \(pwErr == .success ? "OK" : "err=\(pwErr.rawValue)") attempt #\(attempt)")
+            }
             let err = CGSOrderWindow(CGS_CONNECTION, mostRecent.wid,
                                      CGSWindowOrderingMode.above.rawValue, 0)
             if err == .success {
-                Diagnostics.log("ZENFORCE", "CGSOrderWindow(wid=\(mostRecent.wid)) fixed z\(targetZPos)→z0")
+                Diagnostics.log("ZENFORCE", "INTERVENE CGSOrderWindow(wid=\(mostRecent.wid) above all) → OK fixed z\(targetZPos)→z0")
             } else {
                 // For same-pid windows (e.g., multiple Outlook emails),
                 // kAXRaiseAction doesn't work — Parallels ignores it.
@@ -235,17 +368,191 @@ class Windows {
                 // doesn't work for same-pid reordering.
                 var psn = ProcessSerialNumber()
                 GetProcessForPID(mostRecent.pid, &psn)
+                // SLPS(.noWindows) brings the target's APP to frontmost
+                // without changing z-order itself. Critical for cross-app
+                // raises (e.g. Chrome steals front from OneNote during
+                // guard window): AX raise alone can't push a backgrounded
+                // app's window above the active app's — macOS refuses.
+                // Process activation first, then makeKeyWindow + AX raise
+                // as before.
+                _SLPSSetFrontProcessWithOptions(&psn, mostRecent.wid, SLPSMode.noWindows.rawValue)
                 window.makeKeyWindow(&psn)
                 if let appAx = window.application.axUiElement,
                    let selfAx = window.axUiElement {
                     try? appAx.setAttribute(kAXFocusedWindowAttribute, selfAx)
+                    // Belt-and-suspenders kAXFrontmost setter: forces
+                    // app-level AX frontmost flag along with the
+                    // window-level kAXFocusedWindow. Without this, a
+                    // stale source app can keep claiming AX frontmost
+                    // even though SLPS moved the process state.
+                    let fmErr = AXUIElementSetAttributeValue(appAx, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+                    Diagnostics.log("FRONTMOSTSET", "ZENFORCE recovery kAXFrontmost=true pid=\(mostRecent.pid) wid=\(mostRecent.wid) → \(fmErr == .success ? "OK" : "err=\(fmErr.rawValue)")")
                 }
                 try? window.axUiElement?.performAction(kAXRaiseAction as String)
-                Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), makeKey+setFocused+raise #\(attempt)/\(ZOrderIntent.maxRaiseAttempts)")
+                Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), SLPS+makeKey+setFocused+raise #\(attempt)/\(ZOrderIntent.maxRaiseAttempts)")
             }
         } else {
             Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) not found in z-order (offscreen?)")
         }
+    }
+
+    /// Restore the *full* user-expected z-order after a focus call.
+    /// Computes expected = [target] + (preZRanking minus target,
+    /// preserving prior relative order). Then walks expected top→down
+    /// and pairwise-CGSOrderWindow's each entry to its expected slot —
+    /// this corrects ALL disagreements, not just same-app sibling
+    /// promotions. Without this, a process-level activation that pulls
+    /// multiple of target's app windows up will leave them above OTHER
+    /// apps that previously sat between them (the user's "messed up
+    /// window-level z-order" complaint).
+    ///
+    /// Runs ONCE per focus session, on the tick when target first
+    /// reaches z0. After that, ZENFORCE keeps target at z0 but doesn't
+    /// keep re-fighting natural app-driven z-order changes (modals,
+    /// dialogs, the user dragging a window forward).
+    ///
+    /// Skips windows that disappeared between snapshot and now, and
+    /// windows that newly appeared (not in the snapshot — could be
+    /// legitimate notifications, sheets, etc).
+    private static func restoreExpectedZOrder(targetWid: CGWindowID, targetPid: pid_t, preZ: [PreZEntry]) {
+        guard !preZ.isEmpty else {
+            Diagnostics.log("ZRESTORE", "no preZ snapshot for target=#\(targetWid); skipping")
+            return
+        }
+        // Build expected order: [target] + (preZ minus target)
+        var expected: [PreZEntry] = []
+        if !preZ.contains(where: { $0.wid == targetWid }) {
+            // Target wasn't in the prior top-N — push it onto expected
+            // anyway. Owner is best-effort; we don't strictly need it
+            // for ordering decisions.
+            expected.append(PreZEntry(wid: targetWid, pid: targetPid, owner: "target"))
+        } else {
+            expected.append(preZ.first { $0.wid == targetWid }!)
+        }
+        expected.append(contentsOf: preZ.filter { $0.wid != targetWid })
+        // Capture current actual order (just the wids in z-order).
+        let actual = Self.captureTopZRanking()
+        let actualWids = actual.map { $0.wid }
+        // Pre-summary line so we can compare expected vs actual at a
+        // glance even before any corrections fire.
+        let expSummary = expected.prefix(8).enumerated().map { "z\($0.0)=#\($0.1.wid) \($0.1.owner.prefix(10))" }.joined(separator: " | ")
+        let actSummary = actual.prefix(8).enumerated().map { "z\($0.0)=#\($0.1.wid) \($0.1.owner.prefix(10))" }.joined(separator: " | ")
+        Diagnostics.log("ZRESTORE", "compare target=#\(targetWid)\n  expected: \(expSummary)\n  actual:   \(actSummary)")
+        // Walk expected[1...] top→down, ensure each is just below its
+        // predecessor. expected[0] (target) is already pinned at z0 by
+        // ZENFORCE — don't touch it here, the relativeTo-0 .above call
+        // is what ZENFORCE already does.
+        var corrections = 0
+        var prevWid: CGWindowID = targetWid
+        for entry in expected.dropFirst() {
+            // Skip if this window is no longer visible.
+            guard actualWids.contains(entry.wid) else { continue }
+            // Check if it's already in the right relative position
+            // (immediately below prevWid in actual). If so, no-op.
+            if let actIdx = actualWids.firstIndex(of: entry.wid),
+               let prevIdx = actualWids.firstIndex(of: prevWid),
+               actIdx == prevIdx + 1 {
+                prevWid = entry.wid
+                continue
+            }
+            let err = CGSOrderWindow(CGS_CONNECTION, entry.wid,
+                                     CGSWindowOrderingMode.below.rawValue, prevWid)
+            Diagnostics.log("ZRESTORE", "place #\(entry.wid) \(entry.owner.prefix(15)) below #\(prevWid) → \(err == .success ? "OK" : "err=\(err.rawValue)")")
+            corrections += 1
+            prevWid = entry.wid
+        }
+        if corrections == 0 {
+            Diagnostics.log("ZRESTORE", "no corrections needed (z-order matches expected) for target=#\(targetWid)")
+        } else {
+            Diagnostics.log("ZRESTORE", "applied \(corrections) corrections for target=#\(targetWid)")
+        }
+    }
+
+    /// Per-tick alignment diagnostic. Captures the three signals the
+    /// user perceives misalignment between:
+    ///   - target: what AltTab was asked to focus
+    ///   - z0:     what's actually visually on top (CGWindowList)
+    ///   - axFoc:  what AX kAXFocusedWindow on the frontmost app reports
+    /// Logs `[DIAG ZALIGN]` every tick so we can see the drift and
+    /// whether interventions correct it. To avoid log spam, dedupes
+    /// consecutive identical alignment states (same target/z0/axFoc).
+    private static var lastZAlignSignature: String = ""
+    private static func logZAlignment(target: CGWindowID, z0Wid: CGWindowID?, z0Label: String) {
+        let nsApp = NSWorkspace.shared.frontmostApplication
+        let frontPid = nsApp?.processIdentifier
+        let frontApp = nsApp?.localizedName ?? "?"
+        var axFocusedWid: CGWindowID? = nil
+        var axFocusedTitle: String = "?"
+        if let pid = frontPid {
+            let appRef = AXUIElementCreateApplication(pid)
+            var focused: AnyObject?
+            if AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focused) == .success,
+               let winRef = focused {
+                var w: CGWindowID = 0
+                if _AXUIElementGetWindow(winRef as! AXUIElement, &w) == .success {
+                    axFocusedWid = w
+                }
+                var titleVal: AnyObject?
+                if AXUIElementCopyAttributeValue(winRef as! AXUIElement, kAXTitleAttribute as CFString, &titleVal) == .success,
+                   let t = titleVal as? String {
+                    axFocusedTitle = String(t.prefix(20))
+                }
+            }
+        }
+        let zMatch = (z0Wid == target)
+        let axMatch = (axFocusedWid == target)
+        let signature = "\(target)|\(z0Wid ?? 0)|\(axFocusedWid ?? 0)"
+        if signature == lastZAlignSignature { return }
+        lastZAlignSignature = signature
+        Diagnostics.log("ZALIGN",
+            "target=#\(target) z0=#\(z0Wid ?? 0)(\(z0Label)) axFoc=#\(axFocusedWid ?? 0)(\(frontApp):\(axFocusedTitle)) | z0Match=\(zMatch) axMatch=\(axMatch)\(zMatch && axMatch ? " ✓ALIGNED" : "")")
+    }
+
+    /// Detect AND repair divergence between macOS z-order (window in front)
+    /// and NSWorkspace.frontmostApplication (app receiving keyboard input).
+    /// Phantom activations (Safari/system events that grab "front app"
+    /// without changing z-order) leave the user looking at OneNote but
+    /// typing into Safari. When detected, push the target's pid back to
+    /// frontmost via SLPS(.noWindows) — process-only activation, no
+    /// z-order change, since z-order is already correct.
+    /// Only fires while ZENFORCE is active (poll-driven, 200ms cadence).
+    private static var lastFrontMismatchLogged: pid_t? = nil
+    private static var lastFrontRestoreAt: CFAbsoluteTime = 0
+    private static func diagnoseFrontmostMismatch(targetWid: CGWindowID, targetPid: pid_t, atZ0: Bool) {
+        guard atZ0 else { lastFrontMismatchLogged = nil; return }
+        let frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
+        guard frontPid != targetPid else {
+            if lastFrontMismatchLogged != nil {
+                Diagnostics.log("FRONT_MISMATCH", "resolved: target wid=\(targetWid) pid=\(targetPid) now matches frontmostApplication")
+                lastFrontMismatchLogged = nil
+            }
+            return
+        }
+        let frontBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
+        if lastFrontMismatchLogged != frontPid {
+            lastFrontMismatchLogged = frontPid
+            Diagnostics.log("FRONT_MISMATCH", "target wid=\(targetWid) at z0 (pid:\(targetPid)) but frontmostApplication pid=\(frontPid) (\(frontBundle.suffix(40))) — restoring")
+        }
+        restoreFrontmostToTarget(targetWid: targetWid, targetPid: targetPid, frontPid: frontPid)
+    }
+
+    /// Re-issue a process-level activation for the target's pid using
+    /// SLPS(.noWindows). Bounded to one attempt per 400ms by default
+    /// (poll-driven callers); `bypassThrottle` is for one-shot event-
+    /// driven callers (e.g. click-misroute recovery) that need to fire
+    /// immediately and don't repeat on their own.
+    static func restoreFrontmostToTarget(targetWid: CGWindowID, targetPid: pid_t, frontPid: pid_t, source: String = "FRONT_MISMATCH", bypassThrottle: Bool = false) {
+        let now = CFAbsoluteTimeGetCurrent()
+        if !bypassThrottle {
+            guard now - lastFrontRestoreAt > 0.4 else { return }
+        }
+        lastFrontRestoreAt = now
+        guard let target = list.first(where: { $0.cgWindowId == targetWid }) else { return }
+        var psn = ProcessSerialNumber()
+        GetProcessForPID(targetPid, &psn)
+        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.noWindows.rawValue)
+        target.makeKeyWindow(&psn)
+        Diagnostics.log(source, "restore attempt: SLPS(noWin)+makeKey(pid=\(targetPid), wid=\(targetWid)) — was frontmostPid=\(frontPid)")
     }
 
     /// Restore the correct z-order after a Parallels window close. macOS
@@ -388,6 +695,9 @@ class Windows {
     /// re-activation. Updated by the global event monitor installed
     /// at startup.
     static var lastMouseClickTime: CFAbsoluteTime = 0
+    static var lastMouseClickWid: CGWindowID = 0
+    static var lastMouseClickPid: pid_t = 0
+    static var lastMouseClickOwner: String = ""
 
     static func shouldSuppressApplicationActivation(for app: Application) -> Bool {
         guard CFAbsoluteTimeGetCurrent() < altTabFocusTargetUntil,
@@ -509,27 +819,37 @@ class Windows {
         // workaround: when Preferences > Mission Control > "Displays have separate Spaces" is unchecked,
         // switching between displays doesn't trigger .activeSpaceDidChangeNotification; we get the latest manually
         Spaces.refresh()
-        // One bulk query of live window names keyed by wid. Parallels
-        // Coherence rewrites titles without firing AX notifications and
-        // without updating the per-window CGS title property, so this
-        // bulk CGWindowListCopyWindowInfo call is the only source of
-        // truth for the currently-displayed title.
-        var liveTitles = [CGWindowID: String]()
-        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-        if let info = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] {
-            for w in info {
-                if let wid = w[kCGWindowNumber as String] as? Int,
-                   let name = w[kCGWindowName as String] as? String {
-                    liveTitles[CGWindowID(wid)] = name
-                }
-            }
-        }
+        // Parallels Coherence rewrites the guest window title on page/tab
+        // navigation. Empirically (logs 2026-04-27): both
+        // kAXTitleChangedNotification AND CGWindowListCopyWindowInfo's
+        // kCGWindowName return the STALE title for non-front Parallels
+        // windows. Only a direct per-window kAXTitleAttribute query
+        // returns the current guest-side title (proven by [DIAG FRONT]'s
+        // sysFocus probe at Logger.swift returning live titles for
+        // wid=18882 while the cached title stayed "Trading - April 2026"
+        // for hours).
+        var parWindowsQueried = 0
+        var parTitlesObtained = 0
         for window in list {
             window.updateSpacesAndScreen()
-            if window.isParallelsCoherenceWindow, let wid = window.cgWindowId {
-                window.refreshTitleIfChanged(liveTitles[wid])
+            if window.isParallelsCoherenceWindow, let axElement = window.axUiElement {
+                parWindowsQueried += 1
+                var titleValue: AnyObject?
+                let axStatus = AXUIElementCopyAttributeValue(axElement, kAXTitleAttribute as CFString, &titleValue)
+                if axStatus == .success, let liveTitle = titleValue as? String, !liveTitle.isEmpty {
+                    parTitlesObtained += 1
+                    window.refreshTitleIfChanged(liveTitle)  // logs [DIAG TITLE] if changed
+                } else if let wid = window.cgWindowId {
+                    // Surfaces "AX query failed for non-front window" — tells us
+                    // whether AX itself is stale on background Parallels windows
+                    // (in which case we have no live source at all).
+                    Diagnostics.log("AXTITLE", "wid=\(wid) cached='\(window.title ?? "")' AX failed: status=\(axStatus.rawValue)")
+                }
             }
             refreshIfWindowShouldBeShownToTheUser(window)
+        }
+        if parWindowsQueried > 0 {
+            Diagnostics.log("REFRESH", "panel build: parallels_windows=\(parWindowsQueried) ax_titles_obtained=\(parTitlesObtained)")
         }
         refreshWhichWindowsToShowTheUser()
         sort()
@@ -559,12 +879,37 @@ class Windows {
             }
         }
         guard (!eligibleWindows.isEmpty || windowRemoved) else { return }
-        if #available(macOS 14.0, *),
-           // mitigate macOS 15 bugs with ScreenCapture Kit (see https://github.com/lwouis/alt-tab-macos/issues/5190)
-           ProcessInfo.processInfo.operatingSystemVersion.majorVersion != 15 {
-            WindowCaptureScreenshots.oneTimeScreenshots(eligibleWindows, source)
-        } else {
-            WindowCaptureScreenshotsPrivateApi.oneTimeScreenshots(eligibleWindows, source)
+        // Split eligible windows by capture method.
+        // ScreenCaptureKit (macOS 14+) sees the macOS-side view of each
+        // window. For Parallels Coherence windows, that view is the
+        // empty shim NSWindow that Parallels uses — the guest-rendered
+        // pixel content is composited via a separate channel SCK can't
+        // observe, so SCK returns blank/wrong thumbnails.
+        // The private API CGSHWCaptureWindowList CAN capture this
+        // content because it goes through the WindowServer's HW
+        // capture path that includes Parallels' compositor output.
+        // Net: use SCK for native macOS windows, fall back to the
+        // private API only for Parallels Coherence windows.
+        let parallelsWindows = eligibleWindows.filter { $0.isParallelsCoherenceWindow }
+        let nativeWindows = eligibleWindows.filter { !$0.isParallelsCoherenceWindow }
+        let useSck = {
+            if #available(macOS 14.0, *) {
+                // mitigate macOS 15 bugs with ScreenCapture Kit (see https://github.com/lwouis/alt-tab-macos/issues/5190)
+                return ProcessInfo.processInfo.operatingSystemVersion.majorVersion != 15
+            }
+            return false
+        }()
+        if !nativeWindows.isEmpty {
+            if useSck, #available(macOS 14.0, *) {
+                WindowCaptureScreenshots.oneTimeScreenshots(nativeWindows, source)
+            } else {
+                WindowCaptureScreenshotsPrivateApi.oneTimeScreenshots(nativeWindows, source)
+            }
+        }
+        if !parallelsWindows.isEmpty {
+            // Always private API for Parallels Coherence; SCK doesn't
+            // see the guest-rendered pixel content.
+            WindowCaptureScreenshotsPrivateApi.oneTimeScreenshots(parallelsWindows, source)
         }
     }
 

@@ -20,6 +20,7 @@ class Preferences {
             "arrowKeysEnabled": "true",
             "vimKeysEnabled": "false",
             "mouseHoverEnabled": "false",
+            "scrollPanelOnEdgeHover": "false",
             "cursorFollowFocus": CursorFollowFocus.never.indexAsString,
             "showTabsAsWindows": "false",
             "hideColoredCircles": "false",
@@ -103,6 +104,7 @@ class Preferences {
     // periphery:ignore
     static var vimKeysEnabled: Bool { CachedUserDefaults.bool("vimKeysEnabled") }
     static var mouseHoverEnabled: Bool { CachedUserDefaults.bool("mouseHoverEnabled") }
+    static var scrollPanelOnEdgeHover: Bool { CachedUserDefaults.bool("scrollPanelOnEdgeHover") }
     static var cursorFollowFocus: CursorFollowFocus { CachedUserDefaults.macroPref("cursorFollowFocus", CursorFollowFocus.allCases) }
     static var trackpadHapticFeedbackEnabled: Bool { CachedUserDefaults.bool("trackpadHapticFeedbackEnabled") }
     static var showTabsAsWindows: Bool { CachedUserDefaults.bool("showTabsAsWindows") }

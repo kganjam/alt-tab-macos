@@ -91,28 +91,187 @@ class Logger {
 /// Toggle via UserDefaults:
 ///   defaults write com.lwouis.alt-tab-macos diagnosticsEnabled -bool true   # default
 ///   defaults write com.lwouis.alt-tab-macos diagnosticsEnabled -bool false  # silence
+///
+/// Log level (overrides finer than enabled boolean). Each [DIAG <CAT>] line
+/// has a category-defined required level; lines below the active min-level
+/// are dropped before the message is even formatted (closures unevaluated):
+///   off      — fully silent. Equivalent to diagnosticsEnabled=false.
+///   error    — only failures/unexpected outcomes.
+///   warn     — adds anomalies the user might notice (CLICKMISROUTE,
+///              FRONT_MISMATCH, TITLEMISS, AXTITLE failed, CLICKAFTER mismatch).
+///   info     — adds normal-flow events (PANEL show/hide, KEY release,
+///              MOUSE click, FOCUS, SESSION, GUARD, TITLE refresh). DEFAULT.
+///   perf     — adds end-to-end switch timing breakdown (SWITCH phases,
+///              REFRESH counters). Use when measuring latency.
+///   trace    — adds z-order debugging (SYSZ, SAMEAPP, RECENCY, ZALIGN,
+///              ZENFORCE, ZRESTORE, ZQUICK, SIBLINGSDEMOTE, FRONTMOSTSET,
+///              AXEVENT, COUNTER, OVERLAY, XPROC). Use when chasing
+///              focus/z-order regressions.
+///   verbose  — everything (PROFILER, WINSIDE, API, CTAP, INIT).
+/// Set via:
+///   defaults write com.lwouis.alt-tab-macos diagnosticsLevel info
+///   defaults write com.lwouis.alt-tab-macos diagnosticsLevel perf
+///   defaults write com.lwouis.alt-tab-macos diagnosticsLevel trace
+///
 /// Continuous monitoring interval (ms):
 ///   defaults write com.lwouis.alt-tab-macos diagnosticsMonitorMs -int 500
 ///   defaults write com.lwouis.alt-tab-macos diagnosticsMonitorMs -int -1    # disable
 class Diagnostics {
+    enum Level: Int, Comparable {
+        case off = 0, error = 1, warn = 2, info = 3, perf = 4, trace = 5, verbose = 6
+        static func < (a: Self, b: Self) -> Bool { a.rawValue < b.rawValue }
+        static func parse(_ s: String) -> Level? {
+            switch s.lowercased() {
+            case "off", "silent", "none": return .off
+            case "error", "err": return .error
+            case "warn", "warning": return .warn
+            case "info": return .info
+            case "perf", "timing": return .perf
+            case "trace", "debug": return .trace
+            case "verbose", "all": return .verbose
+            default: return nil
+            }
+        }
+    }
+
     private static let enabledKey = "diagnosticsEnabled"
+    private static let levelKey = "diagnosticsLevel"
     private static let monitorIntervalKey = "diagnosticsMonitorMs"
     private static var monitorTimer: Timer?
     private static let startTime = Date()
 
+    /// Master kill-switch retained for back-compat. `false` forces level to .off.
+    /// Default: true (controlled by level instead).
     static var enabled: Bool {
         if UserDefaults.standard.object(forKey: enabledKey) == nil { return true }
         return UserDefaults.standard.bool(forKey: enabledKey)
     }
 
+    /// Active minimum level. Reads UserDefaults each call; NSUserDefaults
+    /// caches in-memory so the lookup is a dict probe, not a disk hit.
+    static var minLevel: Level {
+        if !enabled { return .off }
+        if let s = UserDefaults.standard.string(forKey: levelKey),
+           let lv = Level.parse(s) {
+            return lv
+        }
+        return .info
+    }
+
+    /// Required level for each known category. Unknown categories default
+    /// to `.info` so accidental new sites still appear in normal runs.
+    private static let categoryLevels: [String: Level] = [
+        // warn — anomalies worth surfacing without full debug spew
+        "TITLEMISS": .warn,
+        "FRONT_MISMATCH": .warn,
+        "AXTITLE": .warn,
+        "CLICKMISROUTE": .warn,
+        "CLICKAFTER": .warn,
+        // info — normal-flow events (default for unknown categories)
+        "PANEL": .info,
+        "KEY": .info,
+        "KEYEVENT": .info,
+        "FOCUS": .info,
+        "MOUSE": .info,
+        "CLICK": .info,
+        "SESSION": .info,
+        "INIT": .info,
+        "MANUAL": .info,
+        "HIDE": .info,
+        "GUARD": .info,
+        "TITLE": .info,
+        // perf — switch timing & panel build counters
+        "SWITCH": .perf,
+        "REFRESH": .perf,
+        // trace — z-order/focus mechanics
+        "SYSZ": .trace,
+        "RECENCY": .trace,
+        "SAMEAPP": .trace,
+        "ZALIGN": .trace,
+        "ZENFORCE": .trace,
+        "ZRESTORE": .trace,
+        "ZQUICK": .trace,
+        "FRONTMOSTSET": .trace,
+        "SIBLINGSDEMOTE": .trace,
+        "FRONT": .trace,
+        "AXEVENT": .trace,
+        "COUNTER": .trace,
+        "OVERLAY": .trace,
+        "XPROC": .trace,
+        "TEST": .trace,
+        // verbose — high-volume / IPC chatter
+        // (PROFILER is opt-in via runProfilerAtLaunch; surface its lines
+        // at info so an automated profiling run is visible at default level.)
+        "PROFILER": .info,
+        "WINSIDE": .verbose,
+        "API": .verbose,
+        "CTAP": .verbose,
+    ]
+
+    private static func categoryLevel(_ category: String) -> Level {
+        return categoryLevels[category] ?? .info
+    }
+
+    /// Returns true iff a `log(category, …)` for this category would emit.
+    /// Use to gate expensive precomputation done outside `log()`'s autoclosure.
+    static func shouldLog(_ category: String) -> Bool {
+        return minLevel >= categoryLevel(category)
+    }
+
     static func log(_ category: String, _ message: @autoclosure () -> String) {
-        guard enabled else { return }
+        guard minLevel >= categoryLevel(category) else { return }
         let elapsed = Date().timeIntervalSince(startTime)
-        NSLog("[DIAG %@] t+%.3fs %@", category, elapsed, message())
+        // NSLog/asl truncate at the first embedded newline, splitting
+        // a single logical message across multiple log lines and
+        // hiding everything that came after the \n. We saw exactly
+        // this with Coherence-window titles containing internal
+        // newlines. Strip line-break characters from the message
+        // before logging.
+        let raw = message()
+        var sanitized = raw
+        if raw.contains("\n") || raw.contains("\r") {
+            sanitized = raw
+                .replacingOccurrences(of: "\r\n", with: " ")
+                .replacingOccurrences(of: "\n", with: " ")
+                .replacingOccurrences(of: "\r", with: " ")
+        }
+        NSLog("[DIAG %@] t+%.3fs %@", category, elapsed, sanitized)
+    }
+
+    // MARK: - Switch timing
+    // End-to-end latency for an Alt-Tab "switch": from hotkey event to
+    // target window focused. All times in milliseconds since `switchT0`.
+    // Phases are recorded under the "SWITCH" category so they can be
+    // grepped together. Concurrency: written from main thread (keyboard
+    // events, App.focus*) and from BackgroundWork.accessibilityCommandsQueue
+    // (Window.focus tail). CFAbsoluteTime reads/writes are atomic enough
+    // for diagnostics; we don't care about a torn read once a switch.
+    static var switchT0: CFAbsoluteTime = 0
+    static var switchLastPhase: CFAbsoluteTime = 0
+    static var switchContext: String = ""
+
+    static func startSwitchTiming(_ context: String) {
+        guard shouldLog("SWITCH") else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        switchT0 = now
+        switchLastPhase = now
+        switchContext = context
+        log("SWITCH", "t0 [\(context)]")
+    }
+
+    static func markSwitchPhase(_ name: String, extra: String = "") {
+        guard shouldLog("SWITCH") else { return }
+        guard switchT0 > 0 else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        let total = (now - switchT0) * 1000
+        let delta = (now - switchLastPhase) * 1000
+        switchLastPhase = now
+        let suffix = extra.isEmpty ? "" : " \(extra)"
+        log("SWITCH", String(format: "%@ +%.1fms (Δ%.1fms) [%@]%@", name, total, delta, switchContext, suffix))
     }
 
     static func logTrackedRecency(_ label: String) {
-        guard enabled else { return }
+        guard shouldLog("RECENCY") else { return }
         let top = Windows.list
             .sorted { $0.lastFocusOrder < $1.lastFocusOrder }
             .prefix(8)
@@ -132,7 +291,11 @@ class Diagnostics {
     ]
 
     static func logSystemZOrder(_ label: String) {
-        guard enabled else { return }
+        // Gate on SAMEAPP too — that's the regression-detector branch
+        // inside this function. If both SYSZ and SAMEAPP are below the
+        // active level, the entire CGWindowListCopyWindowInfo + per-window
+        // CGSGetWindowLevel scan is skipped.
+        guard shouldLog("SYSZ") || shouldLog("SAMEAPP") else { return }
         // Use .optionOnScreenOnly — Apple only guarantees front-to-back
         // z-order for "OnScreen" options. Without it, ordering is undefined.
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
@@ -147,8 +310,10 @@ class Diagnostics {
             return true
         }
         var idx = 0
+        var ownerCounts: [String: Int] = [:]
         let top = filtered.prefix(8).map { (w: [String: Any]) -> String in
             let owner = (w[kCGWindowOwnerName as String] as? String) ?? "?"
+            ownerCounts[owner, default: 0] += 1
             let name = (w[kCGWindowName as String] as? String) ?? ""
             let wid = (w[kCGWindowNumber as String] as? Int) ?? 0
             let layer = (w[kCGWindowLayer as String] as? Int) ?? 0
@@ -160,10 +325,19 @@ class Diagnostics {
             return result
         }
         log("SYSZ", "\(label): \(top.joined(separator: " || "))")
+        // Surfaces the "all-windows-up" regression. AltTab must focus a
+        // single window per app — if multiple windows of the same owner
+        // appear in the top-8 z-order after a focus, _SLPSSetFrontProcess
+        // brought the whole process forward instead of just the target.
+        let multi = ownerCounts.filter { $0.value > 1 }
+        if !multi.isEmpty {
+            let summary = multi.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: " ")
+            log("SAMEAPP", "\(label): top8 has \(summary) (>1 window of same app at top — should be 1)")
+        }
     }
 
     static func logFrontmostSignals(_ label: String) {
-        guard enabled else { return }
+        guard shouldLog("FRONT") else { return }
         let nswApp = NSWorkspace.shared.frontmostApplication
         let nswPid = nswApp?.processIdentifier
         let atFront = Applications.frontmostPid
@@ -231,7 +405,10 @@ class Diagnostics {
     /// Captures what's actually on top at the compositor level.
     /// Call after a focus transition to see the z-order fight.
     static func sampleZOrderOverTime(label: String, durationMs: Int = 5000, intervalMs: Int = 200) {
-        guard enabled else { return }
+        // Gate on SYSZ — sampler exists solely to feed logSystemZOrder.
+        // Below `trace` this returns immediately, saving N background
+        // CGWindowListCopyWindowInfo calls per focus.
+        guard shouldLog("SYSZ") else { return }
         let samples = durationMs / intervalMs
         for i in 0..<samples {
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(i * intervalMs)) {
@@ -243,7 +420,7 @@ class Diagnostics {
     /// Log which app is frontmost + which window is key, with timestamp.
     /// Lightweight — no CGWindowList call.
     static func logFrontmostQuick(_ label: String) {
-        guard enabled else { return }
+        guard shouldLog("ZQUICK") else { return }
         let nsw = NSWorkspace.shared.frontmostApplication
         log("ZQUICK", "\(label): pid=\(nsw?.processIdentifier ?? 0) app=\(nsw?.bundleIdentifier ?? "?") frontPid=\(Applications.frontmostPid ?? 0)")
     }
@@ -398,7 +575,15 @@ class FocusOverlay {
         guard overlayModeEnabled, ScreenRecordingPermission.status == .granted else { return }
         refreshTimer?.invalidate()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { _ in
+            // Defensive re-gate: even after the timer was scheduled, the
+            // user may have toggled overlay mode off via the menu. We
+            // can't rely on stopBackgroundRefresh being called from
+            // every code path that flips the flag — and we observed
+            // 708MB RSS at idle that traced back to this Task running
+            // when it shouldn't.
+            guard overlayModeEnabled else { return }
             Task {
+                guard overlayModeEnabled else { return }
                 do {
                     let content = try await getContent()
                     // Only cache top 5 most-recently-used windows (not all 66!)
@@ -433,6 +618,18 @@ class FocusOverlay {
             }
         }
         Diagnostics.log("OVERLAY", "background refresh started (5s interval)")
+    }
+
+    /// Stop the periodic refresh and release any cached buffers.
+    /// Called when overlay mode is toggled off — without this, the
+    /// timer keeps running and Task captures keep populating
+    /// preCaptureCache despite the gate, growing RSS unbounded.
+    static func stopBackgroundRefresh() {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+        let cleared = preCaptureCache.count
+        preCaptureCache.removeAll()
+        Diagnostics.log("OVERLAY", "background refresh stopped, cleared \(cleared) cached buffers")
     }
 
     /// Call once at launch to create the persistent overlay panel.
@@ -572,4 +769,1105 @@ class DebugWindowDestination: BaseDestination {
         DispatchQueue.main.async { callback?(level, formatted) }
         return formattedString
     }
+}
+
+/// Synthetic load generator for measuring focus-path success + latency.
+/// Each attempt: optionally warms up a SOURCE window (so we control the
+/// transition direction), then fires the measured focus via one of:
+///   (1) tileClick: App.focusSelectedWindow(target) — single switch
+///   (2) fastAltTab: focus an intermediate window, wait ~100ms, then
+///       focus the real target. Stresses race conditions when the user
+///       rapidly changes mind / cycles.
+///
+/// Transitions are weighted to over-sample Parallels-involving cases
+/// (where the user reports flakiness):
+///   parToPar=35%  parToMac=25%  macToPar=25%  macToMac=15%
+///
+/// At +50/100/200/500/1000/2000ms after each measured focus, samples
+/// ground truth via NSWorkspace.frontmostApplication, AX
+/// kAXFocusedWindow, and CGWindowListCopyWindowInfo. The +50/100ms
+/// checkpoints expose perceptible-flicker bounces that ZENFORCE
+/// recovers from before the longer-offset checkpoints.
+///
+/// Trigger:
+///   defaults write com.lwouis.alt-tab-macos runProfilerAtLaunch -bool true
+///   <restart AltTab>; profiler runs once, clears the flag.
+class Profiler {
+    static var isRunning = false
+    private static var attempts: [Attempt] = []
+    private static var startTime: CFAbsoluteTime = 0
+
+    enum Mode: String { case tileClick, fastAltTab }
+    enum Transition: String { case parToPar, parToMac, macToPar, macToMac }
+
+    struct Attempt {
+        let mode: Mode
+        let transition: Transition
+        let warmedSource: Bool
+        let intermediateApp: String?
+        let targetWid: CGWindowID
+        let targetApp: String
+        let targetTitle: String
+        let isTargetParallels: Bool
+        let requestTime: CFAbsoluteTime
+        var checkpoints: [Checkpoint] = []
+        var firstSuccessMs: Int?
+        var stableAt2s: Bool = false
+        var bouncedAtMs: [Int] = []
+    }
+
+    struct Checkpoint {
+        let offsetMs: Int
+        let frontmostPid: pid_t?
+        let frontmostAppName: String
+        let axFocusedWid: CGWindowID?
+        let topZWid: CGWindowID?
+        let topZApp: String
+        let success: Bool
+    }
+
+    static func run(durationSeconds: TimeInterval = 60) {
+        guard !isRunning else {
+            Diagnostics.log("PROFILER", "already running, ignoring start")
+            return
+        }
+        isRunning = true
+        attempts = []
+        startTime = CFAbsoluteTimeGetCurrent()
+        let endTime = startTime + durationSeconds
+        let par = eligibleTargets().filter { $0.isParallelsCoherenceWindow }.count
+        let mac = eligibleTargets().count - par
+        Diagnostics.log("PROFILER", "===== START — duration=\(Int(durationSeconds))s candidates par=\(par) mac=\(mac) =====")
+        scheduleNext(endTime: endTime)
+    }
+
+    private static func scheduleNext(endTime: CFAbsoluteTime) {
+        guard CFAbsoluteTimeGetCurrent() < endTime else {
+            finish()
+            return
+        }
+        DispatchQueue.main.async {
+            performOne(endTime: endTime)
+        }
+    }
+
+    private static func performOne(endTime: CFAbsoluteTime) {
+        let transition = pickTransition()
+        guard let plan = pickWindows(for: transition) else {
+            Diagnostics.log("PROFILER", "no candidates for \(transition.rawValue); retrying in 0.5s")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                scheduleNext(endTime: endTime)
+            }
+            return
+        }
+        let mode: Mode = Bool.random() ? .tileClick : .fastAltTab
+        // Warmup: ensure the SOURCE window is currently frontmost so the
+        // measured focus actually exercises this transition direction.
+        let currentFront = topZOrderWindow().0
+        let needsWarmup = plan.source.cgWindowId != currentFront
+        let warmupDelayMs = needsWarmup ? 350 : 0
+        if needsWarmup {
+            Diagnostics.log("PROFILER", "warmup \(transition.rawValue): source=\(plan.source.application.localizedName ?? "?") wid=\(plan.source.cgWindowId ?? 0)")
+            focusVia(plan.source)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(warmupDelayMs)) {
+            runMeasured(mode: mode, transition: transition, plan: plan, warmedSource: needsWarmup, endTime: endTime)
+        }
+    }
+
+    private static func runMeasured(mode: Mode, transition: Transition, plan: Plan, warmedSource: Bool, endTime: CFAbsoluteTime) {
+        let target = plan.target
+        let attempt = Attempt(
+            mode: mode,
+            transition: transition,
+            warmedSource: warmedSource,
+            intermediateApp: plan.intermediate?.application.localizedName,
+            targetWid: target.cgWindowId!,
+            targetApp: target.application.localizedName ?? "?",
+            targetTitle: String((target.title ?? "").prefix(40)),
+            isTargetParallels: target.isParallelsCoherenceWindow,
+            requestTime: CFAbsoluteTimeGetCurrent()
+        )
+        attempts.append(attempt)
+        let idx = attempts.count - 1
+        Diagnostics.log("PROFILER", "#\(idx) start mode=\(mode.rawValue) trans=\(transition.rawValue) warmed=\(warmedSource) target=\(attempt.targetApp):wid=\(attempt.targetWid) title='\(attempt.targetTitle)'")
+        switch mode {
+        case .tileClick:
+            focusVia(target)
+            scheduleSamples(idx: idx, target: target, endTime: endTime)
+        case .fastAltTab:
+            // Rapid 2-step: focus intermediate, 100ms later focus the
+            // real target. Simulates a user who alt-tabs to A, then
+            // immediately changes mind and alt-tabs to B — exposes
+            // races where ZENFORCE for A is still active when B fires.
+            let inter = plan.intermediate ?? plan.source
+            focusVia(inter)
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) {
+                focusVia(target)
+                scheduleSamples(idx: idx, target: target, endTime: endTime)
+            }
+        }
+    }
+
+    private static func focusVia(_ window: Window) {
+        // Satisfy `guard appIsBeingUsed` in App.focusSelectedWindow.
+        // The path itself calls hideUi(true) which resets it.
+        App.appIsBeingUsed = true
+        App.focusSelectedWindow(window)
+    }
+
+    private static func scheduleSamples(idx: Int, target: Window, endTime: CFAbsoluteTime) {
+        // Sub-50ms checkpoints surface latency wins from focus-path
+        // reorders. The 50ms→2000ms tail still measures stability so we
+        // catch any z-order regressions from new fast paths.
+        let offsets = [5, 10, 15, 20, 30, 40, 50, 100, 200, 500, 1000, 2000]
+        for ms in offsets {
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(ms)) {
+                let cp = sampleGroundTruth(target: target, offsetMs: ms)
+                guard idx < attempts.count else { return }
+                attempts[idx].checkpoints.append(cp)
+                if cp.success && attempts[idx].firstSuccessMs == nil {
+                    attempts[idx].firstSuccessMs = ms
+                }
+                if ms == offsets.last {
+                    attempts[idx].stableAt2s = cp.success
+                    // Bounce: any checkpoint that failed AFTER first-success.
+                    // Useful even when stableAt2s=true — captures the brief
+                    // intra-app sibling promotion that ZENFORCE corrects.
+                    let firstOK = attempts[idx].firstSuccessMs ?? Int.max
+                    let bouncedAt = attempts[idx].checkpoints
+                        .filter { $0.offsetMs > firstOK && !$0.success }
+                        .map { $0.offsetMs }
+                    attempts[idx].bouncedAtMs = bouncedAt
+                    // Failure log distinguishes "z0 wrong but AX right"
+                    // (transient compositor-only blip; user usually doesn't
+                    // notice) from "both wrong" (real input-routing failure).
+                    let cps = attempts[idx].checkpoints.map { c -> String in
+                        if c.success { return "\(c.offsetMs)=✓" }
+                        let axRight = c.axFocusedWid == target.cgWindowId
+                        let mark = axRight ? "z!ax✓" : "z!ax!"
+                        return "\(c.offsetMs)=\(mark):\(c.topZApp.prefix(10))"
+                    }.joined(separator: " ")
+                    let bounceTag = bouncedAt.isEmpty ? "" : " bounced@\(bouncedAt.map { "\($0)" }.joined(separator: ","))"
+                    Diagnostics.log("PROFILER", "#\(idx) result first=\(attempts[idx].firstSuccessMs.map { "\($0)ms" } ?? "never")\(bounceTag) | \(cps)")
+                }
+            }
+        }
+        // Next attempt: shorter wait if no warmup needed (~1.8s),
+        // longer if we warmed up (~2.5s) — gives prior session
+        // time to fully settle.
+        let nextDelay = 2.0 + Double.random(in: 0...0.5)
+        DispatchQueue.main.asyncAfter(deadline: .now() + nextDelay) {
+            scheduleNext(endTime: endTime)
+        }
+    }
+
+    struct Plan {
+        let source: Window
+        let target: Window
+        let intermediate: Window?
+    }
+
+    private static func pickWindows(for transition: Transition) -> Plan? {
+        let candidates = eligibleTargets()
+        let par = candidates.filter { $0.isParallelsCoherenceWindow }
+        let mac = candidates.filter { !$0.isParallelsCoherenceWindow }
+        let sourcePool: [Window]
+        let targetPool: [Window]
+        switch transition {
+        case .parToPar:
+            sourcePool = par
+            targetPool = par
+        case .parToMac:
+            sourcePool = par
+            targetPool = mac
+        case .macToPar:
+            sourcePool = mac
+            targetPool = par
+        case .macToMac:
+            sourcePool = mac
+            targetPool = mac
+        }
+        guard !sourcePool.isEmpty, !targetPool.isEmpty else { return nil }
+        guard let source = sourcePool.randomElement() else { return nil }
+        // Target must differ from source.
+        let validTargets = targetPool.filter { $0.cgWindowId != source.cgWindowId }
+        guard let target = validTargets.randomElement() else {
+            // Pool too small for distinct source/target — only viable for
+            // par→par/mac→mac with a single window. Bail out, caller retries.
+            return nil
+        }
+        // For fastAltTab, pick an intermediate that's also in target pool
+        // and distinct from source+target. Falls back to source if pool is
+        // exhausted.
+        let interPool = candidates.filter {
+            $0.cgWindowId != source.cgWindowId && $0.cgWindowId != target.cgWindowId
+        }
+        let intermediate = interPool.randomElement()
+        return Plan(source: source, target: target, intermediate: intermediate)
+    }
+
+    // Weighted sampler — even after H1 + finer checkpoints showed every
+    // path passing at 5ms, the user explicitly cited Mac→Mac slowness, so
+    // bias the sampler toward macToMac to build statistical confidence on
+    // that path. Parallels-involving paths still get majority share since
+    // they're the historical regression source.
+    private static let transitionWeights: [(Transition, Int)] = [
+        (.parToPar, 25), (.parToMac, 20), (.macToPar, 25), (.macToMac, 30),
+    ]
+
+    private static func pickTransition() -> Transition {
+        let total = transitionWeights.map { $0.1 }.reduce(0, +)
+        var r = Int.random(in: 0..<total)
+        for (t, w) in transitionWeights {
+            if r < w { return t }
+            r -= w
+        }
+        return .macToMac
+    }
+
+    private static func eligibleTargets() -> [Window] {
+        return Windows.list.filter { w in
+            w.cgWindowId != nil
+                && !w.isMinimized
+                && !w.isHidden
+                && w.application.bundleIdentifier != App.bundleIdentifier
+                && w.shouldShowTheUser
+                && (w.size?.width ?? 0) >= 200
+                && (w.size?.height ?? 0) >= 80
+        }
+    }
+
+    private static func sampleGroundTruth(target: Window, offsetMs: Int) -> Checkpoint {
+        let nsApp = NSWorkspace.shared.frontmostApplication
+        let frontPid = nsApp?.processIdentifier
+        let frontName = nsApp?.localizedName ?? "?"
+        var axFocusedWid: CGWindowID? = nil
+        if let pid = frontPid {
+            let appRef = AXUIElementCreateApplication(pid)
+            var focusedValue: AnyObject?
+            if AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedValue) == .success,
+               let windowRef = focusedValue {
+                var wid: CGWindowID = 0
+                if _AXUIElementGetWindow(windowRef as! AXUIElement, &wid) == .success {
+                    axFocusedWid = wid
+                }
+            }
+        }
+        let (topWid, topApp) = topZOrderWindow()
+        // Success = our target is ALSO at z0 or AX-focused. We don't
+        // require both, since either signal alone reflects user-visible
+        // success.
+        let success = (topWid == target.cgWindowId) || (axFocusedWid == target.cgWindowId)
+        return Checkpoint(
+            offsetMs: offsetMs,
+            frontmostPid: frontPid,
+            frontmostAppName: frontName,
+            axFocusedWid: axFocusedWid,
+            topZWid: topWid,
+            topZApp: topApp ?? "?",
+            success: success
+        )
+    }
+
+    private static func topZOrderWindow() -> (CGWindowID?, String?) {
+        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let info = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return (nil, nil) }
+        let blocklist: Set<String> = [
+            "Window Server", "Control Center", "Dock", "AltTab",
+            "Notification Center", "SystemUIServer", "Spotlight",
+            "Menubar", "Wallpaper", "CursorUIViewService",
+            "LocalAuthenticationRemoteService",
+        ]
+        for w in info {
+            let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
+            if blocklist.contains(owner) { continue }
+            let alpha = (w[kCGWindowAlpha as String] as? Double) ?? 1.0
+            if alpha < 0.1 { continue }
+            if let bounds = w[kCGWindowBounds as String] as? [String: Any],
+               let width = bounds["Width"] as? Double, width < 40 { continue }
+            if let wid = w[kCGWindowNumber as String] as? Int {
+                return (CGWindowID(wid), owner)
+            }
+        }
+        return (nil, nil)
+    }
+
+    private static func finish() {
+        let total = attempts.count
+        guard total > 0 else {
+            Diagnostics.log("PROFILER", "===== FINISHED — no attempts =====")
+            isRunning = false
+            return
+        }
+        let elapsed = Int(CFAbsoluteTimeGetCurrent() - startTime)
+        Diagnostics.log("PROFILER", "===== SUMMARY (n=\(total), elapsed=\(elapsed)s) =====")
+        for ms in [5, 10, 15, 20, 30, 40, 50, 100, 200, 500, 1000, 2000] {
+            let s = attempts.filter { a in a.checkpoints.first(where: { $0.offsetMs == ms })?.success == true }.count
+            Diagnostics.log("PROFILER", "success @ \(ms)ms: \(s)/\(total) (\(pct(s, total))%)")
+        }
+        let firstSuccesses = attempts.compactMap { $0.firstSuccessMs }
+        if firstSuccesses.count >= 1 {
+            let sorted = firstSuccesses.sorted()
+            let avg = sorted.reduce(0, +) / sorted.count
+            let p50 = sorted[sorted.count / 2]
+            let p90Idx = max(0, min(sorted.count - 1, Int(Double(sorted.count) * 0.9)))
+            let p90 = sorted[p90Idx]
+            Diagnostics.log("PROFILER", "first-success ms (n=\(sorted.count)): avg=\(avg) p50=\(p50) p90=\(p90)")
+        } else {
+            Diagnostics.log("PROFILER", "first-success ms: NONE — every attempt missed at all checkpoints")
+        }
+        for mode in [Mode.tileClick, Mode.fastAltTab] {
+            let m = attempts.filter { $0.mode == mode }
+            guard !m.isEmpty else { continue }
+            let s = m.filter { $0.stableAt2s }.count
+            Diagnostics.log("PROFILER", "mode=\(mode.rawValue): \(s)/\(m.count) stable @ 2s (\(pct(s, m.count))%)")
+        }
+        for transition in [Transition.parToPar, .parToMac, .macToPar, .macToMac] {
+            let t = attempts.filter { $0.transition == transition }
+            guard !t.isEmpty else { continue }
+            let s = t.filter { $0.stableAt2s }.count
+            Diagnostics.log("PROFILER", "transition=\(transition.rawValue): \(s)/\(t.count) stable @ 2s (\(pct(s, t.count))%)")
+        }
+        var byApp: [String: (count: Int, stable: Int)] = [:]
+        for a in attempts {
+            var entry = byApp[a.targetApp] ?? (0, 0)
+            entry.count += 1
+            if a.stableAt2s { entry.stable += 1 }
+            byApp[a.targetApp] = entry
+        }
+        Diagnostics.log("PROFILER", "per-app stable @ 2s:")
+        for (app, stats) in byApp.sorted(by: { $0.key < $1.key }) {
+            Diagnostics.log("PROFILER", "  \(app): \(stats.stable)/\(stats.count) (\(pct(stats.stable, stats.count))%)")
+        }
+        let failures = attempts.enumerated().filter { !$0.element.stableAt2s }
+        if !failures.isEmpty {
+            Diagnostics.log("PROFILER", "failures (\(failures.count)):")
+            for (idx, a) in failures {
+                let cps = a.checkpoints.map { c in
+                    c.success ? "\(c.offsetMs)=✓" : "\(c.offsetMs)=top:\(c.topZApp)"
+                }.joined(separator: " ")
+                Diagnostics.log("PROFILER", "  #\(idx) \(a.mode.rawValue) trans=\(a.transition.rawValue) target='\(a.targetApp):\(a.targetTitle)' wid=\(a.targetWid) par=\(a.isTargetParallels) | \(cps)")
+            }
+        }
+        // Recoverable-flicker stats: attempts that missed at +50/100ms
+        // but ZENFORCE recovered by +200ms. Useful signal because the
+        // user perceives the brief flicker even when the final state
+        // is correct.
+        let recoveredFromFlicker = attempts.filter { a in
+            let f50 = a.checkpoints.first(where: { $0.offsetMs == 50 })?.success ?? true
+            let f200 = a.checkpoints.first(where: { $0.offsetMs == 200 })?.success ?? false
+            return !f50 && f200
+        }.count
+        Diagnostics.log("PROFILER", "flicker-then-recovered (50ms miss + 200ms hit): \(recoveredFromFlicker)/\(total) (\(pct(recoveredFromFlicker, total))%)")
+        // Bounce stats: attempts that achieved first-success but had any
+        // later failed checkpoint. Captures the intra-app sibling z-order
+        // bounce that the +50/200ms pair misses (e.g. bounce at +100ms only).
+        let bounced = attempts.filter { !$0.bouncedAtMs.isEmpty }
+        if !bounced.isEmpty {
+            Diagnostics.log("PROFILER", "post-success bounces: \(bounced.count)/\(total) (\(pct(bounced.count, total))%)")
+            var bounceMsHist: [Int: Int] = [:]
+            for a in bounced {
+                for ms in a.bouncedAtMs { bounceMsHist[ms, default: 0] += 1 }
+            }
+            let hist = bounceMsHist.sorted { $0.key < $1.key }
+                .map { "\($0.key)ms=\($0.value)" }.joined(separator: " ")
+            Diagnostics.log("PROFILER", "bounce histogram: \(hist)")
+        } else {
+            Diagnostics.log("PROFILER", "post-success bounces: 0/\(total) (no z-order drift after first-success)")
+        }
+        Diagnostics.log("PROFILER", "===== END =====")
+        isRunning = false
+    }
+
+    private static func pct(_ n: Int, _ d: Int) -> Int {
+        guard d > 0 else { return 0 }
+        return Int((Double(n) / Double(d) * 100).rounded())
+    }
+}
+
+/// Winside: bridge to a tiny PowerShell TCP daemon running inside the
+/// Parallels Windows 11 guest. Lets AltTab query and set the
+/// guest-side foreground window directly via Win32 APIs (Get/SetForegroundWindow,
+/// EnumWindows), bypassing the slow `prlctl exec` round-trip.
+///
+/// Wire protocol is line-based ASCII over TCP. See
+/// `~/.alttab/winside-helper.ps1` for the server side. Status (IP+port)
+/// is read from the JSON the helper writes to the shared folder, so we
+/// don't have to re-`prlctl list -f` on every command.
+///
+/// Lifecycle:
+///   - start(): if `winsideHelperEnabled` defaults key is set (default
+///     ON) AND helper isn't already healthy, fire-and-forget
+///     `prlctl exec` to launch it.
+///   - stop(): TCP `EXIT` to the helper. Falls back to `prlctl exec
+///     taskkill` if the EXIT command fails.
+///   - isReady(): TCP `PING`/`PONG` round trip, ~10-50ms.
+///   - queryForegroundAsync(): `FG` command, parses
+///     `OK <hwnd> <pid> <title>` and logs as `[DIAG WINSIDE]`.
+///   - setForegroundAsync(hwnd:): `SET <hwnd>`; logs result.
+///
+/// All commands run on a serial background queue so they don't block
+/// the focus path. Defaults key `winsideHelperEnabled` controls
+/// auto-start at app launch + menu toggle.
+class Winside {
+    private static let port: Int = 18765
+    private static let defaultsEnabledKey = "winsideHelperEnabled"
+    private static let helperScriptHostPath = "\(NSHomeDirectory())/.alttab/winside-helper.ps1"
+    private static let helperScriptGuestPath = #"\\Mac\Home\.alttab\winside-helper.ps1"#
+    private static let statusJsonPath = "\(NSHomeDirectory())/.alttab/winside-status.json"
+    private static let vmName = "Windows 11"
+    /// Serial queue so concurrent commands don't trample each other's
+    /// stdin/stdout (we use one-shot Process invocations).
+    private static let queue = DispatchQueue(label: "alttab.winside", qos: .utility)
+    private static var lastKnownIp: String?
+
+    static var isEnabled: Bool {
+        if UserDefaults.standard.object(forKey: defaultsEnabledKey) == nil { return true }
+        return UserDefaults.standard.bool(forKey: defaultsEnabledKey)
+    }
+
+    static func setEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: defaultsEnabledKey)
+        Diagnostics.log("WINSIDE", "enabled set → \(enabled)")
+        if enabled {
+            startIfNeeded()
+        } else {
+            stop()
+        }
+    }
+
+    /// Cache of the helper's IP from the status JSON. Tries up to N
+    /// times across short sleeps (helper takes ~3-5s to start).
+    private static func readStatusIp(retries: Int = 1) -> String? {
+        for _ in 0..<retries {
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: statusJsonPath)),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let ip = obj["ip"] as? String, !ip.isEmpty, ip != "0.0.0.0" {
+                lastKnownIp = ip
+                return ip
+            }
+            if retries > 1 { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        return lastKnownIp
+    }
+
+    /// Persistent TCP socket file descriptor (-1 = no connection).
+    /// All access goes through the serial queue, so no extra locking
+    /// needed for the fd itself, but `connectIfNeeded` and `closeSocket`
+    /// must run on `queue` too.
+    private static var socketFd: Int32 = -1
+    /// Counts consecutive sendOverSocket failures since last success.
+    /// 3 in a row → declare the helper hung, kill it, re-launch.
+    /// Real-world failure mode (observed 2026-05-01): helper
+    /// process is alive in the guest but TCP listener is wedged
+    /// after ~25 hours uptime. Without auto-restart, all SET calls
+    /// silently no-op until AltTab is manually restarted.
+    private static var consecutiveFailures: Int = 0
+    private static let failureThreshold = 3
+    /// Suppress recursive auto-restart attempts.
+    private static var restartInProgress = false
+    /// We only treat failures as "the helper hung" once we've actually
+    /// seen one successful round-trip. Without this gate, the startup
+    /// probe loop (which legitimately fails until the helper is up)
+    /// instantly trips the restart logic and kills the helper we just
+    /// launched.
+    private static var everConnected = false
+
+    private static func closeSocket(_ reason: String = "") {
+        if socketFd >= 0 {
+            close(socketFd)
+            Diagnostics.log("WINSIDE", "socket closed\(reason.isEmpty ? "" : ": \(reason)")")
+            socketFd = -1
+        }
+    }
+
+    /// Open a persistent TCP socket to the helper. Returns true on
+    /// success. Caller must be on `queue`. Idempotent: returns true
+    /// quickly if socket is already open.
+    private static func connectIfNeeded() -> Bool {
+        if socketFd >= 0 { return true }
+        guard let ip = readStatusIp() else { return false }
+        let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+        guard fd >= 0 else {
+            Diagnostics.log("WINSIDE", "socket() failed: errno=\(errno)")
+            return false
+        }
+        // SO_NOSIGPIPE: writing to a half-closed socket raises SIGPIPE
+        // and kills the process with no crash report. We observed
+        // this — AltTab vanished mid-alt-tab when the Winside helper
+        // had hung, leaving no log past the focus's manualUpdate.
+        // Mac doesn't have MSG_NOSIGNAL, so this is the per-socket
+        // way to suppress.
+        var noSigPipe: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        // 5s read timeout. LIST can take 1-3s on a freshly-warmed
+        // helper because PowerShell's first EnumWindows + JIT for
+        // Add-Type imports is slow. With a 2s timeout we were
+        // tripping on partial responses and dropping back to nc
+        // fallback, where the parse only saw the first line and
+        // declared "1 windows cached".
+        var tv = timeval(tv_sec: 5, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        // TCP_NODELAY for low latency (small commands).
+        var one: Int32 = 1
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(UInt16(port).bigEndian)
+        addr.sin_addr.s_addr = inet_addr(ip)
+        let connectResult = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if connectResult != 0 {
+            Diagnostics.log("WINSIDE", "connect(\(ip):\(port)) failed: errno=\(errno)")
+            close(fd)
+            return false
+        }
+        socketFd = fd
+        Diagnostics.log("WINSIDE", "socket opened to \(ip):\(port) fd=\(fd)")
+        return true
+    }
+
+    /// Send `cmd\n` over the persistent socket and read one line back.
+    /// For multi-line responses (LIST), reads until "END\n" sentinel
+    /// or terminator-pattern timeout.
+    /// Returns nil on socket error; closes socket so next call reconnects.
+    /// Multi-line aware via `expectMultiline` flag.
+    private static func sendOverSocket(_ cmd: String, expectMultiline: Bool = false) -> String? {
+        if !connectIfNeeded() { return nil }
+        let payload = (cmd + "\n").data(using: .utf8)!
+        let written = payload.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int in
+            return Darwin.send(socketFd, raw.baseAddress, payload.count, 0)
+        }
+        if written != payload.count {
+            closeSocket("send failed errno=\(errno)")
+            return nil
+        }
+        // Read until we see a complete response. For most commands
+        // that's one line. For LIST we keep reading until "END\n".
+        var buf = [UInt8](repeating: 0, count: 4096)
+        var accumulated = Data()
+        while true {
+            let n = recv(socketFd, &buf, buf.count, 0)
+            if n <= 0 {
+                closeSocket("recv n=\(n) errno=\(errno)")
+                return nil
+            }
+            accumulated.append(contentsOf: buf[0..<n])
+            if !expectMultiline {
+                // First newline ends single-line responses.
+                if accumulated.contains(0x0A) { break }
+            } else {
+                // LIST ends with a sentinel line "END\n" (or "END\r\n"
+                // because the helper uses StreamWriter.WriteLine which
+                // emits CRLF). Match it as a COMPLETE LINE — bracketed
+                // by newlines on both sides — so a window title that
+                // happens to contain literal "END" doesn't trigger a
+                // false-positive end-of-response.
+                if let s = String(data: accumulated, encoding: .utf8),
+                   s.contains("\nEND\n") || s.contains("\nEND\r\n") || s.hasPrefix("END\n") || s.hasPrefix("END\r\n") {
+                    break
+                }
+            }
+            if accumulated.count > 1_000_000 {
+                closeSocket("response too large")
+                return nil
+            }
+        }
+        let s = String(data: accumulated, encoding: .utf8) ?? ""
+        return s.trimmingCharacters(in: CharacterSet(charactersIn: "\r\n \u{FEFF}"))
+    }
+
+    /// Synchronous command. Tries persistent socket first; falls back to
+    /// one-shot nc spawn if socket isn't available. Internal — caller
+    /// must be on `queue`. Tracks consecutive failures and triggers
+    /// helper restart when the threshold is hit.
+    private static func sendCommandSync(_ cmd: String, timeoutSeconds: Int = 2) -> String? {
+        let multiline = (cmd == "LIST")
+        // Try the persistent socket first. ~50x faster than spawning nc.
+        if let resp = sendOverSocket(cmd, expectMultiline: multiline) {
+            consecutiveFailures = 0
+            everConnected = true
+            return resp
+        }
+        // Socket path failed (or no IP yet). Fall back to nc one-shot.
+        guard let ip = readStatusIp() else {
+            recordFailure(reason: "no status file")
+            return nil
+        }
+        let task = Process()
+        task.launchPath = "/bin/sh"
+        task.arguments = ["-c", "printf '%s\\n' '\(cmd)' | /usr/bin/nc -w \(timeoutSeconds) \(ip) \(port)"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = Pipe()
+        task.launch()
+        task.waitUntilExit()
+        guard task.terminationStatus == 0 else {
+            recordFailure(reason: "nc exit \(task.terminationStatus)")
+            return nil
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let resp = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\r\n \u{FEFF}"))
+        if resp == nil || resp?.isEmpty == true {
+            recordFailure(reason: "empty nc response")
+            return nil
+        }
+        consecutiveFailures = 0
+        everConnected = true
+        return resp
+    }
+
+    /// Bump the failure counter. After `failureThreshold` consecutive
+    /// failures, declare the helper hung and re-launch it. Caller must
+    /// be on `queue`.
+    /// Only counts failures AFTER we've had at least one successful
+    /// round-trip — startup probes shouldn't trigger restart.
+    private static func recordFailure(reason: String) {
+        guard everConnected else {
+            // Pre-first-success: silently swallow. The startup probe
+            // loop in startIfNeeded handles its own retry cadence.
+            return
+        }
+        consecutiveFailures += 1
+        Diagnostics.log("WINSIDE", "command failure #\(consecutiveFailures): \(reason)")
+        if consecutiveFailures >= failureThreshold && !restartInProgress {
+            restartInProgress = true
+            Diagnostics.log("WINSIDE", "helper appears hung (\(consecutiveFailures) failures); killing + restarting")
+            closeSocket("auto-restart")
+            // Kill any existing helper inside the guest, then re-launch.
+            let kill = Process()
+            kill.launchPath = "/bin/sh"
+            kill.arguments = [
+                "-c",
+                "/usr/local/bin/prlctl exec '\(vmName)' --current-user powershell -Command \"Get-WmiObject Win32_Process | Where-Object { $_.CommandLine -like '*winside-helper.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }\" 2>/dev/null"
+            ]
+            kill.launch()
+            kill.waitUntilExit()
+            consecutiveFailures = 0
+            restartInProgress = false
+            // Re-launch via the public path so probe + log fire normally.
+            // Done from `queue.async` so we don't recurse on the queue.
+            queue.async { startInternal() }
+        }
+    }
+
+    /// Internal launcher (no enable-check, no probe). Used by both
+    /// startIfNeeded and the auto-restart path.
+    private static func startInternal() {
+        ensureHelperScriptOnDisk()
+        Diagnostics.log("WINSIDE", "startInternal: launching helper via prlctl exec")
+        let task = Process()
+        task.launchPath = "/bin/sh"
+        task.arguments = [
+            "-c",
+            "nohup /usr/local/bin/prlctl exec '\(vmName)' --current-user powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File '\(helperScriptGuestPath)' >/tmp/alttab-winside-launch.log 2>&1 &"
+        ]
+        task.launch()
+        task.waitUntilExit()
+    }
+
+    /// True if helper responds to PING within `timeoutSeconds`.
+    static func isReady(timeoutSeconds: Int = 2) -> Bool {
+        return queue.sync {
+            guard let resp = sendCommandSync("PING", timeoutSeconds: timeoutSeconds) else { return false }
+            return resp.hasPrefix("PONG")
+        }
+    }
+
+    /// Launch the helper inside the guest if not already healthy.
+    /// Asynchronous; returns immediately.
+    static func startIfNeeded() {
+        guard isEnabled else {
+            Diagnostics.log("WINSIDE", "startIfNeeded: disabled in prefs, skipping")
+            return
+        }
+        queue.async {
+            // Make sure ~/.alttab and the helper script exist.
+            ensureHelperScriptOnDisk()
+            if let resp = sendCommandSync("PING", timeoutSeconds: 1), resp.hasPrefix("PONG") {
+                Diagnostics.log("WINSIDE", "startIfNeeded: helper already healthy at \(lastKnownIp ?? "?"):\(port)")
+                return
+            }
+            Diagnostics.log("WINSIDE", "startIfNeeded: launching helper via prlctl exec")
+            let task = Process()
+            task.launchPath = "/bin/sh"
+            // Fire-and-forget. The helper is a long-running PS process;
+            // we don't waitUntilExit. `nohup` + `&` so the prlctl exec
+            // call returns immediately.
+            task.arguments = [
+                "-c",
+                "nohup /usr/local/bin/prlctl exec '\(vmName)' --current-user powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File '\(helperScriptGuestPath)' >/tmp/alttab-winside-launch.log 2>&1 &"
+            ]
+            task.launch()
+            task.waitUntilExit()  // wait only for the shell, not the prlctl
+            // Probe up to 60s. Cold-start budget covers:
+            //   prlctl exec connection (~5-10s)
+            //   PowerShell -ExecutionPolicy Bypass cold start (~5-10s)
+            //   Add-Type JIT compilation (~5-15s on first run)
+            //   listener bind (~instant)
+            // Subsequent runs are faster (warm caches), but we
+            // intentionally don't tighten the budget: the cost of
+            // waiting longer is just log noise; the cost of giving up
+            // too early is the focus path can't use the helper at all.
+            // Log a heartbeat every 5s so the user sees we're still
+            // waiting.
+            let totalSeconds = 60
+            let pollIntervalSec = 0.5
+            let polls = Int(Double(totalSeconds) / pollIntervalSec)
+            var lastHeartbeat = 0
+            for attempt in 1...polls {
+                Thread.sleep(forTimeInterval: pollIntervalSec)
+                if let resp = sendCommandSync("PING", timeoutSeconds: 1), resp.hasPrefix("PONG") {
+                    let elapsedMs = Int(Double(attempt) * pollIntervalSec * 1000)
+                    Diagnostics.log("WINSIDE", "startIfNeeded: helper ready after \(elapsedMs)ms at \(lastKnownIp ?? "?"):\(port)")
+                    return
+                }
+                let elapsedSec = Int(Double(attempt) * pollIntervalSec)
+                if elapsedSec >= lastHeartbeat + 5 {
+                    Diagnostics.log("WINSIDE", "startIfNeeded: still waiting at \(elapsedSec)s (cold-start budget = \(totalSeconds)s)")
+                    lastHeartbeat = elapsedSec
+                }
+            }
+            Diagnostics.log("WINSIDE", "startIfNeeded: helper did NOT respond to PING within \(totalSeconds)s — see /tmp/alttab-winside-launch.log")
+        }
+    }
+
+    /// Tell the helper to terminate. Best-effort; falls back to
+    /// taskkill if EXIT fails. Sync — caller may want to wait.
+    static func stop() {
+        queue.sync {
+            if let resp = sendCommandSync("EXIT", timeoutSeconds: 2) {
+                Diagnostics.log("WINSIDE", "stop: helper acknowledged → \(resp)")
+                closeSocket("after EXIT ack")
+                return
+            }
+            closeSocket("after EXIT failure")
+            Diagnostics.log("WINSIDE", "stop: EXIT command failed; falling back to taskkill via prlctl exec")
+            // Fallback: kill any winside-helper.ps1 process inside the
+            // guest. Coarse but reliable.
+            let task = Process()
+            task.launchPath = "/bin/sh"
+            task.arguments = [
+                "-c",
+                "/usr/local/bin/prlctl exec '\(vmName)' --current-user powershell -Command \"Get-WmiObject Win32_Process | Where-Object { $_.CommandLine -like '*winside-helper.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }\" 2>/dev/null"
+            ]
+            task.launch()
+            task.waitUntilExit()
+        }
+    }
+
+    /// Async: query foreground window from guest. Logs result.
+    /// Callback (optional) receives (hwnd, pid, title) on success or nil.
+    static func queryForegroundAsync(label: String = "", callback: @escaping ((Int, Int, String)?) -> Void = { _ in }) {
+        queue.async {
+            guard let resp = sendCommandSync("FG", timeoutSeconds: 2) else {
+                Diagnostics.log("WINSIDE", "FG \(label): no response (helper down?)")
+                callback(nil)
+                return
+            }
+            // Expected: "OK <hwnd> <pid> <title>"
+            let parts = resp.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: false).map(String.init)
+            guard parts.count >= 3, parts[0] == "OK",
+                  let hwnd = Int(parts[1]), let pid = Int(parts[2]) else {
+                Diagnostics.log("WINSIDE", "FG \(label): bad response: \(resp.prefix(80))")
+                callback(nil)
+                return
+            }
+            let title = parts.count >= 4 ? parts[3] : ""
+            Diagnostics.log("WINSIDE", "FG \(label): hwnd=\(hwnd) pid=\(pid) title='\(title.prefix(40))'")
+            callback((hwnd, pid, title))
+        }
+    }
+
+    /// Async: SetForegroundWindow on the given guest hwnd. Logs result.
+    static func setForegroundAsync(hwnd: Int, label: String = "") {
+        queue.async {
+            guard let resp = sendCommandSync("SET \(hwnd)", timeoutSeconds: 2) else {
+                Diagnostics.log("WINSIDE", "SET \(hwnd) \(label): no response (helper down?)")
+                return
+            }
+            Diagnostics.log("WINSIDE", "SET \(hwnd) \(label): \(resp)")
+        }
+    }
+
+    /// Replace all CR/LF with single spaces and collapse runs of
+    /// whitespace, then trim ends. Coherence-side titles can contain
+    /// internal newlines (multi-line AX titles); without this, both
+    /// the cache key (built from LIST output) and the lookup needle
+    /// (built from `Window.title`) end up with mismatched newline
+    /// content and the dictionary lookup misses.
+    private static func sanitizeTitle(_ raw: String) -> String {
+        let noNewlines = raw
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        // Collapse runs of whitespace to a single space.
+        let parts = noNewlines.split(whereSeparator: { $0.isWhitespace })
+        return parts.joined(separator: " ")
+    }
+
+    /// Cache of guest title → hwnd, populated from LIST. Refreshed
+    /// on demand via refreshHwndCacheIfStale.
+    private static var hwndCache: [String: Int] = [:]
+    private static var hwndCacheTime: CFAbsoluteTime = 0
+    private static let hwndCacheStaleMs: Double = 1500
+
+    /// Refresh the cache by issuing LIST. Synchronous — call from queue.
+    /// Idempotent: skips if cache is fresh.
+    private static func refreshHwndCacheIfStale() {
+        let now = CFAbsoluteTimeGetCurrent()
+        if !hwndCache.isEmpty && (now - hwndCacheTime) * 1000 < hwndCacheStaleMs {
+            return
+        }
+        guard let resp = sendCommandSync("LIST", timeoutSeconds: 3) else {
+            Diagnostics.log("WINSIDE", "LIST refresh: no response")
+            return
+        }
+        var newCache: [String: Int] = [:]
+        for line in resp.split(separator: "\n", omittingEmptySubsequences: true) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed == "END" || trimmed.isEmpty { continue }
+            // "<hwnd> <pid> <title>"
+            let parts = trimmed.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+            if parts.count >= 3, let hwnd = Int(parts[0]) {
+                newCache[sanitizeTitle(parts[2])] = hwnd
+            }
+        }
+        if !newCache.isEmpty {
+            hwndCache = newCache
+            hwndCacheTime = now
+            Diagnostics.log("WINSIDE", "LIST refresh: \(newCache.count) windows cached")
+        }
+    }
+
+    /// Async: resolve hwnd from a Window's title, then SetForegroundWindow.
+    /// Belt-and-suspenders intervention to fire after AltTab's macOS-side
+    /// focus path completes — when SLPS+AX has succeeded but axFoc hasn't
+    /// fully transferred from the source app, the Windows-side
+    /// SetForegroundWindow is decisive (it goes through the OS's actual
+    /// foreground-management path). No-op if the helper isn't running.
+    /// Title-match strategy: exact match first, then prefix-match
+    /// (handles cases where macOS-side title got truncated/altered).
+    static func setForegroundForTitleAsync(_ title: String, label: String = "") {
+        guard isEnabled else { return }
+        // Parallels Coherence titles can contain INTERNAL newlines
+        // (multi-line titles returned by AX), not just trailing ones.
+        // `.trimmingCharacters(in: .whitespacesAndNewlines)` only strips
+        // leading + trailing whitespace; internal `\n` survives. Replace
+        // ALL line-break chars with a space so cache key + lookup match
+        // and so NSLog doesn't truncate at an embedded newline.
+        let needle = sanitizeTitle(title)
+        guard !needle.isEmpty else { return }
+        queue.async {
+            refreshHwndCacheIfStale()
+            // Exact match first.
+            if let hwnd = hwndCache[needle] {
+                guard let resp = sendCommandSync("SET \(hwnd)", timeoutSeconds: 2) else {
+                    Diagnostics.log("WINSIDE", "SET \(hwnd) \(label) for title='\(needle.prefix(40))': no response")
+                    return
+                }
+                Diagnostics.log("WINSIDE", "SET \(hwnd) \(label) (exact-match) title='\(needle.prefix(40))': \(resp)")
+                return
+            }
+            // Prefix-match fallback: macOS sometimes truncates the
+            // Coherence window title at ~30-50 chars; the guest still
+            // has the full title. Match the longest cache key whose
+            // prefix matches our title (or vice versa).
+            let candidates = hwndCache.keys.filter { $0.hasPrefix(needle) || needle.hasPrefix($0) }
+            if let bestTitle = candidates.max(by: { $0.count < $1.count }),
+               let hwnd = hwndCache[bestTitle] {
+                guard let resp = sendCommandSync("SET \(hwnd)", timeoutSeconds: 2) else {
+                    Diagnostics.log("WINSIDE", "SET \(hwnd) \(label) for title-prefix='\(needle.prefix(40))': no response")
+                    return
+                }
+                Diagnostics.log("WINSIDE", "SET \(hwnd) \(label) (prefix-match) title='\(needle.prefix(40))' → '\(bestTitle.prefix(40))': \(resp)")
+                return
+            }
+            Diagnostics.log("WINSIDE", "SET \(label): no hwnd found for title='\(needle.prefix(40))' (cache size=\(hwndCache.count))")
+        }
+    }
+
+    /// Idempotent: write the embedded PS script to disk if missing or
+    /// out-of-date. Source string is bundled here so AltTab.app is
+    /// self-contained — no manual placement needed.
+    private static func ensureHelperScriptOnDisk() {
+        let dir = "\(NSHomeDirectory())/.alttab"
+        if !FileManager.default.fileExists(atPath: dir) {
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+        let existing = (try? String(contentsOfFile: helperScriptHostPath, encoding: .utf8)) ?? ""
+        if existing == helperScriptSource {
+            return
+        }
+        do {
+            try helperScriptSource.write(toFile: helperScriptHostPath, atomically: true, encoding: .utf8)
+            Diagnostics.log("WINSIDE", "wrote embedded helper script to \(helperScriptHostPath) (\(helperScriptSource.utf8.count) bytes)")
+        } catch {
+            Diagnostics.log("WINSIDE", "FAILED to write helper script: \(error)")
+        }
+    }
+
+    /// Embedded source of `winside-helper.ps1`. Updated whenever the
+    /// guest-side daemon needs to change. Keep in sync with the file
+    /// AltTab developers reference at runtime via `helperScriptHostPath`.
+    /// Raw string (Swift `#"""..."""#`) so PowerShell `$` and `\` are
+    /// literal.
+    private static let helperScriptSource = #"""
+## winside-helper.ps1 — TCP daemon for fast Windows-side window control.
+## Started by AltTab via prlctl exec; talks to host over TCP.
+## Wire protocol (line-based ASCII, \r\n or \n terminator):
+##   PING                → PONG
+##   FG                  → OK <hwnd> <pid> <title>
+##   SET <hwnd>          → OK <0|1>   (1 = SetForegroundWindow returned true)
+##   LIST                → multiple lines "<hwnd> <pid> <title>", terminated by END
+##   EXIT                → OK BYE   (helper terminates after replying)
+## Status JSON (so host can discover IP+port without prlctl exec each time):
+##   \\Mac\Home\.alttab\winside-status.json
+##   { "version": 1, "ip": "<guest-ip>", "port": 18765, "pid": <ps-pid>, "started": "<ISO8601>" }
+
+$ErrorActionPreference = 'Stop'
+$Port = 18765
+$StatusPath = '\\Mac\Home\.alttab\winside-status.json'
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class WinSide {
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  public delegate bool EnumProc(IntPtr h, IntPtr lp);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lp);
+}
+"@
+
+function Get-PrimaryIPv4 {
+    $candidates = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+        Where-Object { $_.OperationalStatus -eq 'Up' -and $_.NetworkInterfaceType -ne 'Loopback' } |
+        ForEach-Object { $_.GetIPProperties().UnicastAddresses } |
+        Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' }
+    foreach ($c in $candidates) {
+        $ip = $c.Address.ToString()
+        if (-not $ip.StartsWith('169.254.')) { return $ip }
+    }
+    return '0.0.0.0'
+}
+
+function Write-Status {
+    param([string]$Ip, [int]$Port, [int]$ProcessId)
+    try {
+        $obj = @{
+            version = 1
+            ip = $Ip
+            port = $Port
+            pid = $ProcessId
+            started = (Get-Date).ToUniversalTime().ToString('o')
+        }
+        $json = $obj | ConvertTo-Json -Compress
+        $dir = Split-Path -Parent $StatusPath
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        [System.IO.File]::WriteAllText($StatusPath, $json)
+    } catch {}
+}
+
+function Get-FG-Line {
+    $h = [WinSide]::GetForegroundWindow()
+    $sb = New-Object Text.StringBuilder 512
+    [WinSide]::GetWindowText($h, $sb, 512) | Out-Null
+    $procId = 0
+    [WinSide]::GetWindowThreadProcessId($h, [ref]$procId) | Out-Null
+    return "OK $($h.ToInt64()) $procId $($sb.ToString())"
+}
+
+function Do-SetForeground {
+    param([Int64]$HwndInt)
+    $h = New-Object IntPtr -ArgumentList $HwndInt
+    if ([WinSide]::IsIconic($h)) {
+        [WinSide]::ShowWindow($h, 9) | Out-Null
+    }
+    [WinSide]::BringWindowToTop($h) | Out-Null
+    $r = [WinSide]::SetForegroundWindow($h)
+    return "OK $([int]$r)"
+}
+
+function List-Windows {
+    $lines = New-Object System.Collections.ArrayList
+    $cb = {
+        param([IntPtr]$h, [IntPtr]$lp)
+        if ([WinSide]::IsWindowVisible($h)) {
+            $sb = New-Object Text.StringBuilder 512
+            [WinSide]::GetWindowText($h, $sb, 512) | Out-Null
+            if ($sb.Length -gt 0) {
+                $procId = 0
+                [WinSide]::GetWindowThreadProcessId($h, [ref]$procId) | Out-Null
+                $lines.Add("$($h.ToInt64()) $procId $($sb.ToString())") | Out-Null
+            }
+        }
+        return $true
+    }
+    [WinSide]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
+    return $lines
+}
+
+$ip = Get-PrimaryIPv4
+$endpoint = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, $Port)
+$listener = New-Object System.Net.Sockets.TcpListener -ArgumentList $endpoint
+try { $listener.Start() } catch { exit 1 }
+
+Write-Status -Ip $ip -Port $Port -ProcessId $PID
+
+$shouldExit = $false
+while (-not $shouldExit) {
+    try {
+        $client = $listener.AcceptTcpClient()
+        $client.NoDelay = $true
+        $stream = $client.GetStream()
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        $reader = New-Object System.IO.StreamReader($stream, $utf8NoBom)
+        $writer = New-Object System.IO.StreamWriter($stream, $utf8NoBom)
+        $writer.AutoFlush = $true
+        while ($null -ne ($line = $reader.ReadLine())) {
+            $cmd = $line.Trim()
+            if ($cmd -eq '') { continue }
+            try {
+                if ($cmd -eq 'PING') {
+                    $writer.WriteLine('PONG')
+                } elseif ($cmd -eq 'FG') {
+                    $writer.WriteLine((Get-FG-Line))
+                } elseif ($cmd -match '^SET\s+(\d+)$') {
+                    $writer.WriteLine((Do-SetForeground -HwndInt ([Int64]$Matches[1])))
+                } elseif ($cmd -eq 'LIST') {
+                    foreach ($l in (List-Windows)) { $writer.WriteLine($l) }
+                    $writer.WriteLine('END')
+                } elseif ($cmd -eq 'EXIT') {
+                    $writer.WriteLine('OK BYE')
+                    $shouldExit = $true
+                    break
+                } else {
+                    $writer.WriteLine("ERR unknown: $cmd")
+                }
+            } catch {
+                try { $writer.WriteLine("ERR exception: $($_.Exception.Message)") } catch {}
+            }
+        }
+        try { $client.Close() } catch {}
+    } catch {}
+}
+
+try { $listener.Stop() } catch {}
+try { Remove-Item -Path $StatusPath -Force -ErrorAction SilentlyContinue } catch {}
+"""#
 }

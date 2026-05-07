@@ -38,6 +38,10 @@ class TileOverView: FlippedView {
     func updateHover() {
         guard let scrollView, !scrollView.isCurrentlyScrolling, !TilesView.hasMarkedText(), !ContextMenuEvents.isMenuOpen else { return }
         let location = convert(TilesPanel.shared.mouseLocationOutsideOfEventStream, from: nil)
+        guard isLocationInsideVisibleViewport(location) else {
+            if previousTarget != nil { resetHoveredWindow() }
+            return
+        }
         updateButtonHover(location)
         let newTarget = findTarget(location)
         if let target = newTarget ?? previousTarget {
@@ -57,6 +61,16 @@ class TileOverView: FlippedView {
             }
             previousTarget = newTarget
         }
+    }
+
+    /// When the cursor leaves the visible viewport, ignore it. Otherwise the
+    /// tile under cursor is one that's scrolled offscreen, and the resulting
+    /// scrollToVisible compounds into a runaway page to the LRU/MRU end.
+    private func isLocationInsideVisibleViewport(_ location: NSPoint) -> Bool {
+        if Preferences.scrollPanelOnEdgeHover { return true }
+        guard let scrollView, let superview else { return true }
+        let visibleInOverlay = convert(scrollView.documentVisibleRect, from: superview)
+        return visibleInOverlay.contains(location)
     }
 
     /// Find the TrafficLightButton at the given point (in TileOverView's coordinate space)

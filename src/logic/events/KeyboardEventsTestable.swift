@@ -27,6 +27,10 @@ private func logKeyboardEvent(_ globalId: Int?, _ shortcutState: ShortcutState?,
     if let globalId, let shortcutState {
         let shortcut = KeyboardEventsTestable.globalShortcutsIds.first { $0.value == globalId }
         Diagnostics.log("KEYEVENT", "hotkey \(shortcut?.key ?? "?") \(shortcutState) (globalId=\(globalId))")
+        // t0 for end-to-end switch latency. Reset on every hotkey event
+        // (press or release) so the most recent press/release is the
+        // time origin for the focus that follows.
+        Diagnostics.startSwitchTiming("\(shortcut?.key ?? "hotkey")-\(shortcutState)")
         Logger.debug { "globalShortcut:\(shortcut?.key ?? "") state:\(shortcutState)" }
         return
     }

@@ -63,11 +63,20 @@ sudo cp -R DerivedData/Build/Products/Release/AltTab.app /Applications/AltTab.ap
 rm -rf DerivedData/Build/Products/Release/AltTab.app
 rm -rf DerivedData/Build/Products/Debug/AltTab.app 2>/dev/null || true
 
-# Reset Launch Services so /Applications/AltTab.app is the only registered
-# AltTab bundle. Without this, `open -n` and process-attribution can pick
-# stale registrations (Debug build, .bak, Trash copies, etc.).
+# Re-register the canonical bundle. We do NOT run `lsregister -kill -r` here
+# any more — it was a fork-bomb amplifier:
+#   1. Apple deprecated `-kill` (lsregister now prints "The -kill option has
+#      been removed because it was dangerous and no longer useful.").
+#   2. `-r -domain ...` re-walks the disk and re-registers every AltTab.app
+#      it finds (DerivedData, .bak, Trash copies, Xcode-IDE cache). Each one
+#      gets a distinct `trustedCodeSignatures` entry. TCC keys on (bundle id,
+#      designated requirement) so each cert hash is a separate "client" that
+#      independently needs Accessibility/ScreenRecording/InputMonitoring
+#      authorization. The result was N parallel TCC contexts and on first
+#      launch AltTab's permission-window logic looped, spawning ~N popups.
+# To purge stale ghost entries explicitly when needed (after deleting their
+# on-disk path), use:  lsregister -u /path/to/stale/AltTab.app
 LSREG=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
-"$LSREG" -kill -r -domain local -domain system -domain user 2>/dev/null || true
 "$LSREG" /Applications/AltTab.app 2>/dev/null || true
 
 # Best-effort: pre-grant TCC entries so the rebuild doesn't re-prompt for

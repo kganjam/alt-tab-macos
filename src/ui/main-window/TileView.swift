@@ -234,7 +234,18 @@ class TileView: FlippedView {
         updateAppIcon(element, title)
         updateDockLabelIcon(element.dockLabel)
         setAccessibilityHelp(getAccessibilityHelp(element.application.localizedName, element.dockLabel))
-        mouseUpCallback = { () -> Void in App.focusSelectedWindow(element) }
+        mouseUpCallback = { () -> Void in
+            // Sync the keyboard-tracked selection to the clicked tile.
+            // Without this, a delayed Parallels hideUi(true) leaves
+            // appIsBeingUsed=true for ~200ms, and a hotkey-release in
+            // that window re-fires focusTarget against the stale
+            // keyboard-selected wid — focusing the wrong window.
+            Windows.updateSelectedAndHoveredWindowIndex(index, true)
+            // Start switch timing for the mouse-click path so per-phase
+            // logs measure click→focused, not stale time-since-last-key.
+            Diagnostics.startSwitchTiming("mouseClick")
+            App.focusSelectedWindow(element)
+        }
         mouseMovedCallback = { () -> Void in Windows.updateSelectedAndHoveredWindowIndex(index, true) }
     }
 

@@ -51,6 +51,19 @@ class App: AppCenterApplication {
     /// start to decide the current frontmost window when other signals
     /// disagree.
     static var lastFocusedTargetWid: CGWindowID?
+    /// pid of the same target. Used by CLICKMISROUTE to distinguish
+    /// "wrong app" (cross-pid) from "different window of same app"
+    /// (cross-wid, same-pid) — the latter is usually just user
+    /// clicking outside a small alt-tab target's bounds, not a bug.
+    static var lastFocusedTargetPid: pid_t?
+    /// When `lastFocusedTargetWid` was last set. Used by the
+    /// CLICKMISROUTE diagnostic to age-out the "expected target" so a
+    /// user clicking around 30 seconds after a switch isn't flagged as
+    /// a misroute.
+    static var lastFocusedTargetTime: CFAbsoluteTime?
+    /// Register-once guard for the global mouse-click NSEvent monitor.
+    /// Without this, duplicate `[DIAG MOUSE]` lines appeared per click.
+    static var globalClickMonitorRegistered = false
     /// Mirror of `sessionSourceWid` as a pid, exposed as before for the
     /// existing Parallels-outbound detection which only needs to know
     /// the source app. Kept in sync via rotation.
@@ -82,7 +95,43 @@ class App: AppCenterApplication {
         TilesView.reset()
     }
 
+    private static var didCallRestart = false
+    private static let restartLockPath = "/tmp/alttab-restart.lock"
+    private static let restartLockWindowMs: Double = 5000
+
     static func restart() {
+        // Why this is a fork-bomb without a guard: there are ~9 callers of
+        // restart() — almost all "if my event tap couldn't be created,
+        // bounce the process". When TCC for Input Monitoring is in a
+        // flaky state (e.g., multiple registered code-signatures, fresh
+        // rebuild not yet authorized), every spawned process fails the
+        // same way, calls restart(), spawns ANOTHER one with `open -n`
+        // (which bypasses the running-instance check), and dies. The
+        // children survive their parent. Within seconds the screen is
+        // littered with PermissionsWindow popups from many parallel
+        // instances.
+        //
+        // Two-tier guard:
+        //  1. Process-local: each instance restarts at most once.
+        //  2. Filesystem mtime: if ANY instance restarted within the
+        //     last 5s, suppress this one — just terminate without
+        //     spawning a successor. The first restarter wins.
+        if didCallRestart {
+            Logger.error { "restart() called twice in same process — ignoring" }
+            return
+        }
+        didCallRestart = true
+        let now = Date().timeIntervalSince1970
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: restartLockPath),
+           let mtime = attrs[.modificationDate] as? Date {
+            let ageMs = (now - mtime.timeIntervalSince1970) * 1000
+            if ageMs < restartLockWindowMs {
+                Logger.error { "restart() suppressed: another instance restarted \(Int(ageMs))ms ago — terminating only" }
+                App.shared.terminate(nil)
+                return
+            }
+        }
+        try? "\(now)".write(toFile: restartLockPath, atomically: true, encoding: .utf8)
         // we use -n to open a new instance, to avoid calling applicationShouldHandleReopen
         // we use Bundle.main.bundlePath in case of multiple AltTab versions on the machine
         printStackTrace()
@@ -94,25 +143,36 @@ class App: AppCenterApplication {
         Logger.info { "appIsBeingUsed:\(appIsBeingUsed)" }
         guard appIsBeingUsed else { return } // already hidden
         Diagnostics.log("PANEL", "hideUi keepPreview=\(keepPreview)")
+        // Phase 1 — sync state flip + the visible step. `appIsBeingUsed=false`
+        // first so the deferred-cleanup re-entry guard is correct; tile-panel
+        // orderOut second so the user-perceived latency for Mac→Mac ends here
+        // (target window has already been raised by `window.focus()` upstream
+        // under H1 ordering, so the orderOut reveals it instantly).
+        // `sessionSourcePid` intentionally NOT cleared — overwritten in
+        // `showUiOrCycleSelection` on the next session.
         appIsBeingUsed = false
-        // note: `sessionSourcePid` is intentionally NOT cleared here because
-        // `focusSelectedWindow` calls `hideUi(true)` immediately BEFORE
-        // `window.focus()`, and the focus path still needs the source pid to
-        // detect Parallels Coherence outbound switches. The pid is overwritten
-        // on the next session start in `showUiOrCycleSelection`.
         isFirstSummon = true
         forceDoNothingOnRelease = false
-        UsageStats.resetSession()
-        TilesView.endSearchSession()
-        ContextMenuEvents.toggle(false)
-        CursorEvents.toggle(false)
-        TrackpadEvents.reset()
         hideTilesPanelWithoutChangingKeyWindow()
-        if !keepPreview {
-            PreviewPanel.shared.orderOut(nil)
+        // Phase 2 — defer the slow cleanup to the next runloop. Event-tap
+        // teardown (CursorEvents/ContextMenuEvents), tooltip private-API
+        // call, and MainMenu rebuild together cost 10–50 ms on the main
+        // thread; running them inline pushed the perceived end-of-switch
+        // out by that amount. The deferred handlers all guard on
+        // `appIsBeingUsed`, so a re-entrant Cmd-Tab arriving in this
+        // window finds the flag already false and behaves correctly.
+        DispatchQueue.main.async {
+            UsageStats.resetSession()
+            TilesView.endSearchSession()
+            ContextMenuEvents.toggle(false)
+            CursorEvents.toggle(false)
+            TrackpadEvents.reset()
+            if !keepPreview {
+                PreviewPanel.shared.orderOut(nil)
+            }
+            hideAllTooltips()
+            MainMenu.toggle(true)
         }
-        hideAllTooltips()
-        MainMenu.toggle(true)
     }
 
     /// some tooltips may not be hidden when the main window is hidden; we force it through a private API
@@ -179,6 +239,7 @@ class App: AppCenterApplication {
 
     static func focusTarget() {
         guard appIsBeingUsed else { return } // already hidden
+        Diagnostics.markSwitchPhase("focusTarget")
         let selectedWindow = Windows.selectedWindow()
         Logger.info { selectedWindow?.debugId }
         focusSelectedWindow(selectedWindow)
@@ -232,6 +293,7 @@ class App: AppCenterApplication {
         } else {
             FocusOverlay.dismiss()
             FocusOverlay.clearPreCaptureCache()
+            FocusOverlay.stopBackgroundRefresh()
         }
         Diagnostics.log("OVERLAY", "overlay mode \(newValue ? "ON" : "OFF")")
     }
@@ -258,6 +320,12 @@ class App: AppCenterApplication {
         updateParallelsMenuStates()
     }
 
+    @objc static func toggleWinsideHelper() {
+        let newValue = !Winside.isEnabled
+        Winside.setEnabled(newValue)
+        updateParallelsMenuStates()
+    }
+
     private static func updateParallelsMenuStates() {
         guard let parallelsItem = Menubar.menu.items.first(where: { $0.title == "Parallels Mode" }),
               let sub = parallelsItem.submenu else { return }
@@ -267,6 +335,7 @@ class App: AppCenterApplication {
             case "Hide Source Window": item.state = UserDefaults.standard.bool(forKey: "hideSourceWindow") ? .on : .off
             case "Coherence Thumbnails": item.state = !UserDefaults.standard.bool(forKey: "disableCoherencePreviews") ? .on : .off
             case "Diagnostics Logging": item.state = Diagnostics.enabled ? .on : .off
+            case "Windows Helper (Phase 3 IPC)": item.state = Winside.isEnabled ? .on : .off
             default: break
             }
         }
@@ -362,6 +431,22 @@ class App: AppCenterApplication {
         }
         lastFocusTime = now
         lastFocusWid = targetWid
+        // Click-time live-title check for Parallels Coherence windows.
+        // If the panel-build refresh missed an update (or the user
+        // navigated OneNote between panel-show and click), this catches
+        // the divergence and refreshes before logging the KEY line.
+        // Surfaces the "tile said X but live says Y" failure mode.
+        if let w = selectedWindow, w.isParallelsCoherenceWindow,
+           let axElement = w.axUiElement, let wid = w.cgWindowId {
+            var titleValue: AnyObject?
+            if AXUIElementCopyAttributeValue(axElement, kAXTitleAttribute as CFString, &titleValue) == .success,
+               let liveTitle = titleValue as? String, !liveTitle.isEmpty,
+               liveTitle != w.title {
+                Diagnostics.log("TITLEMISS", "wid=\(wid) tile-said='\(w.title ?? "")' live-at-click='\(liveTitle)'")
+                w.refreshTitleIfChanged(liveTitle)
+            }
+        }
+        Diagnostics.markSwitchPhase("focusSelectedWindow", extra: "wid=\(targetWid?.description ?? "nil")")
         Diagnostics.log("KEY", "release → focusSelectedWindow target=\(selectedWindow?.debugId ?? "nil")")
         Diagnostics.logFrontmostQuick("pre-focus")
         // Light z-order sampling: 5 samples over 1s (not 25 over 5s).
@@ -397,6 +482,7 @@ class App: AppCenterApplication {
         }()
         if isParInvolved {
             if let window = selectedWindow, MissionControl.state() == .inactive || MissionControl.state() == .showDesktop {
+                Diagnostics.markSwitchPhase("preFocus", extra: "par=true")
                 window.focus()
                 if Preferences.cursorFollowFocus == .always || (
                     Preferences.cursorFollowFocus == .differentScreen && (Spaces.screenSpacesMap.first { $0.value.contains { space in window.spaceIds.contains(space) } })?.key != NSScreen.active()?.cachedUuid()) {
@@ -405,14 +491,30 @@ class App: AppCenterApplication {
             } else {
                 PreviewPanel.shared.orderOut(nil)
             }
-            // Delay panel dismiss — target is now raising under the curtain
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(200)) {
+            // Delay panel dismiss — target is now raising under the curtain.
+            // Original: 200 ms; user reported Par→Par "noticeably slow" — that
+            // 1/5-second wait was the dominant felt latency. With the
+            // tightened ZENFORCE early-phase ticks (5/12/25 ms) actively
+            // re-raising the target if Parallels' coherence sync momentarily
+            // bumps it, a much shorter curtain is sufficient. Default 30 ms
+            // ≈ 2 display frames at 60 Hz; user can dial via
+            // `defaults write com.lwouis.alt-tab-macos parHideUiDelayMs -int N`
+            // if a specific Parallels workload needs more (or less).
+            let parHideUiDelayMs = UserDefaults.standard.object(forKey: "parHideUiDelayMs") as? Int ?? 30
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(parHideUiDelayMs)) {
                 hideUi(true)
             }
         } else {
-            // Non-Parallels: original order
-            hideUi(true)
+            // Non-Parallels: focus FIRST, then dismiss the panel. Prior
+            // order called hideUi(true) synchronously (~25-75ms on the
+            // event-tap teardown path), so SLPS didn't fire until after
+            // the panel had already disappeared and the previous frontmost
+            // briefly re-rendered. Reordering pushes SLPS to t=0, hides
+            // the panel afterward — the popUpMenu-level TilesPanel keeps
+            // the visual curtain up while the target raises beneath it.
+            // Same logic the Parallels branch above already relies on.
             if let window = selectedWindow, MissionControl.state() == .inactive || MissionControl.state() == .showDesktop {
+                Diagnostics.markSwitchPhase("preFocus", extra: "par=false")
                 window.focus()
                 if Preferences.cursorFollowFocus == .always || (
                     Preferences.cursorFollowFocus == .differentScreen && (Spaces.screenSpacesMap.first { $0.value.contains { space in window.spaceIds.contains(space) } })?.key != NSScreen.active()?.cachedUuid()) {
@@ -421,6 +523,8 @@ class App: AppCenterApplication {
             } else {
                 PreviewPanel.shared.orderOut(nil)
             }
+            Diagnostics.markSwitchPhase("preHideUi")
+            hideUi(true)
         }
     }
 
@@ -649,12 +753,41 @@ class App: AppCenterApplication {
 
 extension App: NSApplicationDelegate {
     func applicationDidFinishLaunching(_ aNotification: Notification) {
+        // Ignore SIGPIPE process-wide. Without this, any write to a
+        // half-closed socket (e.g. the Winside TCP socket when the
+        // guest helper has hung) raises SIGPIPE → silent process
+        // death with NO crash report. We observed exactly this:
+        // AltTab vanished mid-alt-tab leaving the user without a
+        // window switcher and no diagnostic. Per-socket SO_NOSIGPIPE
+        // is also set defensively, but this catches any other
+        // unprotected write (NSPipe drains, prlctl IO, etc).
+        signal(SIGPIPE, SIG_IGN)
         App.appCenterDelegate = AppCenterCrash()
         App.shared.disableRelaunchOnLogin()
         Logger.initialize()
         Logger.info { "Launching AltTab \(App.version)" }
         Diagnostics.log("INIT", "AltTab \(App.version) launched (custom build with diagnostics)")
         Diagnostics.startContinuousMonitoring()
+        // Auto-run profiler if `runProfilerAtLaunch` is set in defaults.
+        // Clears the flag immediately so a crash mid-run doesn't loop.
+        // 8s settle delay ensures Windows.list has been populated by
+        // the initial AX scan before we start picking targets.
+        if UserDefaults.standard.bool(forKey: "runProfilerAtLaunch") {
+            UserDefaults.standard.set(false, forKey: "runProfilerAtLaunch")
+            // Optional override: `defaults write com.lwouis.alt-tab-macos
+            // profilerDurationSeconds -int 180` for longer runs / better
+            // statistical confidence. Default 60s gives ~21 attempts;
+            // 180s gives ~60 attempts (~3% precision on bounce rate).
+            let dur = UserDefaults.standard.object(forKey: "profilerDurationSeconds") as? Int ?? 60
+            Diagnostics.log("PROFILER", "runProfilerAtLaunch=true; scheduling \(dur)s run in 8s")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) {
+                Profiler.run(durationSeconds: TimeInterval(dur))
+            }
+        }
+        // Phase 3 IPC: launch the Windows-side TCP helper (in the
+        // Parallels guest) if the user has it enabled. Async — does
+        // not block app launch. Default ON.
+        Winside.startIfNeeded()
         if FocusOverlay.overlayModeEnabled {
             FocusOverlay.createPersistentOverlay()
             DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
@@ -672,43 +805,135 @@ extension App: NSApplicationDelegate {
         // Global mouse click monitor: tracks clicks to distinguish
         // user-initiated window activations from Parallels' automatic
         // re-activation during the focus guard period.
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .leftMouseUp, .rightMouseUp]) { event in
-            let isDown = event.type == .leftMouseDown || event.type == .rightMouseDown
-            let button = (event.type == .leftMouseDown || event.type == .leftMouseUp) ? "left" : "right"
-            let action = isDown ? "down" : "up"
-            if isDown {
-                Windows.lastMouseClickTime = CFAbsoluteTimeGetCurrent()
-            }
-            // Log click target: find topmost window at cursor position
-            let pt = NSEvent.mouseLocation
-            let screenHeight = NSScreen.main?.frame.height ?? 0
-            let cgPoint = CGPoint(x: pt.x, y: screenHeight - pt.y)
-            let skipOwners: Set<String> = [
-                "Window Server", "Control Center", "Dock", "AltTab",
-                "Notification Center", "SystemUIServer", "Spotlight",
-                "Menubar", "Wallpaper", "CursorUIViewService",
-                "LocalAuthenticationRemoteService",
-            ]
-            if isDown, let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
-                for w in list {
-                    let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
-                    if skipOwners.contains(owner) { continue }
-                    let alpha = (w[kCGWindowAlpha as String] as? Double) ?? 1.0
-                    if alpha < 0.1 { continue }
-                    guard let bounds = w[kCGWindowBounds as String] as? [String: Any],
-                          let x = bounds["X"] as? Double, let y = bounds["Y"] as? Double,
-                          let width = bounds["Width"] as? Double, let height = bounds["Height"] as? Double else { continue }
-                    let rect = CGRect(x: x, y: y, width: width, height: height)
-                    if rect.contains(cgPoint) {
-                        let name = (w[kCGWindowName as String] as? String) ?? ""
-                        let wid = (w[kCGWindowNumber as String] as? Int) ?? 0
-                        let short = name.isEmpty ? owner : "\(owner):\(name.prefix(30))"
-                        Diagnostics.log("MOUSE", "\(button) \(action) at (\(Int(cgPoint.x)),\(Int(cgPoint.y))) → wid=\(wid) \(short)")
-                        break
-                    }
+        // REGISTER-ONCE GUARD: empirically `[DIAG MOUSE]` was firing
+        // twice per click — symptom of either an inadvertent double
+        // call to applicationDidFinishLaunching or external HID
+        // duplication. The guard ensures only the first registration
+        // wins and logs the duplicate so it's diagnosable.
+        if App.globalClickMonitorRegistered {
+            Diagnostics.log("INIT", "duplicate addGlobalMonitorForEvents call suppressed")
+        } else {
+            App.globalClickMonitorRegistered = true
+            NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .leftMouseUp, .rightMouseUp]) { event in
+                let isDown = event.type == .leftMouseDown || event.type == .rightMouseDown
+                let button = (event.type == .leftMouseDown || event.type == .leftMouseUp) ? "left" : "right"
+                let action = isDown ? "down" : "up"
+                if isDown {
+                    Windows.lastMouseClickTime = CFAbsoluteTimeGetCurrent()
                 }
-            } else {
-                Diagnostics.log("MOUSE", "\(button) \(action) at (\(Int(cgPoint.x)),\(Int(cgPoint.y)))")
+                // Log click target: find topmost window at cursor position
+                let pt = NSEvent.mouseLocation
+                let screenHeight = NSScreen.main?.frame.height ?? 0
+                let cgPoint = CGPoint(x: pt.x, y: screenHeight - pt.y)
+                let skipOwners: Set<String> = [
+                    "Window Server", "Control Center", "Dock", "AltTab",
+                    "Notification Center", "SystemUIServer", "Spotlight",
+                    "Menubar", "Wallpaper", "CursorUIViewService",
+                    "LocalAuthenticationRemoteService",
+                ]
+                if isDown, let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+                    for w in list {
+                        let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
+                        if skipOwners.contains(owner) { continue }
+                        let alpha = (w[kCGWindowAlpha as String] as? Double) ?? 1.0
+                        if alpha < 0.1 { continue }
+                        guard let bounds = w[kCGWindowBounds as String] as? [String: Any],
+                              let x = bounds["X"] as? Double, let y = bounds["Y"] as? Double,
+                              let width = bounds["Width"] as? Double, let height = bounds["Height"] as? Double else { continue }
+                        let rect = CGRect(x: x, y: y, width: width, height: height)
+                        if rect.contains(cgPoint) {
+                            let name = (w[kCGWindowName as String] as? String) ?? ""
+                            let wid = (w[kCGWindowNumber as String] as? Int) ?? 0
+                            let ownerPid = (w[kCGWindowOwnerPID as String] as? Int32) ?? 0
+                            let short = name.isEmpty ? owner : "\(owner):\(name.prefix(30))"
+                            if isDown {
+                                Windows.lastMouseClickWid = CGWindowID(wid)
+                                Windows.lastMouseClickPid = ownerPid
+                                Windows.lastMouseClickOwner = owner
+                                // CRITICAL: when the user clicks a window
+                                // belonging to a DIFFERENT app than the
+                                // current AltTab focus target, release
+                                // the guard. Without this,
+                                // diagnoseFrontmostMismatch sees "target
+                                // at z0 but frontmost-app is different"
+                                // and fires SLPS to restore the old
+                                // target — fighting the user's click and
+                                // making it impossible to switch apps
+                                // by clicking. The guard's purpose is
+                                // to defend against silent self-
+                                // activation; an explicit user click is
+                                // not silent.
+                                if let target = Windows.altTabFocusTarget,
+                                   target.application.pid != ownerPid {
+                                    Diagnostics.log("GUARD",
+                                        "released by user click: clicked pid=\(ownerPid) (\(short.prefix(30))) ≠ target pid=\(target.application.pid)")
+                                    Windows.altTabFocusTarget = nil
+                                    Windows.altTabFocusTargetUntil = 0
+                                    Windows.recentZOrderIntents.removeAll()
+                                }
+                            }
+                            Diagnostics.log("MOUSE", "\(button) \(action) at (\(Int(cgPoint.x)),\(Int(cgPoint.y))) → wid=\(wid) pid=\(ownerPid) \(short)")
+                            // CLICKMISROUTE: when the click resolved to a wid that
+                            // is NOT our most recent AltTab focus target, the user
+                            // likely clicked expecting the target window but hit
+                            // something else (a stealer at z0, a bouncing sibling,
+                            // or just stale focus). We suppress when there's no
+                            // recent target (>5s since last focus call) so plain
+                            // user-clicking on whatever isn't flagged as misroute.
+                            if isDown,
+                               let recentTarget = App.lastFocusedTargetWid,
+                               let recentTargetTime = App.lastFocusedTargetTime,
+                               CFAbsoluteTimeGetCurrent() - recentTargetTime < 5.0,
+                               CGWindowID(wid) != recentTarget {
+                                let ageMs = Int((CFAbsoluteTimeGetCurrent() - recentTargetTime) * 1000)
+                                let recentTargetPid = App.lastFocusedTargetPid ?? 0
+                                let isAppMismatch = (recentTargetPid != 0 && ownerPid != recentTargetPid)
+                                let kind = isAppMismatch ? "APP-MISMATCH" : "WINDOW-MISMATCH"
+                                Diagnostics.log("CLICKMISROUTE",
+                                    "[\(kind)] click→wid=\(wid) pid=\(ownerPid) (\(short.prefix(40))) but AltTab target wid=\(recentTarget) pid=\(recentTargetPid) (\(ageMs)ms ago)")
+                            }
+                            // CLICKAFTER: schedule a +200ms probe of where
+                            // input is actually routed. If frontmost-app's
+                            // pid differs from the click's pid at +200ms,
+                            // the user's typing in the next ~hundred-ms
+                            // would land in the wrong app. This is the
+                            // diagnostic that catches "I clicked OneNote
+                            // but my keystrokes go to Safari" — clicks
+                            // resolve correctly via WindowServer, but a
+                            // background app self-activation between
+                            // click and keystroke routes input elsewhere.
+                            if isDown {
+                                let clickedWid = CGWindowID(wid)
+                                let clickedPid = ownerPid
+                                let clickedShort = short
+                                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(200)) {
+                                    let nsApp = NSWorkspace.shared.frontmostApplication
+                                    let frontPid = nsApp?.processIdentifier ?? -1
+                                    let frontName = nsApp?.localizedName ?? "?"
+                                    var axFocusedWid: CGWindowID = 0
+                                    if frontPid > 0 {
+                                        let appRef = AXUIElementCreateApplication(frontPid)
+                                        var focusedValue: AnyObject?
+                                        if AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedValue) == .success,
+                                           let windowRef = focusedValue {
+                                            var w: CGWindowID = 0
+                                            if _AXUIElementGetWindow(windowRef as! AXUIElement, &w) == .success {
+                                                axFocusedWid = w
+                                            }
+                                        }
+                                    }
+                                    if frontPid != clickedPid {
+                                        Diagnostics.log("CLICKAFTER",
+                                            "+200ms after click on wid=\(clickedWid) pid=\(clickedPid) (\(clickedShort.prefix(30))) → frontmost is pid=\(frontPid) \(frontName) axFoc=#\(axFocusedWid). Input would route to a DIFFERENT app than the user clicked.")
+                                    }
+                                }
+                            }
+                            break
+                        }
+                    }
+                } else {
+                    Diagnostics.log("MOUSE", "\(button) \(action) at (\(Int(cgPoint.x)),\(Int(cgPoint.y)))")
+                }
             }
         }
         AXUIElement.setGlobalTimeout()
@@ -725,6 +950,9 @@ extension App: NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         // symbolic hotkeys state persist after the app is quit; we restore this shortcut before quitting
         setNativeCommandTabEnabled(true)
+        // Tell the Windows-side helper to terminate so we don't leave a
+        // dangling TCP listener when AltTab quits.
+        Winside.stop()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

@@ -43,11 +43,21 @@
 	<key>NSSupportsSuddenTermination</key>
 	<string>false</string>
 	<key>SUEnableAutomaticChecks</key>
-	<string>true</string>
+	<string>false</string>
 	<key>SUEnableJavaScript</key>
-	<string>true</string>
+	<string>false</string>
+	<!--
+	     SUFeedURL intentionally points nowhere for our custom build.
+	     Upstream value was https://alt-tab.app/appcast.xml; that fed
+	     Sparkle the official 10.x release stream and gave us "Update
+	     Available" prompts that, if accepted, would replace our
+	     custom-built /Applications/AltTab.app with the upstream one
+	     and lose every patch in this repo. Pointing at an unresolvable
+	     URL is the simplest belt-and-suspenders alongside
+	     SUEnableAutomaticChecks=false.
+	-->
 	<key>SUFeedURL</key>
-	<string>https://alt-tab.app/appcast.xml</string>
+	<string>https://localhost.invalid/disabled-by-custom-build</string>
 	<key>SUPublicEDKey</key>
 	<string>2e9SQOBoaKElchSa/4QDli/nvYkyuDNfynfzBF6vJK4=</string>
 	<key>SUScheduledCheckInterval</key>

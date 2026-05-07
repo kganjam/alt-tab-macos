@@ -16,6 +16,7 @@ class CursorEvents {
     static func toggle(_ enabled: Bool) {
         guard enabled != shouldBeEnabled else { return }
         shouldBeEnabled = enabled
+        Diagnostics.log("CTAP", "toggle enabled=\(enabled)")
         if !enabled {
             deadZoneInitialPosition = nil
         }
@@ -66,65 +67,107 @@ class CursorEvents {
         }
     }
 
+    /// Logs the click-tap decision so absorbed events become visible.
+    /// The existing global NSEvent monitor in App.swift only sees clicks
+    /// that were NOT absorbed by this tap — so without this, an absorbed
+    /// click is invisible everywhere.
+    private static func logTapDecision(_ btn: String, _ action: String, _ cgEvent: CGEvent, absorbed: Bool, reason: String = "") {
+        let p = cgEvent.location
+        let suffix = reason.isEmpty ? "" : " (\(reason))"
+        Diagnostics.log("CTAP", "\(btn) \(action) at (\(Int(p.x)),\(Int(p.y))) absorbed=\(absorbed)\(suffix)")
+    }
+
     private static func handleLeftMouseDown(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
-        if TilesView.hasMarkedText() || ContextMenuEvents.isMenuOpen { return Unmanaged.passUnretained(cgEvent) }
+        if TilesView.hasMarkedText() || ContextMenuEvents.isMenuOpen {
+            logTapDecision("left", "down", cgEvent, absorbed: false, reason: "markedText/menuOpen")
+            return Unmanaged.passUnretained(cgEvent)
+        }
         if isPointerInsideSearchField() {
             mouseDownInsideSearchField = true
+            logTapDecision("left", "down", cgEvent, absorbed: false, reason: "searchField")
             return Unmanaged.passUnretained(cgEvent)
         }
         mouseDownInsideSearchField = false
-        guard isPointerInsideUi() else { return nil }
+        guard isPointerInsideUi() else {
+            logTapDecision("left", "down", cgEvent, absorbed: true, reason: "outsideUi")
+            return nil
+        }
         mouseDownTarget = (findButtonUnderPointer() ?? findTileViewUnderPointer()) as AnyObject?
+        logTapDecision("left", "down", cgEvent, absorbed: true, reason: "insideUi")
         return nil
     }
 
     private static func handleLeftMouseUp(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
-        if TilesView.hasMarkedText() || ContextMenuEvents.isMenuOpen { return Unmanaged.passUnretained(cgEvent) }
+        if TilesView.hasMarkedText() || ContextMenuEvents.isMenuOpen {
+            logTapDecision("left", "up", cgEvent, absorbed: false, reason: "markedText/menuOpen")
+            return Unmanaged.passUnretained(cgEvent)
+        }
         if mouseDownInsideSearchField || isPointerInsideSearchField() {
             mouseDownInsideSearchField = false
+            logTapDecision("left", "up", cgEvent, absorbed: false, reason: "searchField")
             return Unmanaged.passUnretained(cgEvent)
         }
         guard isPointerInsideUi() else {
             if mouseDownTarget == nil { App.hideUi() }
             mouseDownTarget = nil
+            logTapDecision("left", "up", cgEvent, absorbed: true, reason: "outsideUi→hideUi")
             return nil
         }
         let downTarget = mouseDownTarget
         mouseDownTarget = nil
         if let button = findButtonUnderPointer(), button === downTarget {
             button.onClick()
+            logTapDecision("left", "up", cgEvent, absorbed: true, reason: "button")
             return nil
         }
         if let target = findTileViewUnderPointer(), target === downTarget {
             target.mouseUpCallback()
+            logTapDecision("left", "up", cgEvent, absorbed: true, reason: "tile")
             return nil
         }
+        logTapDecision("left", "up", cgEvent, absorbed: true, reason: "insideUi-noTarget")
         return nil
     }
 
     private static func handleRightMouseDown(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
-        if ContextMenuEvents.isMenuOpen || isPointerInsideUi() { return Unmanaged.passUnretained(cgEvent) }
+        if ContextMenuEvents.isMenuOpen || isPointerInsideUi() {
+            logTapDecision("right", "down", cgEvent, absorbed: false, reason: "menuOpen/insideUi")
+            return Unmanaged.passUnretained(cgEvent)
+        }
+        logTapDecision("right", "down", cgEvent, absorbed: true, reason: "outsideUi")
         return nil
     }
 
     private static func handleRightMouseUp(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
-        if ContextMenuEvents.isMenuOpen || isPointerInsideUi() { return Unmanaged.passUnretained(cgEvent) }
+        if ContextMenuEvents.isMenuOpen || isPointerInsideUi() {
+            logTapDecision("right", "up", cgEvent, absorbed: false, reason: "menuOpen/insideUi")
+            return Unmanaged.passUnretained(cgEvent)
+        }
+        logTapDecision("right", "up", cgEvent, absorbed: true, reason: "outsideUi")
         return nil
     }
 
     private static func handleOtherMouseDown(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
-        if ContextMenuEvents.isMenuOpen || isPointerInsideUi() { return Unmanaged.passUnretained(cgEvent) }
+        if ContextMenuEvents.isMenuOpen || isPointerInsideUi() {
+            logTapDecision("other", "down", cgEvent, absorbed: false, reason: "menuOpen/insideUi")
+            return Unmanaged.passUnretained(cgEvent)
+        }
+        logTapDecision("other", "down", cgEvent, absorbed: true, reason: "outsideUi")
         return nil
     }
 
     private static func handleOtherMouseUp(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
-        if ContextMenuEvents.isMenuOpen { return Unmanaged.passUnretained(cgEvent) }
+        if ContextMenuEvents.isMenuOpen {
+            logTapDecision("other", "up", cgEvent, absorbed: false, reason: "menuOpen")
+            return Unmanaged.passUnretained(cgEvent)
+        }
         if isPointerInsideUi(),
            cgEvent.getIntegerValueField(.mouseEventButtonNumber) == 2,
            let target = findTileViewUnderPointer(),
            let window = target.window_ {
             window.isWindowlessApp ? window.application.quit() : window.close()
         }
+        logTapDecision("other", "up", cgEvent, absorbed: true, reason: "")
         return nil
     }
 

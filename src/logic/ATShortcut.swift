@@ -95,8 +95,16 @@ class ATShortcut {
                id == currentHoldShortcut.id {
                 let currentModifiers = cocoaToCarbonFlags(ModifierFlags.current)
                 if currentModifiers != (currentModifiers | (currentHoldShortcut.shortcut.carbonModifierFlags)) {
-                    currentHoldShortcut.state = .up
-                    ControlsTab.executeAction(currentHoldShortcut.id)
+                    // Safety net only: if matches() Path B already detected the
+                    // .up transition and fired executeAction this iteration,
+                    // `state` is already `.up` and we'd just be duplicating.
+                    // Without this guard, every normal Alt-release fires
+                    // focusTarget twice (once from matches(), once from here)
+                    // — caught downstream by the 200ms debounce, but waste.
+                    if currentHoldShortcut.state != .up {
+                        currentHoldShortcut.state = .up
+                        ControlsTab.executeAction(currentHoldShortcut.id)
+                    }
                 }
             }
         }
