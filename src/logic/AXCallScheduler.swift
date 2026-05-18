@@ -33,8 +33,8 @@ class AXCallScheduler {
     }
 
     private init() {
-        fastQueue = LabeledOperationQueue("axCallsFast", .userInteractive, 16)
-        retryQueue = LabeledOperationQueue("axCallsRetry", .userInteractive, 8)
+        fastQueue = LabeledOperationQueue("axCallsFast", .userInitiated, 2)
+        retryQueue = LabeledOperationQueue("axCallsRetry", .utility, 1)
     }
 
     func schedule(key: String, file: String = #file, function: String = #function, line: Int = #line, context: String = "", pid: pid_t? = nil, block: @escaping () throws -> Void) {
@@ -57,8 +57,7 @@ class AXCallScheduler {
                 keyStates[key] = state
                 let remaining = Self.throttleDelayNs - elapsed
                 lock.unlock()
-                let queue = queueForPid(pid)
-                queue.addOperationAfter(deadline: .now() + .nanoseconds(Int(remaining))) { [self] in
+                addOperation(queueForPid(pid), afterNs: remaining) { [self] in
                     fireThrottled(key: key, file: file, function: function, line: line)
                 }
             }
@@ -85,7 +84,7 @@ class AXCallScheduler {
     }
 
     func submit(_ block: @escaping () -> Void) {
-        fastQueue.addOperation(block)
+        addOperation(fastQueue, block)
     }
 
     func removeEntry(key: String) {
@@ -125,10 +124,31 @@ class AXCallScheduler {
     }
 
     private func submitToQueue(key: String, pid: pid_t?, file: String, function: String, line: Int, context: String, block: @escaping () throws -> Void) {
-        let queue = queueForPid(pid)
-        queue.addOperation { [self] in
+        addOperation(queueForPid(pid)) { [self] in
             attemptBlock(key: key, pid: pid, file: file, function: function, line: line, context: context, retryStartTime: DispatchTime.now().uptimeNanoseconds, block: block)
         }
+    }
+
+    private func addOperation(_ queue: LabeledOperationQueue, afterNs: UInt64 = 0, _ block: @escaping () -> Void) {
+        let quietNs = UInt64(max(Windows.focusQuietRemainingMs(), 0)) * 1_000_000
+        let delayNs = max(afterNs, quietNs)
+        guard delayNs > 0 else {
+            queue.addOperation { [self] in runOrDefer(queue, block) }
+            return
+        }
+        let cappedDelayNs = min(delayNs, UInt64(Int.max))
+        queue.addOperationAfter(deadline: .now() + .nanoseconds(Int(cappedDelayNs))) { [self] in
+            runOrDefer(queue, block)
+        }
+    }
+
+    private func runOrDefer(_ queue: LabeledOperationQueue, _ block: @escaping () -> Void) {
+        let quietMs = Windows.focusQuietRemainingMs()
+        guard quietMs == 0 else {
+            addOperation(queue, afterNs: UInt64(quietMs) * 1_000_000, block)
+            return
+        }
+        block()
     }
 
     private func attemptBlock(key: String, pid: pid_t?, file: String, function: String, line: Int, context: String, retryStartTime: UInt64, block: @escaping () throws -> Void) {
@@ -186,7 +206,7 @@ class AXCallScheduler {
         lock.unlock()
 
         Logger.debug { "Retrying AX call in \(delayNs / 1_000_000)ms. \(Self.logContext(file, function, line, context))" }
-        retryQueue.addOperationAfter(deadline: .now() + .nanoseconds(Int(delayNs))) { [self] in
+        addOperation(retryQueue, afterNs: delayNs) { [self] in
             attemptBlock(key: key, pid: pid, file: file, function: function, line: line, context: context, retryStartTime: retryStartTime, block: block)
         }
     }
@@ -229,8 +249,7 @@ class AXCallScheduler {
             state.phase = .executing
             keyStates[key] = state
             lock.unlock()
-            let queue = queueForPid(pid)
-            queue.addOperation { [self] in
+            addOperation(queueForPid(pid)) { [self] in
                 attemptBlock(key: key, pid: pid, file: file, function: function, line: line, context: context, retryStartTime: DispatchTime.now().uptimeNanoseconds, block: block)
             }
         } else {
@@ -241,8 +260,7 @@ class AXCallScheduler {
             keyStates[key] = state
             let remaining = Self.throttleDelayNs - elapsed
             lock.unlock()
-            let queue = queueForPid(pid)
-            queue.addOperationAfter(deadline: .now() + .nanoseconds(Int(remaining))) { [self] in
+            addOperation(queueForPid(pid), afterNs: remaining) { [self] in
                 fireThrottled(key: key, file: file, function: function, line: line)
             }
         }

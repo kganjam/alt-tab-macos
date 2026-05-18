@@ -7,6 +7,7 @@ class SleepWakeEvents {
 
     @objc private static func handleWake(_ notification: Notification) {
         Logger.info { "" }
+        Windows.requestZOrderReview(reason: "wake", fullDelayMs: 1000)
         reEnableAllTaps()
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { reEnableAllTaps() }
     }

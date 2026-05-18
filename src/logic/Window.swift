@@ -1,5 +1,8 @@
 import Cocoa
 
+@_silgen_name("CGPostMouseEvent")
+func CGPostMouseEventNoCursor(_ mouseCursorPosition: CGPoint, _ updateMouseCursorPosition: boolean_t, _ buttonCount: CGButtonCount, _ mouseButtonDown: boolean_t) -> CGError
+
 class Window {
     private static let notifications = [
         kAXUIElementDestroyedNotification,
@@ -17,6 +20,8 @@ class Window {
     var creationOrder = Int.zero
     var title: String!
     var thumbnail: CALayerContents?
+    var thumbnailUpdatedAt: CFAbsoluteTime = 0
+    var thumbnailUpdateCount = 0
     var icon: CGImage? { get { application.icon } }
     var shouldShowTheUser = true
     var isTabbed: Bool = false
@@ -34,6 +39,11 @@ class Window {
     var spaceIndexes = [SpaceIndex.max]
     var screenId: ScreenUuid?
     var axUiElement: AXUIElement?
+    private var fastFocusAxElement: AXUIElement?
+    private var fastFocusAxElementWid: CGWindowID?
+    private var fastFocusAxElementAt: CFAbsoluteTime = 0
+    private var fastFocusAxLastAttemptAt: CFAbsoluteTime = 0
+    private var fastFocusAxPrewarmInFlight = false
     var application: Application
     var axObserver: AXObserver?
     var rowIndex: Int?
@@ -115,6 +125,7 @@ class Window {
 
     func invalidateThumbnail() {
         thumbnail = nil
+        thumbnailUpdatedAt = 0
         guard App.appIsBeingUsed,
               let view = (TilesView.recycledViews.first { $0.window_?.cgWindowId == cgWindowId }),
               !view.thumbnail.isHidden else { return }
@@ -165,6 +176,8 @@ class Window {
 
     func refreshThumbnail(_ screenshot: CALayerContents) {
         thumbnail = screenshot
+        thumbnailUpdatedAt = CFAbsoluteTimeGetCurrent()
+        thumbnailUpdateCount += 1
         if !App.appIsBeingUsed || !shouldShowTheUser { return }
         if let position, let size,
            let view = (TilesView.recycledViews.first { $0.window_?.cgWindowId == cgWindowId }) {
@@ -258,6 +271,7 @@ class Window {
 
     func focus() {
         Diagnostics.markSwitchPhase("Window.focus")
+        Windows.nextZOrderFocusGeneration()
         // Clear any stale focus guard from a prior Parallels transition.
         // Parallels-involved paths below re-arm for their own target;
         // standard macOS→macOS SLPS path correctly runs with no guard.
@@ -283,45 +297,668 @@ class Window {
         } else if isOutboundFromParallelsCoherence() {
             focusMacOsWindowOverParallelsCoherence()
         } else {
-            // SLPS + makeKeyWindow are fast WindowServer IPCs (~sub-ms);
-            // run them inline for minimum switch latency. Only the AX
-            // call (an RPC into the target process, can block 10-100ms)
-            // is dispatched to the accessibilityCommandsQueue.
-            //
-            // macOS bug context (still relevant): when switching to a
-            // System Preferences window in another space, it switches
-            // to that space, but quickly switches back to another window
-            // in that space. Reproducible via Dock-icon click → it's an
-            // OS bug, not threading-related.
-            let wasAlreadyFrontmost = Applications.frontmostPid == application.pid ||
-                NSWorkspace.shared.frontmostApplication?.processIdentifier == application.pid
+            focusNativeMacWindowLikeUpstream()
+        }
+    }
+
+    private func focusNativeMacWindowLikeUpstream() {
+        let generation = Windows.currentZOrderFocusGeneration()
+        let enqueuedAt = CFAbsoluteTimeGetCurrent()
+        guard let targetWid = cgWindowId else { return }
+        let preZ = Windows.zOrderSnapshotForFocus()
+        if shouldUseNoWindowsNativeFocus() {
             var psn = ProcessSerialNumber()
             GetProcessForPID(application.pid, &psn)
-            _SLPSSetFrontProcessWithOptions(&psn, cgWindowId!, SLPSMode.userGenerated.rawValue)
-            Diagnostics.markSwitchPhase("slpsDone")
-            makeKeyWindow(&psn)
-            Diagnostics.markSwitchPhase("makeKeyDone")
-            let orderErr = CGSOrderWindow(CGS_CONNECTION, cgWindowId!, CGSWindowOrderingMode.above.rawValue, 0)
-            Diagnostics.markSwitchPhase("cgsOrderDone", extra: "err=\(orderErr.rawValue)")
-            if wasAlreadyFrontmost && orderErr != .success {
-                try? axUiElement!.focusWindow()
-                Diagnostics.markSwitchPhase("axSyncDone", extra: "wid=\(cgWindowId ?? 0)")
-                manuallyUpdateFocusOrderForDirectFocus()
+            focusNativeMultiWindow(&psn, targetWid, preZ)
+            return
+        }
+        let mode = nativeFocusMode()
+        if mode == "hidTitlebarClick" {
+            focusNativeMacWindowViaHidTitlebarClick(generation, enqueuedAt)
+            return
+        }
+        if mode == "skyLightEventFocus" {
+            focusNativeMacWindowViaSkyLightClick(generation, enqueuedAt, preZ)
+            return
+        }
+        if mode.hasPrefix("noWindows") || mode == "skyLightClickFocus" {
+            Diagnostics.log("FOCUS", "ignoring unsafe nativeFocusMode=\(mode); using original per-window focus")
+        }
+        focusNativeMacWindowOriginalAltTab(generation, enqueuedAt, preZ)
+    }
+
+    private func focusNativeMacWindowViaSkyLightClick(_ generation: Int64, _ enqueuedAt: CFAbsoluteTime, _ preZ: [Windows.PreZEntry]) {
+        manuallyUpdateFocusOrderForDirectFocus()
+        BackgroundWork.focusActionsQueue.addOperation { [weak self] in
+            guard Windows.isCurrentZOrderFocusGeneration(generation), let self, let targetWid = self.cgWindowId else { return }
+            let startedAt = CFAbsoluteTimeGetCurrent()
+            let queueWaitMs = (startedAt - enqueuedAt) * 1000
+            var psn = ProcessSerialNumber()
+            GetProcessForPID(self.application.pid, &psn)
+            let skyLightPosted = self.postSkyLightFocusClick(targetWid)
+            let skyLightAt = CFAbsoluteTimeGetCurrent()
+            Diagnostics.markSwitchPhase("skyLightClickDone", extra: "posted=\(skyLightPosted) wid=\(targetWid)")
+            guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
+            _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
+            let slpsAt = CFAbsoluteTimeGetCurrent()
+            Diagnostics.markSwitchPhase("slpsDone", extra: "skyLightClickFocus")
+            guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
+            self.makeKeyWindow(&psn)
+            let makeKeyAt = CFAbsoluteTimeGetCurrent()
+            Diagnostics.markSwitchPhase("makeKeyDone", extra: "skyLightClickFocus")
+            guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
+            if let axUiElement = self.axUiElement {
+                AXUIElementSetMessagingTimeout(axUiElement, self.nativeMultiWindowAxTimeout())
+                try? axUiElement.focusWindow()
+            }
+            let finishedAt = CFAbsoluteTimeGetCurrent()
+            Diagnostics.log("AXFOCUS", String(format: "wid=%u source=skyLightClickFocus queue=%.1fms sky=%.1fms slps=%.1fms makeKey=%.1fms ax=%.1fms total=%.1fms endToEnd=%.1fms", targetWid, queueWaitMs, (skyLightAt - startedAt) * 1000, (slpsAt - skyLightAt) * 1000, (makeKeyAt - slpsAt) * 1000, (finishedAt - makeKeyAt) * 1000, (finishedAt - startedAt) * 1000, (finishedAt - enqueuedAt) * 1000))
+            DispatchQueue.main.async {
+                guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
+                Windows.armNativeFocusZOrderIntent(for: self, preZ: preZ)
                 DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
+                    guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
                     Windows.previewSelectedWindowIfNeeded()
+                    Windows.requestZOrderTopReview(reason: "skylight-click-focus", wid: targetWid)
                 }
+            }
+        }
+    }
+
+    private func focusNativeMacWindowViaNoWindowsAxActivate(_ generation: Int64, _ enqueuedAt: CFAbsoluteTime) {
+        manuallyUpdateFocusOrderForDirectFocus()
+        BackgroundWork.focusActionsQueue.addOperation { [weak self] in
+            guard Windows.isCurrentZOrderFocusGeneration(generation), let self, let targetWid = self.cgWindowId else { return }
+            let startedAt = CFAbsoluteTimeGetCurrent()
+            let queueWaitMs = (startedAt - enqueuedAt) * 1000
+            var psn = ProcessSerialNumber()
+            GetProcessForPID(self.application.pid, &psn)
+            _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.noWindows.rawValue)
+            let slpsAt = CFAbsoluteTimeGetCurrent()
+            Diagnostics.markSwitchPhase("slpsDone", extra: "noWindowsAxActivate")
+            let clickFallback = self.nativeClickFallbackEnabled()
+            if clickFallback {
+                self.scheduleNativeClickFallback(targetWid, generation)
+            }
+            let axTarget = self.nativeAxTarget(targetWid)
+            let resolvedAt = CFAbsoluteTimeGetCurrent()
+            let mainErr = self.setNativeAxMainAndFocused(axTarget)
+            let mainAt = CFAbsoluteTimeGetCurrent()
+            var raiseErr = AXError.failure
+            if let axTarget {
+                AXUIElementSetMessagingTimeout(axTarget, self.nativeMultiWindowAxTimeout())
+                raiseErr = AXUIElementPerformAction(axTarget, kAXRaiseAction as CFString)
+            }
+            let raiseAt = CFAbsoluteTimeGetCurrent()
+            guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
+            let activateOk = self.application.runningApplication.activate(options: [])
+            let finishedAt = CFAbsoluteTimeGetCurrent()
+            Diagnostics.log("AXFOCUS", String(format: "wid=%u source=noWindowsAxActivate queue=%.1fms slps=%.1fms resolve=%.1fms axSet=%.1fms axRaise=%.1fms activate=%.1fms mainErr=%d focusErr=%d raiseErr=%d activateOk=%@ total=%.1fms endToEnd=%.1fms", targetWid, queueWaitMs, (slpsAt - startedAt) * 1000, (resolvedAt - slpsAt) * 1000, (mainAt - resolvedAt) * 1000, (raiseAt - mainAt) * 1000, (finishedAt - raiseAt) * 1000, mainErr.main.rawValue, mainErr.focus.rawValue, raiseErr.rawValue, activateOk ? "true" : "false", (finishedAt - startedAt) * 1000, (finishedAt - enqueuedAt) * 1000))
+            if !clickFallback {
+                Windows.retryNativeFocusTargetIfNeeded(targetWid: targetWid, targetPid: self.application.pid, delayMs: 120)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
+                guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
+                Windows.previewSelectedWindowIfNeeded()
+                Windows.requestZOrderTopReview(reason: "no-windows-ax-activate", wid: targetWid)
+            }
+        }
+    }
+
+    private func focusNativeMacWindowViaHidTitlebarClick(_ generation: Int64, _ enqueuedAt: CFAbsoluteTime) {
+        manuallyUpdateFocusOrderForDirectFocus()
+        BackgroundWork.focusActionsQueue.addOperation { [weak self] in
+            guard Windows.isCurrentZOrderFocusGeneration(generation), let self, let targetWid = self.cgWindowId else { return }
+            let startedAt = CFAbsoluteTimeGetCurrent()
+            let queueWaitMs = (startedAt - enqueuedAt) * 1000
+            let result = self.postNativeTitlebarClick(targetWid)
+            let finishedAt = CFAbsoluteTimeGetCurrent()
+            Diagnostics.log("AXFOCUS", String(format: "wid=%u source=hidTitlebarClick queue=%.1fms posted=%@ reason=%@ point=%@ total=%.1fms endToEnd=%.1fms", targetWid, queueWaitMs, result.posted ? "true" : "false", result.reason, result.pointText, (finishedAt - startedAt) * 1000, (finishedAt - enqueuedAt) * 1000))
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
+                guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
+                Windows.previewSelectedWindowIfNeeded()
+                Windows.requestZOrderTopReview(reason: "hid-titlebar-click", wid: targetWid)
+            }
+        }
+    }
+
+    private func nativeClickFallbackEnabled() -> Bool {
+        nativeFocusMode() == "noWindowsAxActivateClickFallback" || RuntimeFlags.nativeFocusClickFallbackEnabled
+    }
+
+    private func scheduleNativeClickFallback(_ targetWid: CGWindowID, _ generation: Int64) {
+        let delayMs = max(40, RuntimeFlags.nativeFocusClickFallbackDelayMs)
+        BackgroundWork.zOrderCacheQueue.addOperationAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
+            guard Windows.isCurrentZOrderFocusGeneration(generation), let self else { return }
+            guard Self.nativeTopWindowId() != targetWid else {
+                Windows.requestZOrderCacheRefresh(full: false, delayMs: 0, topOnly: true)
                 return
             }
-            manuallyUpdateFocusOrderForDirectFocus()
-            BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
-                guard let self else { return }
-                Diagnostics.markSwitchPhase("axQueueEntry")
-                try? self.axUiElement!.focusWindow()
-                Diagnostics.markSwitchPhase("axDone", extra: "wid=\(self.cgWindowId ?? 0)")
-                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
-                    Windows.previewSelectedWindowIfNeeded()
-                }
+            let startedAt = CFAbsoluteTimeGetCurrent()
+            let result = self.postNativeTitlebarClick(targetWid)
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+            Diagnostics.log("AXFOCUS", String(format: "wid=%u source=hidClickFallback delay=%dms posted=%@ reason=%@ point=%@ total=%.1fms", targetWid, delayMs, result.posted ? "true" : "false", result.reason, result.pointText, elapsedMs))
+            if result.posted {
+                Windows.requestZOrderTopReview(reason: "hid-click-fallback", wid: targetWid, secondDelayMs: 80)
+            } else {
+                Windows.retryNativeFocusTargetIfNeeded(targetWid: targetWid, targetPid: self.application.pid, delayMs: 0)
             }
+        }
+    }
+
+    private func scheduleNoWindowsAxActivateRetries(_ targetWid: CGWindowID, _ generation: Int64) {
+        for delayMs in [100, 250] {
+            BackgroundWork.focusActionsQueue.addOperationAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
+                guard Windows.isCurrentZOrderFocusGeneration(generation), let self else { return }
+                self.retryNoWindowsAxActivate(targetWid, generation, delayMs)
+            }
+        }
+    }
+
+    private func retryNoWindowsAxActivate(_ targetWid: CGWindowID, _ generation: Int64, _ delayMs: Int) {
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        var psn = ProcessSerialNumber()
+        GetProcessForPID(application.pid, &psn)
+        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.noWindows.rawValue)
+        guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
+        let activateOk = application.runningApplication.activate(options: [])
+        let ms = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+        Diagnostics.log("AXFOCUS", String(format: "wid=%u source=noWindowsActivateRetry delay=%dms activateOk=%@ total=%.1fms", targetWid, delayMs, activateOk ? "true" : "false", ms))
+    }
+
+    private func nativeAxTarget(_ targetWid: CGWindowID) -> AXUIElement? {
+        if let axUiElement, (try? axUiElement.cgWindowId()) == targetWid {
+            return axUiElement
+        }
+        return Self.resolveNativeFocusAxElement(pid: application.pid, wid: targetWid, timeout: 0.25) ?? axUiElement
+    }
+
+    private func setNativeAxMainAndFocused(_ axUiElement: AXUIElement?) -> (main: AXError, focus: AXError) {
+        guard let axUiElement else { return (.failure, .failure) }
+        let timeout = nativeMultiWindowAxTimeout()
+        AXUIElementSetMessagingTimeout(axUiElement, timeout)
+        let mainErr = AXUIElementSetAttributeValue(axUiElement, kAXMainAttribute as CFString, kCFBooleanTrue)
+        guard let appAx = application.axUiElement else { return (mainErr, .failure) }
+        AXUIElementSetMessagingTimeout(appAx, timeout)
+        let focusErr = AXUIElementSetAttributeValue(appAx, kAXFocusedWindowAttribute as CFString, axUiElement)
+        return (mainErr, focusErr)
+    }
+
+    private func postSkyLightFocusClick(_ targetWid: CGWindowID) -> Bool {
+        guard let bounds = skyLightClickBounds() else { return false }
+        let point = skyLightClickPoint(bounds)
+        let localPoint = CGPoint(x: point.x - bounds.minX, y: point.y - bounds.minY)
+        guard let down = skyLightMouseEvent(.leftMouseDown, targetWid, point, localPoint, 1),
+              let up = skyLightMouseEvent(.leftMouseUp, targetWid, point, localPoint, 1) else { return false }
+        Windows.noteSyntheticFocusClick()
+        SLEventPostToPid(application.pid, down)
+        usleep(1_000)
+        SLEventPostToPid(application.pid, up)
+        return true
+    }
+
+    private func skyLightMouseEvent(_ type: NSEvent.EventType, _ targetWid: CGWindowID, _ point: CGPoint, _ localPoint: CGPoint, _ clickCount: Int) -> CGEvent? {
+        guard let nsEvent = NSEvent.mouseEvent(with: type, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: Int(targetWid), context: nil, eventNumber: 0, clickCount: clickCount, pressure: 1.0),
+              let event = nsEvent.cgEvent else { return nil }
+        event.location = point
+        event.setIntegerValueField(.mouseEventButtonNumber, value: 0)
+        event.setIntegerValueField(.mouseEventSubtype, value: 3)
+        event.setIntegerValueField(.mouseEventClickState, value: Int64(clickCount))
+        event.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(targetWid))
+        event.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(targetWid))
+        event.setIntegerValueField(.eventTargetUnixProcessID, value: Int64(application.pid))
+        CGEventSetWindowLocation(event, localPoint)
+        SLEventSetIntegerValueField(event, 40, Int64(application.pid))
+        event.timestamp = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        return event
+    }
+
+    private func skyLightClickBounds() -> CGRect? {
+        guard let cgWindowId,
+              let window = CGWindow.windows(.optionOnScreenOnly).first(where: { $0.id() == cgWindowId }),
+              let bounds = window.bounds() else {
+            if let position, let size {
+                return CGRect(origin: position, size: size)
+            }
+            return nil
+        }
+        return bounds
+    }
+
+    private func skyLightClickPoint(_ bounds: CGRect) -> CGPoint {
+        let x = bounds.minX + min(120, max(bounds.width - 24, 24))
+        let y = bounds.minY + min(18, max(10, bounds.height * 0.03))
+        return CGPoint(x: x, y: y)
+    }
+
+    private struct NativeClickResult {
+        let posted: Bool
+        let reason: String
+        let point: CGPoint?
+        var pointText: String { point.map { "\(Int($0.x)),\(Int($0.y))" } ?? "nil" }
+    }
+
+    private static let nativeClickOwnerBlocklist: Set<String> = [
+        "Window Server",
+        "Control Center",
+        "Dock",
+        "AltTab",
+        "Notification Center",
+        "SystemUIServer",
+        "Spotlight",
+        "Menubar",
+        "Wallpaper",
+        "CursorUIViewService",
+        "LocalAuthenticationRemoteService",
+    ]
+
+    private static let nativeClickTransparentOwnerBlocklist: Set<String> = [
+        "Window Server",
+        "Control Center",
+        "Dock",
+        "Notification Center",
+        "SystemUIServer",
+        "Spotlight",
+        "Menubar",
+        "Wallpaper",
+        "CursorUIViewService",
+        "LocalAuthenticationRemoteService",
+    ]
+
+    private func postNativeTitlebarClick(_ targetWid: CGWindowID) -> NativeClickResult {
+        guard NSEvent.pressedMouseButtons == 0 else { return NativeClickResult(posted: false, reason: "mouse-down", point: nil) }
+        guard let candidate = nativeTitlebarClickCandidate(targetWid) else { return NativeClickResult(posted: false, reason: "no-exposed-point", point: nil) }
+        let localPoint = CGPoint(x: candidate.point.x - candidate.bounds.minX, y: candidate.point.y - candidate.bounds.minY)
+        guard let down = skyLightMouseEvent(.leftMouseDown, targetWid, candidate.point, localPoint, 1),
+              let up = skyLightMouseEvent(.leftMouseUp, targetWid, candidate.point, localPoint, 1) else {
+            return NativeClickResult(posted: false, reason: "event-create", point: candidate.point)
+        }
+        Windows.noteSyntheticFocusClick()
+        SLEventPostToPid(application.pid, down)
+        usleep(1_000)
+        SLEventPostToPid(application.pid, up)
+        return NativeClickResult(posted: true, reason: "slevent-pid", point: candidate.point)
+    }
+
+    private func nativeTitlebarClickCandidate(_ targetWid: CGWindowID) -> (point: CGPoint, bounds: CGRect)? {
+        let windows = CGWindow.windows(.optionOnScreenOnly)
+        guard let target = windows.first(where: { $0.id() == targetWid }),
+              target.ownerPID() == application.pid,
+              target.layer() == 0,
+              let bounds = target.bounds(),
+              bounds.width >= 120,
+              bounds.height >= 80 else { return nil }
+        let y = bounds.minY + min(18, max(10, bounds.height * 0.03))
+        for x in nativeTitlebarClickXOffsets(bounds.width).map({ bounds.minX + $0 }) {
+            let point = CGPoint(x: x, y: y)
+            guard Self.nativePointOnDisplay(point) else { continue }
+            if Self.nativeTopRoutableWindow(at: point, in: windows) == targetWid {
+                return (point, bounds)
+            }
+        }
+        return nil
+    }
+
+    private func nativeTitlebarClickXOffsets(_ width: CGFloat) -> [CGFloat] {
+        [120, 160, 220, 300, width / 2, width - 160, width - 80].map { min(max($0, 20), width - 20) }
+    }
+
+    private static func nativeTopWindowId() -> CGWindowID? {
+        CGWindow.windows(.optionOnScreenOnly).first(where: { nativeVisibleWindow($0) })?.id()
+    }
+
+    private static func nativeWindowBlocksClick(_ window: CGWindow, _ point: CGPoint) -> Bool {
+        guard nativeVisibleWindow(window), let bounds = window.bounds() else { return false }
+        return bounds.contains(point)
+    }
+
+    private static func nativeTopRoutableWindow(at point: CGPoint, in windows: [CGWindow]) -> CGWindowID? {
+        windows.first(where: { nativeRoutableWindow($0, point) })?.id()
+    }
+
+    private static func nativeRoutableWindow(_ window: CGWindow, _ point: CGPoint) -> Bool {
+        guard let owner = window.ownerName(),
+              !nativeClickTransparentOwnerBlocklist.contains(owner),
+              nativeWindowAlpha(window) >= 0.1,
+              let bounds = window.bounds(),
+              bounds.width >= 10,
+              bounds.height >= 10 else { return false }
+        return bounds.contains(point)
+    }
+
+    private static func nativeVisibleWindow(_ window: CGWindow) -> Bool {
+        guard window.layer() == 0,
+              let owner = window.ownerName(),
+              !nativeClickOwnerBlocklist.contains(owner),
+              let bounds = window.bounds(),
+              bounds.width >= 40,
+              nativeWindowAlpha(window) >= 0.1 else { return false }
+        return true
+    }
+
+    private static func nativeWindowAlpha(_ window: CGWindow) -> Double {
+        window[kCGWindowAlpha] as? Double ?? 1.0
+    }
+
+    private static func nativePointOnDisplay(_ point: CGPoint) -> Bool {
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else { return true }
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetActiveDisplayList(count, &displays, &count) == .success else { return true }
+        return displays.prefix(Int(count)).contains { CGDisplayBounds($0).contains(point) }
+    }
+
+    private func focusNativeMacWindowOriginalAltTab(_ generation: Int64, _ enqueuedAt: CFAbsoluteTime, _ preZ: [Windows.PreZEntry]) {
+        guard Windows.isCurrentZOrderFocusGeneration(generation), let targetWid = cgWindowId else { return }
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        let wasAlreadyFrontmost = Applications.frontmostPid == application.pid || NSWorkspace.shared.frontmostApplication?.processIdentifier == application.pid
+        var psn = ProcessSerialNumber()
+        GetProcessForPID(application.pid, &psn)
+        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
+        let slpsAt = CFAbsoluteTimeGetCurrent()
+        Diagnostics.markSwitchPhase("slpsDone", extra: "originalInline")
+        makeKeyWindow(&psn)
+        let makeKeyAt = CFAbsoluteTimeGetCurrent()
+        Diagnostics.markSwitchPhase("makeKeyDone", extra: "originalInline")
+        let orderErr = CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, 0)
+        let orderAt = CFAbsoluteTimeGetCurrent()
+        Diagnostics.markSwitchPhase("cgsOrderDone", extra: "originalInline err=\(orderErr.rawValue)")
+        if wasAlreadyFrontmost && orderErr != .success {
+            try? axUiElement?.focusWindow()
+            let finishedAt = CFAbsoluteTimeGetCurrent()
+            Diagnostics.log("AXFOCUS", String(format: "wid=%u source=originalInline-sync queue=%.1fms slps=%.1fms makeKey=%.1fms cgs=%.1fms ax=%.1fms total=%.1fms endToEnd=%.1fms", targetWid, (startedAt - enqueuedAt) * 1000, (slpsAt - startedAt) * 1000, (makeKeyAt - slpsAt) * 1000, (orderAt - makeKeyAt) * 1000, (finishedAt - orderAt) * 1000, (finishedAt - startedAt) * 1000, (finishedAt - enqueuedAt) * 1000))
+            manuallyUpdateFocusOrderForDirectFocus()
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
+                guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
+                Windows.previewSelectedWindowIfNeeded()
+                Windows.requestZOrderTopReview(reason: "native-original-inline-sync", wid: targetWid)
+            }
+            Windows.restoreNativeTargetSiblingOrderForFocus(targetWid: targetWid, targetPid: application.pid, preZ: preZ)
+            return
+        }
+        manuallyUpdateFocusOrderForDirectFocus()
+        Windows.restoreNativeTargetSiblingOrderForFocus(targetWid: targetWid, targetPid: application.pid, preZ: preZ)
+        BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+            guard Windows.isCurrentZOrderFocusGeneration(generation), let self, let targetWid = self.cgWindowId else { return }
+            let axStartedAt = CFAbsoluteTimeGetCurrent()
+            let queueWaitMs = (axStartedAt - enqueuedAt) * 1000
+            try? self.axUiElement?.focusWindow()
+            let finishedAt = CFAbsoluteTimeGetCurrent()
+            Diagnostics.log("AXFOCUS", String(format: "wid=%u source=originalInline-async queue=%.1fms slps=%.1fms makeKey=%.1fms cgs=%.1fms ax=%.1fms total=%.1fms endToEnd=%.1fms", targetWid, queueWaitMs, (slpsAt - startedAt) * 1000, (makeKeyAt - slpsAt) * 1000, (orderAt - makeKeyAt) * 1000, (finishedAt - axStartedAt) * 1000, (finishedAt - startedAt) * 1000, (finishedAt - enqueuedAt) * 1000))
+            Diagnostics.markSwitchPhase("axDone", extra: "originalInline wid=\(targetWid)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
+                guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
+                Windows.previewSelectedWindowIfNeeded()
+                Windows.requestZOrderTopReview(reason: "native-original-inline", wid: targetWid)
+            }
+        }
+    }
+
+    private func nativeFocusMode() -> String {
+        UserDefaults.standard.string(forKey: "nativeFocusMode") ?? "skyLightEventFocus"
+    }
+
+    private func focusNativeMultiWindow(_ psn: inout ProcessSerialNumber, _ targetWid: CGWindowID, _ preZ: [Windows.PreZEntry]) {
+        if shouldUseNoWindowsNativeFocus() {
+            focusNativeMultiWindowNoWindows(&psn, targetWid, preZ)
+        } else {
+            focusNativeMultiWindowUserGenerated(&psn, targetWid, preZ)
+        }
+    }
+
+    private func focusNativeMultiWindowNoWindows(_ psn: inout ProcessSerialNumber, _ targetWid: CGWindowID, _ preZ: [Windows.PreZEntry]) {
+        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.noWindows.rawValue)
+        Diagnostics.markSwitchPhase("slpsDone", extra: "nativeMultiWindow noWindows")
+        makeKeyWindow(&psn)
+        Diagnostics.markSwitchPhase("makeKeyDone", extra: "nativeMultiWindow")
+        let orderErr = orderNativeTargetAboveBlocker(targetWid, preZ)
+        Diagnostics.markSwitchPhase("cgsOrderDone", extra: "nativeMultiWindow err=\(orderErr.rawValue)")
+        let generation = Windows.currentZOrderFocusGeneration()
+        let syncAx = shouldSynchronouslyFocusNativeWindow()
+        if syncAx {
+            focusNativeWindowViaAx(targetWid, phase: "axSyncDone")
+            Windows.restoreNativeExpectedSiblingOrderForFocus(targetWid: targetWid, targetPid: application.pid, preZ: preZ)
+        }
+        manuallyUpdateFocusOrderForDirectFocus()
+        Windows.armNativeFocusZOrderIntent(for: self, preZ: preZ)
+        if !syncAx {
+            let axCompleted = queueNativeWindowAxFocus(targetWid, generation)
+            if !axCompleted {
+                forceNativeWindowFrontAfterAxTimeout(&psn, targetWid)
+            }
+        }
+        Windows.retryNativeFocusTargetIfNeeded(targetWid: targetWid, targetPid: application.pid, delayMs: 160)
+        Windows.restoreNativeTargetSiblingOrderForFocus(targetWid: targetWid, targetPid: application.pid, preZ: preZ)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
+            Windows.previewSelectedWindowIfNeeded()
+        }
+    }
+
+    private func focusNativeMultiWindowUserGenerated(_ psn: inout ProcessSerialNumber, _ targetWid: CGWindowID, _ preZ: [Windows.PreZEntry]) {
+        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.noWindows.rawValue)
+        Diagnostics.markSwitchPhase("slpsDone", extra: "nativeMultiWindow noWindows makeKey asyncRaise")
+        makeKeyWindow(&psn)
+        Diagnostics.markSwitchPhase("makeKeyDone", extra: "nativeMultiWindow noWindows asyncRaise")
+        let orderErr = orderNativeTargetAboveBlocker(targetWid, preZ)
+        Diagnostics.markSwitchPhase("cgsOrderDone", extra: "nativeMultiWindow noWindows asyncRaise err=\(orderErr.rawValue)")
+        manuallyUpdateFocusOrderForDirectFocus()
+        Windows.armNativeFocusZOrderIntent(for: self, preZ: preZ)
+        if queueNativeWindowAxRaise(targetWid) {
+            observeNativeTargetAtZ0Async(targetWid)
+        } else {
+            raiseNativeWindowViaAx(targetWid, phase: "axRaiseDone")
+        }
+        Windows.retryNativeFocusTargetIfNeeded(targetWid: targetWid, targetPid: application.pid, delayMs: 120)
+        Windows.restoreNativeTargetSiblingOrderForFocus(targetWid: targetWid, targetPid: application.pid, preZ: preZ)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
+            Windows.previewSelectedWindowIfNeeded()
+        }
+    }
+
+    private func shouldUseNoWindowsNativeFocus() -> Bool {
+        guard let bundleIdentifier = application.bundleIdentifier else { return false }
+        return ["com.apple.Terminal", "com.googlecode.iterm2"].contains(bundleIdentifier)
+    }
+
+    private func shouldSynchronouslyFocusNativeWindow() -> Bool {
+        shouldUseNoWindowsNativeFocus()
+    }
+
+    private func nativeMultiWindowAsyncAxWaitMs() -> Int {
+        let value = UserDefaults.standard.object(forKey: "nativeMultiWindowAsyncAxWaitMs") as? Int ?? 180
+        return min(max(value, 0), 300)
+    }
+
+    private func nativeMultiWindowZWaitMs() -> Int {
+        let value = UserDefaults.standard.object(forKey: "nativeMultiWindowZWaitMs") as? Int ?? 850
+        return min(max(value, 0), 1200)
+    }
+
+    private func nativeMultiWindowAxTimeout() -> Float {
+        let value = UserDefaults.standard.object(forKey: "nativeMultiWindowAxTimeoutMs") as? Int ?? 50
+        return Float(min(max(value, 50), 1000)) / 1000
+    }
+
+    private func orderNativeTargetAboveBlocker(_ targetWid: CGWindowID, _ preZ: [Windows.PreZEntry]) -> CGError {
+        if let blockerWid = preZ.first(where: { $0.wid != targetWid })?.wid {
+            let pairErr = CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, blockerWid)
+            if pairErr == .success { return pairErr }
+        }
+        return CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, 0)
+    }
+
+    private func focusNativeWindowViaAx(_ targetWid: CGWindowID, phase: String?) {
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        guard let target = nativeFocusAxElement(targetWid) else { return }
+        let afterSetAt: CFAbsoluteTime
+        if let appAx = application.axUiElement {
+            let timeout = nativeMultiWindowAxTimeout()
+            AXUIElementSetMessagingTimeout(appAx, timeout)
+            AXUIElementSetMessagingTimeout(target.axElement, timeout)
+            try? appAx.setAttribute(kAXFocusedWindowAttribute, target.axElement)
+            afterSetAt = CFAbsoluteTimeGetCurrent()
+        } else {
+            afterSetAt = CFAbsoluteTimeGetCurrent()
+        }
+        try? target.axElement.focusWindow()
+        let finishedAt = CFAbsoluteTimeGetCurrent()
+        Diagnostics.log("AXFOCUS", String(format: "wid=%u source=%@ age=%.0fms set=%.1fms raise=%.1fms total=%.1fms", targetWid, target.source, target.ageMs, (afterSetAt - startedAt) * 1000, (finishedAt - afterSetAt) * 1000, (finishedAt - startedAt) * 1000))
+        if let phase {
+            Diagnostics.markSwitchPhase(phase, extra: String(format: "nativeMultiWindow wid=%u ax=%.1fms", targetWid, (finishedAt - startedAt) * 1000))
+        }
+    }
+
+    private func raiseNativeWindowViaAx(_ targetWid: CGWindowID, phase: String?) {
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        guard let target = nativeFocusAxElement(targetWid) else { return }
+        AXUIElementSetMessagingTimeout(target.axElement, nativeMultiWindowAxTimeout())
+        try? target.axElement.performAction(kAXRaiseAction as String)
+        let finishedAt = CFAbsoluteTimeGetCurrent()
+        Diagnostics.log("AXRAISE", String(format: "wid=%u source=%@ age=%.0fms raise=%.1fms", targetWid, target.source, target.ageMs, (finishedAt - startedAt) * 1000))
+        if let phase {
+            Diagnostics.markSwitchPhase(phase, extra: String(format: "nativeMultiWindow wid=%u axRaise=%.1fms", targetWid, (finishedAt - startedAt) * 1000))
+        }
+    }
+
+    private func queueNativeWindowAxRaise(_ targetWid: CGWindowID) -> Bool {
+        guard let target = nativeFocusAxElement(targetWid) else { return false }
+        let generation = Windows.currentZOrderFocusGeneration()
+        let timeout = nativeMultiWindowAxTimeout()
+        BackgroundWork.accessibilityCommandsQueue.addOperation {
+            guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
+            let startedAt = CFAbsoluteTimeGetCurrent()
+            let axTarget = target
+            let resolvedAt = CFAbsoluteTimeGetCurrent()
+            guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
+            AXUIElementSetMessagingTimeout(axTarget.axElement, timeout)
+            try? axTarget.axElement.performAction(kAXRaiseAction as String)
+            let finishedAt = CFAbsoluteTimeGetCurrent()
+            Diagnostics.log("AXRAISE", String(format: "wid=%u source=%@ age=%.0fms resolve=%.1fms raise=%.1fms async=true", targetWid, axTarget.source, axTarget.ageMs, (resolvedAt - startedAt) * 1000, (finishedAt - resolvedAt) * 1000))
+        }
+        return true
+    }
+
+    private func observeNativeTargetAtZ0Async(_ targetWid: CGWindowID) {
+        let maxMs = nativeMultiWindowZWaitMs()
+        let generation = Windows.currentZOrderFocusGeneration()
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        Windows.requestZOrderTopReview(reason: "native-z-observe", wid: targetWid, secondDelayMs: min(maxMs, 120))
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(maxMs)) {
+            guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
+            let topWid = Windows.cachedTopZOrderWid(maxAgeMs: 200)
+            let ms = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+            Diagnostics.log("ZWAIT", String(format: "wid=%u top=%u wait=%.1fms max=%d async=true cached=true", targetWid, topWid ?? 0, ms, maxMs))
+            if topWid == targetWid {
+                Windows.requestZOrderCacheRefresh(full: false)
+            }
+        }
+    }
+
+    func prewarmNativeFocusAxElementIfNeeded() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.prewarmNativeFocusAxElementIfNeeded() }
+            return
+        }
+        guard BackgroundWork.focusPrewarmQueue != nil else { return }
+        guard shouldPrewarmNativeFocusAxElement(), let targetWid = cgWindowId else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        let ttl = nativeFocusAxPrewarmTtl()
+        if fastFocusAxElementWid == targetWid && fastFocusAxElement != nil && now - fastFocusAxElementAt < ttl { return }
+        if fastFocusAxPrewarmInFlight || now - fastFocusAxLastAttemptAt < 5 { return }
+        fastFocusAxPrewarmInFlight = true
+        fastFocusAxLastAttemptAt = now
+        let targetPid = application.pid
+        let timeout = nativeMultiWindowAxTimeout()
+        BackgroundWork.focusPrewarmQueue.addOperation { [weak self] in
+            let startedAt = CFAbsoluteTimeGetCurrent()
+            let resolvedAxElement = Self.resolveNativeFocusAxElement(pid: targetPid, wid: targetWid, timeout: timeout)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.fastFocusAxPrewarmInFlight = false
+                guard self.cgWindowId == targetWid else { return }
+                if let resolvedAxElement {
+                    self.fastFocusAxElement = resolvedAxElement
+                    self.fastFocusAxElementWid = targetWid
+                    self.fastFocusAxElementAt = CFAbsoluteTimeGetCurrent()
+                }
+                let ms = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+                Diagnostics.log("AXPREWARM", String(format: "wid=%u found=%@ ms=%.1f", targetWid, resolvedAxElement == nil ? "false" : "true", ms))
+            }
+        }
+    }
+
+    private func shouldPrewarmNativeFocusAxElement() -> Bool {
+        guard cgWindowId != nil, !isWindowlessApp, !isParallelsCoherenceWindow else { return false }
+        guard Windows.visibleWindowCount(pid: application.pid) > 1 else { return false }
+        return !shouldUseNoWindowsNativeFocus()
+    }
+
+    private func nativeFocusAxElement(_ targetWid: CGWindowID) -> (axElement: AXUIElement, source: String, ageMs: Double)? {
+        let now = CFAbsoluteTimeGetCurrent()
+        if fastFocusAxElementWid == targetWid, let fastFocusAxElement, now - fastFocusAxElementAt < nativeFocusAxPrewarmTtl() {
+            return (fastFocusAxElement, "prewarm", (now - fastFocusAxElementAt) * 1000)
+        }
+        guard let axUiElement else { return nil }
+        return (axUiElement, "cached", -1)
+    }
+
+    private func nativeFocusAxPrewarmTtl() -> CFTimeInterval {
+        let value = UserDefaults.standard.object(forKey: "nativeFocusAxPrewarmTtlMs") as? Int ?? 300_000
+        return Double(min(max(value, 500), 300_000)) / 1000
+    }
+
+    private static func resolveNativeFocusAxElement(pid: pid_t, wid: CGWindowID, timeout: Float = 1) -> AXUIElement? {
+        let deadline = CFAbsoluteTimeGetCurrent() + CFTimeInterval(timeout)
+        let appAx = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(appAx, timeout)
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(appAx, kAXWindowsAttribute as CFString, &value) == .success,
+              let axWindows = value as? [AXUIElement] else { return nil }
+        for axWindow in axWindows {
+            let remaining = deadline - CFAbsoluteTimeGetCurrent()
+            guard remaining > 0 else { return nil }
+            AXUIElementSetMessagingTimeout(axWindow, Float(min(max(remaining, 0.02), CFTimeInterval(timeout))))
+            if (try? axWindow.cgWindowId()) == wid { return axWindow }
+        }
+        return nil
+    }
+
+    private func forceNativeWindowFrontAfterAxTimeout(_ psn: inout ProcessSerialNumber, _ targetWid: CGWindowID) {
+        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
+        Diagnostics.markSwitchPhase("slpsFallbackDone", extra: "nativeMultiWindow wid=\(targetWid)")
+        makeKeyWindow(&psn)
+        Diagnostics.markSwitchPhase("makeKeyFallbackDone", extra: "nativeMultiWindow wid=\(targetWid)")
+        _ = CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, 0)
+    }
+
+    private func queueNativeWindowAxFocus(_ targetWid: CGWindowID, _ generation: Int64) -> Bool {
+        let semaphore = DispatchSemaphore(value: 0)
+        BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+            defer { semaphore.signal() }
+            guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
+            guard let self else { return }
+            Diagnostics.markSwitchPhase("axQueueEntry", extra: "nativeMultiWindow wid=\(targetWid)")
+            self.focusNativeWindowViaAx(targetWid, phase: nil)
+            Diagnostics.markSwitchPhase("axDone", extra: "nativeMultiWindow wid=\(targetWid)")
+        }
+        let waitMs = nativeMultiWindowAsyncAxWaitMs()
+        guard waitMs > 0 else { return false }
+        if semaphore.wait(timeout: .now() + .milliseconds(waitMs)) == .success {
+            Diagnostics.markSwitchPhase("axBoundedWaitDone", extra: "nativeMultiWindow wait=\(waitMs)ms wid=\(targetWid)")
+            return true
+        } else {
+            Diagnostics.markSwitchPhase("axBoundedWaitTimeout", extra: "nativeMultiWindow wait=\(waitMs)ms wid=\(targetWid)")
+            return false
+        }
+    }
+
+    private func queueNativeWindowAxFocusAsync(_ targetWid: CGWindowID, _ generation: Int64) {
+        BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
+            guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
+            guard let self else { return }
+            Diagnostics.markSwitchPhase("axQueueEntry", extra: "nativeMultiWindow async wid=\(targetWid)")
+            self.focusNativeWindowViaAx(targetWid, phase: nil)
+            Diagnostics.markSwitchPhase("axDone", extra: "nativeMultiWindow async wid=\(targetWid)")
         }
     }
 
@@ -331,6 +968,7 @@ class Window {
         App.lastFocusedTargetWid = cgWindowId
         App.lastFocusedTargetPid = application.pid
         App.lastFocusedTargetTime = CFAbsoluteTimeGetCurrent()
+        App.noteDirectFocusOutsideAltTab(cgWindowId)
         if let windows = Windows.updateLastFocusOrder(self) {
             App.refreshOpenUiAfterExternalEvent(windows)
         }
@@ -393,6 +1031,7 @@ class Window {
     private func focusMacOsWindowOverParallelsCoherence() {
         Diagnostics.log("FOCUS", "enter focusMacOsWindowOverParallelsCoherence target=\(debugId ?? "?")")
         guard let targetWid = cgWindowId else { return }
+        let preZ = Windows.zOrderSnapshotForFocus()
         Windows.armAltTabFocusGuard(for: self)
         var psn = ProcessSerialNumber()
         GetProcessForPID(application.pid, &psn)
@@ -400,7 +1039,12 @@ class Window {
         Diagnostics.markSwitchPhase("slpsDone", extra: "parToMac")
         try? axUiElement?.focusWindow()
         Diagnostics.markSwitchPhase("axSyncDone", extra: "parToMac wid=\(targetWid)")
+        let orderErr = CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, 0)
+        Diagnostics.markSwitchPhase("cgsOrderDone", extra: "parToMac err=\(orderErr.rawValue)")
         Diagnostics.log("FOCUS", "Par→mac: SLPS(userGenerated)+AX focus(wid=\(targetWid)) done")
+        Windows.armNativeFocusZOrderIntent(for: self, preZ: preZ)
+        Windows.retryNativeFocusTargetIfNeeded(targetWid: targetWid, targetPid: application.pid, delayMs: 40)
+        Windows.restoreNativeTargetSiblingOrderForFocus(targetWid: targetWid, targetPid: application.pid, preZ: preZ)
         snapshotTopWindowsForParMac(label: "Par→mac+0ms", targetWid: targetWid)
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(30)) { [weak self] in
             self?.snapshotTopWindowsForParMac(label: "Par→mac+30ms", targetWid: targetWid)
@@ -409,6 +1053,7 @@ class Window {
             self?.snapshotTopWindowsForParMac(label: "Par→mac+100ms", targetWid: targetWid)
         }
         manuallyUpdateFocusOrderForParallelsTransition()
+        repokeFrontmostForCachedListeners()
     }
 
     /// Diagnostic: top-8 z-order with per-window owner+wid+level. Lets us
@@ -505,6 +1150,35 @@ class Window {
             Diagnostics.log("API", "mac→Par: AX raise(wid=\(targetWid)) done")
         }
         manuallyUpdateFocusOrderForParallelsTransition()
+        repokeFrontmostForCachedListeners()
+    }
+
+    /// Re-fire `SLPS(.noWindows)` ~150ms after a focus transition so the
+    /// NSWorkspaceDidActivateApplicationNotification gets a second
+    /// definite hit. Other processes that cache the frontmost-app
+    /// bundle ID — Karabiner-Elements being the concrete observed case
+    /// for `frontmost_application_if` rules — sometimes miss the initial
+    /// SLPS-triggered notification, so Cmd-key remaps don't fire until
+    /// the user clicks the window manually. The repoke gives the cache
+    /// a deterministic refresh trigger.
+    ///
+    /// Safe by construction: `SLPS(.noWindows)` activates the process
+    /// without raising ANY windows (per the API table in
+    /// `project_alttab_parallels.md`). It cannot bring other windows of
+    /// this app — or any other app — forward. Skips if the user has
+    /// switched away (`altTabFocusTarget` no longer points at us).
+    private func repokeFrontmostForCachedListeners() {
+        let targetPid = application.pid
+        let targetWid = cgWindowId ?? 0
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(150)) { [weak self] in
+            guard let self else { return }
+            guard let stillTarget = Windows.altTabFocusTarget,
+                  stillTarget.cgWindowId == self.cgWindowId else { return }
+            var psn = ProcessSerialNumber()
+            GetProcessForPID(targetPid, &psn)
+            _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.noWindows.rawValue)
+            Diagnostics.log("FRONTMOSTSET", "+150ms repoke SLPS(noWin) pid=\(targetPid) wid=\(targetWid) for Karabiner/NSWorkspace cache")
+        }
     }
 
     /// SLPS-with-wid is a direct window-server call that doesn't reliably
@@ -523,12 +1197,19 @@ class Window {
     /// many ms, and a stale value causes session-start normalize to
     /// use the wrong "current" pid.
     private func manuallyUpdateFocusOrderForParallelsTransition() {
-        Windows.armAltTabFocusGuard(for: self)
         application.focusedWindow = self
         Applications.frontmostPid = application.pid
         App.lastFocusedTargetWid = cgWindowId
         App.lastFocusedTargetPid = application.pid
         App.lastFocusedTargetTime = CFAbsoluteTimeGetCurrent()
+        guard App.appIsBeingUsed else {
+            App.noteDirectFocusOutsideAltTab(cgWindowId)
+            if let windows = Windows.updateLastFocusOrder(self) {
+                App.refreshOpenUiAfterExternalEvent(windows)
+            }
+            return
+        }
+        Windows.armAltTabFocusGuard(for: self)
         let source = sessionSourceWindow()
         Diagnostics.log("MANUAL", "manualUpdate target=\(debugId ?? "?") source=\(source?.debugId ?? "nil")")
         Windows.setTargetAndSourceAsMostRecent(target: self, source: source)

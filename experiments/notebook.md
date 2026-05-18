@@ -1,5 +1,7 @@
 # AltTab Window-Switch Experiments — Self-Paced Loop
 
+Current hypothesis/claim/evidence log: `experiments/focus-hypotheses.md`.
+
 Self-paced /loop driving a sequence of A/B experiments while the user is away.
 Goal: faster, more reliable transitions across Mac↔Mac, Par↔Par, Mac↔Par,
 Par↔Mac without breaking the per-window focus invariant.
@@ -288,6 +290,31 @@ Defaults left set:
    [5, 12, 25, 50, 100, 200, 350]. Catches the +10-25ms Parallels-coherence
    bounce that profiler Run 3 surfaced.
 
+## Runtime perf toggles added 2026-05-18
+
+Use these with `defaults write com.lwouis.alt-tab-macos ...` for A/B timing without source edits:
+
+- `diagnosticsBasicPerfOnly -bool true` — with `diagnosticsLevel=perf`, logs only `SWITCH`, `REFRESH`, `AXFOCUS`, and `LOGCOST` plus warnings/errors.
+- `thumbnailCaptureEnabled -bool false` — disables thumbnail screenshot capture requests.
+- `focusOverlayCaptureEnabled -bool false` — disables focus-overlay pre-capture/background capture.
+- `zOrderCacheEnabled -bool false` — disables background z-order cache refresh/review work.
+- `zOrderFixesEnabled -bool false` — disables active z-order repair/enforcement while leaving ordinary focus paths intact.
+- `nativeFocusMode userGeneratedFocus|noWindowsFocus|noWindowsRaise|userGeneratedRaise|originalAltTab|skyLightEventFocus|noWindowsAxActivateClickFallback|hidTitlebarClick` — native Mac focus experiment switch.
+- `nativeFocusClickFallbackDelayMs -int 60` — delay before the guarded no-cursor click fallback checks z0 and posts `CGPostMouseEvent`.
+
+Current normal-runtime reset after the low-overhead tests:
+
+- `nativeFocusMode = noWindowsAxActivateClickFallback`
+- `nativeFocusClickFallbackDelayMs = 60`
+- `nativeMultiWindowAxTimeoutMs = 50`
+- `thumbnailCaptureEnabled = true`
+- `focusOverlayCaptureEnabled = true`
+- `zOrderCacheEnabled = true`
+- `zOrderFixesEnabled = true`
+- `captureWindowsInBackground = true`
+- `diagnosticsLevel = perf`
+- `diagnosticsBasicPerfOnly = true`
+
 ## True z-order tracking — coverage audit (added this iteration)
 
 Source-of-z-order-change → AltTab observation path:
@@ -322,3 +349,174 @@ corrections below the visible-fold reflect the user's expected order.
    `Window.focus()` itself does not call `armAltTabFocusGuard` for
    Mac→Mac. Audit Window.focus() variants for any blocking work that
    could move to async.
+
+## 2026-05-18 late — no-cursor click fallback results
+
+- Modern `CGEvent(... mouseCursorPosition ...)` plus `.cghidEventTap` reproduces the fast WindowServer click path but moves the cursor. Delayed cursor warps can restore it, but there is visible/racy pointer movement.
+- Runtime `dlsym("CGPostMouseEvent")` still succeeds even though the macOS 26.5 SDK marks it unavailable. Calling it with `updateMouseCursorPosition=false` activates the clicked window and leaves the cursor fixed.
+- Implemented guarded fallback:
+  - mode: `nativeFocusMode=noWindowsAxActivateClickFallback`
+  - fallback delay: `nativeFocusClickFallbackDelayMs=60`
+  - only posts when target is not z0 and the candidate titlebar point resolves to the target as the top routable window.
+- Final direct matrix: Terminal→Safari median 0.05ms, worst 181.68ms; Safari→Terminal median 0.07ms, worst 200.04ms. Prior guarded no-windows path had 300-500ms outliers.
+- Same-app Terminal check after Safari→Terminal: z0 selected Terminal, z1/z2 Safari, other Terminal windows below Safari. No all-Terminals-to-front regression observed in this check.
+
+## 2026-05-18 final — post-profile cleanup
+
+- `sample` found one real self-inflicted issue: +200ms `CLICKAFTER` diagnostics were doing `AXUIElementCopyAttributeValue` on the main thread after clicks, even when no mismatch needed to be logged.
+- Patched `App.swift` so the main thread only checks the cheap frontmost pid; AX focused-window lookup now runs on `BackgroundWork.accessibilityCommandsQueue` and only for actual mismatch logs.
+- Rebuilt and restarted dev AltTab with `nativeFocusMode=noWindowsAxActivateClickFallback`, `nativeFocusClickFallbackDelayMs=60`, `diagnosticsLevel=perf`, `diagnosticsBasicPerfOnly=true`.
+- Final direct run `/tmp/alttab-profile/dynamic-focus-clickfallback80-20260518_042143.json`: Terminal→Safari median 0.06ms/worst 116.17ms; Safari→Terminal median 0.13ms/worst 196.62ms.
+- Final hotkey run `/tmp/alttab-profile/dynamic-hotkey-clickfallback80-20260518_042354.json`: 18/18 successful across 20/45/100ms key speeds; worst z0 278.48ms.
+- Same-app Terminal direct focus check: focusing Terminal `130062` then returning to `130253` put only those two recent Terminal windows at z0/z1, Safari at z2/z3, and the rest of the Terminal stack below Safari. This did not reproduce the all-Terminals-to-front regression.
+
+## 2026-05-18 — stuck input capture freeze
+
+- Symptom: user reported AltTab prevented clicking other apps, making the UI effectively frozen until AltTab was killed from another account.
+- Log reconstruction:
+  - `/tmp/alttab-run.log` only covered older PID `1405`; the current dev run was foreground logging through Codex.
+  - Recovered PID `34492` logs from the running exec session; the process kept logging `REFRESH reason=window-moved-resized` until SIGTERM at 11:40.
+  - There were no global `MOUSE` down logs while the user was clicking. Since AltTab's global monitor does not see events swallowed by the CGEvent tap, this is strong evidence that `CursorEvents` was still enabled and absorbing clicks.
+- Root-cause assessment:
+  - AltTab did not crash or stop its main runloop.
+  - The desktop looked frozen because input capture stayed armed while the panel/session state did not exit normally.
+  - Risky paths included outside mouse-down absorption without immediate hide, right/other click absorption, async tap disable in `hideUi()`, and duplicate focus debounce returning without release.
+- Patch:
+  - `hideUi()` now disables `CursorEvents` and resets trackpad capture synchronously before hiding the panel.
+  - All outside mouse-downs hide UI immediately. If capture is stale for more than `inputCapturePassthroughMs`, the event passes through after hiding instead of being swallowed.
+  - `inputCaptureWatchdogMs` starts when AltTab enters capture mode and force-hides any session that remains open too long.
+  - Duplicate focus debounce now calls `hideUi(true)` before returning.
+  - Added `CAPTURE` diagnostic category and defaults for `inputCaptureWatchdogMs=15000`, `inputCapturePassthroughMs=3000`.
+- Validation:
+  - `bash ai/build.sh compile` succeeded.
+  - `bash ai/build.sh dev` built `dev/AltTabCore.dylib`.
+  - Temporarily set `inputCaptureWatchdogMs=2000`, launched dev AltTab, forced `--show=0`, and observed `[DIAG CAPTURE] watchdog hiding stuck input capture after 2000ms`.
+  - Restored defaults to `inputCaptureWatchdogMs=15000` and `inputCapturePassthroughMs=3000`.
+
+## 2026-05-18 — Par↔Mac flashing regression
+
+- Symptom: user reported Parallels↔Mac flashing returned and had been better before the last few fixes.
+- First check: live logs showed Par↔Mac still went through the Parallels-specific paths (`parToMac`, `atomicallyPinAndActivate`), not the native `noWindowsAxActivateClickFallback`, so the Safari click fallback was not directly responsible.
+- Likely cause: the Parallels curtain had been shortened from the old 200ms to 30ms for all Parallels-involved transitions. Current logs showed Par→Mac app/focused-window notifications commonly arriving hundreds of milliseconds after SLPS/AX focus, so dropping the panel after ~30ms can expose Parallels' intermediate redraws.
+- Patch:
+  - added `parCrossBoundaryHideUiDelayMs=200`,
+  - added `parSameBoundaryHideUiDelayMs=30`,
+  - changed `App.focusSelectedWindow` to use 200ms only when `sourceIsPar != targetIsPar`,
+  - kept existing `parHideUiDelayMs` as a manual global override,
+  - added `parHideScheduled` `SWITCH` timing marker.
+- Runtime state:
+  - deleted the temporary global `parHideUiDelayMs` override,
+  - set `parCrossBoundaryHideUiDelayMs=200`,
+  - set `parSameBoundaryHideUiDelayMs=30`.
+- Validation:
+  - `bash ai/build.sh compile` succeeded.
+  - `bash ai/build.sh dev` built `dev/AltTabCore.dylib` cdhash `36a76d6755180ffc50c38b8a50a6f5a39a2b1704`.
+  - Foreground dev launch is running as PID `19640`.
+  - Three simulated Cmd-Tab hotkeys produced:
+    - `parHideScheduled ... 200ms sourcePar=true targetPar=false`,
+    - `parHideScheduled ... 200ms sourcePar=false targetPar=true`.
+
+## 2026-05-18 — Par hide readiness gate
+
+- User still saw flashing with the fixed 200ms cross-boundary curtain.
+- Added `/tmp/alttab_zsample` Swift sampler for external WindowServer evidence. It samples top visible app window every 10ms and prints only top-window changes.
+- Reproduced the gap:
+  - Par→Mac controlled sample: Teams stayed top until about 490ms after hotkey in one run.
+  - Mac→Par controlled sample: Terminal stayed top until about 346ms after hotkey in one run.
+  - App logs aligned with this: `parHideScheduled 200ms` fired long before `app-activated`/visible handoff in some runs.
+- Patch:
+  - `App.focusSelectedWindow` cancels delayed panel display after focus is committed.
+  - Par-involved hide now polls the top visible app window and hides only once the target `CGWindowID` is topmost and min delay has elapsed.
+  - Added max/poll defaults: `parHideMaxDelayMs=1200`, `parHidePollIntervalMs=25`.
+  - Added `parHideNow` switch marker with elapsed time, readiness, target, and current top window.
+- Validation:
+  - `bash ai/build.sh compile` succeeded.
+  - `bash ai/build.sh dev` built `dev/AltTabCore.dylib` cdhash `700854c2b078874e5592471525ee31112b8f53fc`.
+  - Foreground dev launch is running as PID `22341`.
+  - Six sampled Par↔Mac reps had exactly one app-top transition and no bounce back:
+    - Par→Mac top transition samples: ~396ms, ~403ms, ~411ms after sampler start.
+    - Mac→Par top transition samples: ~531ms, ~608ms, ~608ms after sampler start.
+  - Matching AltTab logs for these reps all hid with `parHideNow ... ready=true`; no timeout hide was observed.
+
+## 2026-05-18 — native Mac focus/copy regression follow-up
+
+- Added high-resolution z-order evaluators:
+  - `ai/z-order-sampler.swift` samples WindowServer order at millisecond cadence and records target z, same-app-above counts, same-app top-8 counts, and top window IDs.
+  - `ai/eval-focus-transition.sh` wraps exact `--focus=<wid>` calls, supports `TARGET_INDEX`/`TARGET_WID`, and reports first z0, post-z0 flicker, final top-8, and sibling intrusions above the pre-focus divider.
+  - `ai/eval-copy-after-focus.sh` focuses Safari, posts `Cmd-L`/`Cmd-C` with explicit modifier release, and verifies the pasteboard equals Safari's URL.
+- Copy/paste root cause:
+  - AltTab's keyboard sniffing is not swallowing `Cmd-C`; the global modifier tap is listen-only and hotkeys are Carbon global shortcuts.
+  - The reproducible failure was focus state: `originalAltTab` sometimes made Safari visually z0 before Safari was actually key/front enough to receive `Cmd-L`/`Cmd-C`.
+  - Stale synthetic modifier state was an earlier test artifact; `ai/post-key-combo.swift` releases Tab/Command/Shift/Option/Control before and after every probe.
+- Matrix after adding the evaluator:
+  - `originalAltTab` Safari z0 reps: about 530-1100ms; one `eval-copy-after-focus` probe at 0.8s failed because the front app was still Terminal.
+  - `skyLightEventFocus` Safari z0 reps: about 61-89ms; Safari copy passed 3/3.
+  - Deeper Safari-window probes showed no post-z0 sibling intrusion above the pre-focus divider.
+  - Restart probe showed AltTab launch did not change Safari z-order; the before/after top-8 was identical.
+- Patch:
+  - Terminal/iTerm routing now happens before `nativeFocusMode`, so `skyLightEventFocus` cannot bypass the target-only no-windows path.
+  - `nativeFocusMode` default is now `skyLightEventFocus` for non-Terminal native Mac windows.
+  - Terminal/iTerm keep the target-only `nativeMultiWindow` path to avoid bringing every terminal window forward.
+
+## 2026-05-18 — late sibling overtakes caught by z evaluator
+
+- The stricter evaluator caught two regressions that ordinary timing logs missed:
+  - Safari target reached z0 in ~76ms, then a Safari sibling overtook it at ~+1175ms.
+  - Terminal target reached z0, then a Terminal sibling overtook it at ~+311ms.
+- Root cause split:
+  - Native focus paths were not arming any z-order enforcement, so delayed app/window activation could promote a sibling after the target initially succeeded.
+  - `SLEventPostToPid` synthetic focus clicks also hit AltTab's global mouse monitor at the stationary cursor position; the monitor resolved the cursor location to Terminal and treated it as a real user click, canceling the enforcement intent.
+- Patch:
+  - added `Windows.armNativeFocusZOrderIntent(for:preZ:)`, which records a pre-focus z snapshot and runs the existing z enforcement without setting the input-capture/focus-order guard,
+  - applied it to `skyLightEventFocus` and Terminal/iTerm target-only focus,
+  - added synthetic focus-click ignore state so AltTab's global mouse monitor does not update user-click state or release enforcement for its own no-cursor click events,
+  - added user-click release for native z enforcement so a real click still stops the short-lived repair loop.
+- Final validation:
+  - Safari z0 reps: ~129ms, ~80ms, ~97ms, ~85ms; no post-z0 flicker or sibling intrusion.
+  - Safari copy probes: passed with `DELAY=1.2`.
+  - Terminal z0 reps: ~188ms and ~159ms; no post-z0 flicker or sibling intrusion.
+  - Restart probe: top-8 order unchanged across restart; launch did not move Safari windows.
+
+## 2026-05-18 — three-clean-run validation rule
+
+- Added the standing rule to `AGENTS.md` and `experiments/focus-hypotheses.md`: UI/focus/z-order checks need at least three clean repetitions before trusting the result.
+- Rationale: unattended runs can overlap with real user input. A concrete example occurred during copy validation: Safari reached z0, then a real/global mouse-down landed on Terminal 1359ms after focus and made the copy probe report `front=Terminal`. The run was marked contaminated instead of treated as an AltTab regression.
+- Fixed one test artifact before rerunning: `ai/post-key-combo.swift` now releases modifiers before Tab, preventing synthetic `Option+Tab` state from triggering AltTab's `nextWindowShortcut` during copy probes.
+- Clean validation after rebuilding and launching the dev dylib through LaunchServices:
+  - Safari focus z0: 78.2ms, 67.1ms, 65.0ms.
+  - Safari copy after focus: 3/3 passed at `DELAY=1.2`.
+  - Terminal focus z0: 219.2ms, 161.9ms, 224.1ms.
+  - All six z-order focus checks had `flicker_after_z0_samples=0` and `sibling_intrusions_after_z0_max=0`.
+- Process left running: `/Applications/AltTab.app/Contents/MacOS/AltTab --logs=warning` with `ALTTAB_DYLIB_OVERRIDE=dev/AltTabCore.dylib`.
+
+## 2026-05-18 — hotkey probe safety stop
+
+- Attempted to add a real hotkey-path evaluator because exact `--focus` does not fully cover flicker/perf in the switcher UI path.
+- First attempt was invalid: it assumed `Option+Tab`, but this machine's `holdShortcut` is configured as Command. Several samples therefore did not exercise AltTab as intended.
+- User observed that switching back to Terminal during tests routed input to Terminal. Testing was stopped immediately and all evaluator/sampler helper processes were killed.
+- Added a hard safety guard to `ai/eval-hotkey-transition.sh`: it refuses to post global hotkeys unless `ALLOW_SYNTHETIC_HOTKEY_TESTS=1`, and refuses live Terminal hotkey tests unless `ALLOW_TERMINAL_HOTKEY_TESTS=1`.
+- Added the same rule to `AGENTS.md` and `experiments/focus-hypotheses.md`: do not run synthetic hotkey tests against the user's live Terminal/session; use an isolated test desktop/window or exact-focus probes.
+
+## 2026-05-18 — Shift probe and safe panel-driven validation
+
+- Added a harmless focus probe: `ai/post-shift-probe.swift` posts only Shift down/up. It validates keyboard focus without sending printable input, Enter, or Tab to Terminal.
+- Added `ai/eval-switch-transition.sh`, which exercises the actual AltTab panel/session path through CLI commands (`--show=0`, `--selection-state`, `--focus-target`) without posting global hotkeys.
+- Sacrificial native apps:
+  - spawned `AltTabEvalA` and `AltTabEvalB`,
+  - enabled Shift probe logging to `/tmp/alttab-eval-keys.log`,
+  - ran 18 panel-driven A↔B switches across 20/45/100ms show-to-focus delays,
+  - all 18 passed with target final z0, no flicker, no source reappear, no sibling intrusion, and Shift delivered to the target app.
+- Terminal/Safari exact window validation with Shift:
+  - Terminal(130253)→Safari(125024): 148.9, 247.0, 278.3ms to target z0.
+  - Safari(125024)→Terminal(130253): 539.1, 367.7, 235.2ms to target z0.
+  - All six runs had `flicker_after_z0_samples=0`, `source_reappears_after_z0_samples=0`, and `sibling_intrusions_after_z0_max=0`.
+- Copy regression check:
+  - `DELAY=1.1 bash ai/eval-copy-after-focus.sh Safari` passed 3/3.
+  - Pasteboard bytes matched Safari's expected toolbar URL each time.
+- Recency/z-order smoke:
+  - Focus OneNote(132443), then Safari(125024), then show AltTab.
+  - Passed 3/3: selected index 1 was OneNote and top window stayed Safari. This verifies stale Terminal/Outlook source state is not being promoted after direct external focus changes.
+- Parallels/native boundary:
+  - OneNote(132443)→Safari(125024) after target-only Par→Mac z repair: later reps reached target z0 at 716.8 and 870.5ms, no flicker/sibling intrusion.
+  - Outlook(132442)→Safari(125024): 391.9, 785.3, 165.5ms, no flicker/sibling intrusion.
+  - Conclusion: Par→Mac visible handoff remains variable, but the current readiness gate prevents the old-window flash; the remaining delay is downstream WindowServer/Parallels/app surfacing, not AltTab main-thread blocking.

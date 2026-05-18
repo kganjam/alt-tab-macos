@@ -52,28 +52,52 @@ class Windows {
 
     @discardableResult
     static func syncFocusOrderWithLiveFrontmostWindow() -> CGWindowID? {
-        guard let window = liveFrontmostWindow() else { return nil }
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        guard let window = liveFrontmostWindow() else {
+            logLiveFrontmostSync(startedAt, nil)
+            return nil
+        }
         window.application.focusedWindow = window
         Applications.frontmostPid = window.application.pid
         _ = updateLastFocusOrder(window)
+        logLiveFrontmostSync(startedAt, window)
         return window.cgWindowId
     }
 
     private static func liveFrontmostWindow() -> Window? {
         let workspaceFrontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
         let frontPid = workspaceFrontPid ?? Applications.frontmostPid
-        if let guardedTarget = activeGuardedTarget(frontPid) {
+        let topZWindow = topKnownZOrderWindow()
+        if let guardedTarget = activeGuardedTarget(frontPid),
+           zOrderFocusQuietRemainingMs() > 0 || topZWindow == nil || topZWindow === guardedTarget {
             return guardedTarget
         }
-        if let topZWindow = topKnownZOrderWindow(), topZWindow.application.pid == frontPid {
+        if let topZWindow {
             return topZWindow
         }
-        if let axWindow = liveAxFocusedWindow(frontPid) {
-            return axWindow
+        if let singleWindow = singleTrackedWindowForFrontApp(frontPid) { return singleWindow }
+        if let cachedFocusedWindow = cachedFocusedWindow(frontPid) { return cachedFocusedWindow }
+        if UserDefaults.standard.bool(forKey: "forceAxFocusedWindowAtSessionStart"),
+           let axWindow = liveAxFocusedWindow(frontPid) { return axWindow }
+        return nil
+    }
+
+    private static func logLiveFrontmostSync(_ startedAt: CFAbsoluteTime, _ window: Window?) {
+        let ms = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+        Diagnostics.log("REFRESH", String(format: "live frontmost sync: %.1fms wid=%@ app=%@", ms, window?.cgWindowId?.description ?? "nil", window?.application.localizedName ?? "?"))
+    }
+
+    private static func singleTrackedWindowForFrontApp(_ frontPid: pid_t?) -> Window? {
+        guard let frontPid else { return nil }
+        var singleWindow: Window?
+        for window in list where window.application.pid == frontPid && !window.isWindowlessApp {
+            guard singleWindow == nil else { return nil }
+            singleWindow = window
         }
-        if let topZWindow = topKnownZOrderWindow() {
-            return topZWindow
-        }
+        return singleWindow
+    }
+
+    private static func cachedFocusedWindow(_ frontPid: pid_t?) -> Window? {
         guard let frontPid,
               let app = Applications.list.first(where: { $0.pid == frontPid }) else { return nil }
         return app.focusedWindow
@@ -96,8 +120,18 @@ class Windows {
     }
 
     private static func topKnownZOrderWindow() -> Window? {
-        for entry in captureTopZRanking(maxCount: 24) {
-            if let window = list.first(where: { $0.cgWindowId == entry.wid }) {
+        let maxAgeMs = UserDefaults.standard.object(forKey: "zOrderCacheMaxAgeMs") as? Double ?? 200
+        guard let snapshot = cachedZOrderSnapshot(maxAgeMs: maxAgeMs) else {
+            Diagnostics.log("REFRESH", "z-order cache unavailable/stale; falling back to AX-focused window")
+            return nil
+        }
+        let windowsById = Dictionary(uniqueKeysWithValues: list.compactMap { window -> (CGWindowID, Window)? in
+            guard let wid = window.cgWindowId else { return nil }
+            return (wid, window)
+        })
+        for entry in snapshot.entries.prefix(64) {
+            if let window = windowsById[entry.wid] {
+                Diagnostics.log("REFRESH", String(format: "z-order cache hit: age=%.1fms gen=%llu wid=%u app=%@", snapshot.ageMs, snapshot.generation, entry.wid, window.application.localizedName ?? "?"))
                 return window
             }
         }
@@ -124,6 +158,14 @@ class Windows {
             w.lastFocusOrder = nextOrder
             nextOrder += 1
         }
+    }
+
+    static func nextDisplayedFocusWindowId(after currentWid: CGWindowID?) -> CGWindowID? {
+        list
+            .filter { shouldDisplay($0) && $0.cgWindowId != currentWid }
+            .sorted { $0.lastFocusOrder < $1.lastFocusOrder }
+            .first?
+            .cgWindowId
     }
 
     /// Recent focus targets with intended z-order. The guard periodically
@@ -153,6 +195,9 @@ class Windows {
         let wid: CGWindowID
         let pid: pid_t
         let owner: String
+        var rank: Int = Int.max
+        var lastSeenAt: CFAbsoluteTime = 0
+        var lastRankChangedAt: CFAbsoluteTime = 0
     }
 
     /// Capture visible app-level windows in current z-order.
@@ -163,7 +208,7 @@ class Windows {
     /// reflect the user-expected order. CGWindowList itself is the only
     /// real cost; filtering and an Array of structs are free in
     /// comparison, so there is no perf reason to truncate aggressively.
-    static func captureTopZRanking(maxCount: Int = 200) -> [PreZEntry] {
+    static func captureTopZRanking(maxCount: Int = 200, timestamp: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()) -> [PreZEntry] {
         let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         guard let info = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return [] }
         let blocklist: Set<String> = [
@@ -184,20 +229,498 @@ class Windows {
             if layer != 0 { continue }
             let wid = (w[kCGWindowNumber as String] as? Int) ?? 0
             let pid = (w[kCGWindowOwnerPID as String] as? Int32) ?? 0
-            out.append(PreZEntry(wid: CGWindowID(wid), pid: pid, owner: owner))
+            out.append(PreZEntry(wid: CGWindowID(wid), pid: pid, owner: owner, rank: out.count, lastSeenAt: timestamp, lastRankChangedAt: timestamp))
             if out.count >= maxCount { break }
         }
         return out
     }
     static var recentZOrderIntents = [ZOrderIntent]()
+    private static let zOrderCacheLock = NSLock()
+    private static var zOrderCacheTimer: DispatchSourceTimer?
+    private static var zOrderCacheByWid = [CGWindowID: PreZEntry]()
+    private static var zOrderCacheTopSnapshot = [PreZEntry]()
+    private static var zOrderCacheFullSnapshot = [PreZEntry]()
+    private static var zOrderCacheTopUpdatedAt: CFAbsoluteTime = 0
+    private static var zOrderCacheFullUpdatedAt: CFAbsoluteTime = 0
+    private static var zOrderCacheGeneration: UInt64 = 0
+    private static var zOrderLifecycleGeneration: Int64 = 0
+    private static var zOrderFocusGeneration: Int64 = 0
+    private static var zOrderFocusQuietUntilNs: Int64 = 0
     private static var zOrderEnforcementTimer: DispatchSourceTimer?
     private static var zOrderEnforcementGeneration: UInt64 = 0
     private static var queuedAxRecoveryWids = Set<CGWindowID>()
+    private static var syntheticFocusClickIgnoreUntil: CFAbsoluteTime = 0
+    private static var syntheticFocusClickTimestamp: TimeInterval = 0
+
+    static func startZOrderCache() {
+        guard RuntimeFlags.zOrderCacheEnabled else {
+            Diagnostics.log("INIT", "z-order cache disabled by zOrderCacheEnabled=false")
+            return
+        }
+        guard zOrderCacheTimer == nil else { return }
+        let intervalMs = zOrderCacheIntervalMs()
+        let timer = DispatchSource.makeTimerSource(queue: BackgroundWork.zOrderCacheQueue.strongUnderlyingQueue)
+        timer.schedule(deadline: .now(),
+                       repeating: .milliseconds(intervalMs),
+                       leeway: .milliseconds(5))
+        timer.setEventHandler {
+            guard BackgroundWork.zOrderCacheQueue.operationCount == 0 else { return }
+            BackgroundWork.zOrderCacheQueue.addOperation {
+                refreshZOrderCacheRespectingFocus(false, topOnly: false, lifecycleGeneration: nil)
+            }
+        }
+        timer.resume()
+        zOrderCacheTimer = timer
+        Diagnostics.log("INIT", "z-order cache started interval=\(intervalMs)ms")
+    }
+
+    static func stopZOrderCache() {
+        zOrderCacheTimer?.cancel()
+        zOrderCacheTimer = nil
+    }
+
+    static func requestZOrderCacheRefresh(full: Bool = false, delayMs: Int = 0, lifecycleGeneration: Int64? = nil, topOnly: Bool = false) {
+        guard RuntimeFlags.zOrderCacheEnabled else { return }
+        guard BackgroundWork.zOrderCacheQueue != nil else { return }
+        BackgroundWork.zOrderCacheQueue.addOperationAfter(deadline: .now() + .milliseconds(delayMs)) {
+            refreshZOrderCacheRespectingFocus(full, topOnly: topOnly, lifecycleGeneration: lifecycleGeneration)
+        }
+    }
+
+    static func requestZOrderReview(reason: String, wid: CGWindowID = 0, invalidate: Bool = false, fullDelayMs: Int = 400) {
+        guard RuntimeFlags.zOrderCacheEnabled else { return }
+        if reason == "alttab-focus-intent" {
+            extendZOrderFocusQuietPeriod()
+        }
+        if invalidate {
+            invalidateZOrderCacheEntry(wid)
+        }
+        let generation = nextZOrderLifecycleGeneration()
+        Diagnostics.log("REFRESH", "z-order review reason=\(reason) wid=\(wid) invalidate=\(invalidate) gen=\(generation)")
+        requestZOrderCacheRefresh(full: false, delayMs: 0, topOnly: true)
+        requestZOrderCacheRefresh(full: false, delayMs: 80, lifecycleGeneration: generation, topOnly: true)
+        if fullDelayMs >= 0 {
+            requestZOrderCacheRefresh(full: true, delayMs: fullDelayMs, lifecycleGeneration: generation)
+        }
+    }
+
+    static func requestZOrderTopReview(reason: String, wid: CGWindowID = 0, invalidate: Bool = false, secondDelayMs: Int = 120) {
+        guard RuntimeFlags.zOrderCacheEnabled else { return }
+        if invalidate {
+            invalidateZOrderCacheEntry(wid)
+        }
+        Diagnostics.log("REFRESH", "z-order top review reason=\(reason) wid=\(wid) invalidate=\(invalidate)")
+        requestZOrderCacheRefresh(full: false, delayMs: 0, topOnly: true)
+        requestZOrderCacheRefresh(full: false, delayMs: secondDelayMs, topOnly: true)
+    }
+
+    static func requestZOrderReview(afterWindowLifecycleEvent reason: String, wid: CGWindowID) {
+        requestZOrderReview(reason: reason, wid: wid, invalidate: wid != 0, fullDelayMs: 400)
+    }
+
+    private static func invalidateZOrderCacheEntry(_ wid: CGWindowID) {
+        guard wid != 0 else { return }
+        let block = {
+            zOrderCacheLock.lock()
+            zOrderCacheByWid.removeValue(forKey: wid)
+            zOrderCacheTopSnapshot.removeAll { $0.wid == wid }
+            zOrderCacheFullSnapshot.removeAll { $0.wid == wid }
+            zOrderCacheGeneration &+= 1
+            zOrderCacheLock.unlock()
+        }
+        if Thread.isMainThread {
+            guard BackgroundWork.zOrderCacheQueue != nil else { return }
+            BackgroundWork.zOrderCacheQueue.addOperation(block)
+            return
+        }
+        block()
+    }
+
+    private static func withZOrderCacheLock<T>(_ block: () -> T) -> T? {
+        if Thread.isMainThread {
+            guard zOrderCacheLock.try() else { return nil }
+        } else {
+            zOrderCacheLock.lock()
+        }
+        defer { zOrderCacheLock.unlock() }
+        return block()
+    }
+
+    private static func liveZOrderSnapshotOffMain(maxCount: Int) -> [PreZEntry] {
+        guard !Thread.isMainThread else {
+            requestZOrderCacheRefresh(full: false, delayMs: 0, topOnly: true)
+            return []
+        }
+        return captureTopZRanking(maxCount: maxCount)
+    }
+
+    private static func liveFullZOrderSnapshotForIntent() -> [PreZEntry] {
+        guard !Thread.isMainThread else {
+            requestZOrderCacheRefresh(full: true, delayMs: 0)
+            Diagnostics.log("ZRESTORE", "preZ unavailable on main; queued cache refresh instead of blocking")
+            return []
+        }
+        return captureTopZRanking()
+    }
+
+    private static func extendZOrderFocusQuietPeriod() {
+        let quietUntil = zOrderFocusQuietDeadlineNs()
+        while true {
+            let current = OSAtomicAdd64Barrier(0, &zOrderFocusQuietUntilNs)
+            guard quietUntil > current else { return }
+            if OSAtomicCompareAndSwap64Barrier(current, quietUntil, &zOrderFocusQuietUntilNs) { return }
+        }
+    }
+
+    private static func zOrderFocusQuietRemainingMs() -> Int {
+        let deadline = OSAtomicAdd64Barrier(0, &zOrderFocusQuietUntilNs)
+        let now = zOrderNowNs()
+        guard deadline > now else { return 0 }
+        return Int((deadline - now + 999_999) / 1_000_000)
+    }
+
+    static func focusQuietRemainingMs() -> Int {
+        zOrderFocusQuietRemainingMs()
+    }
+
+    private static func zOrderNowNs() -> Int64 {
+        let now = DispatchTime.now().uptimeNanoseconds
+        return now > UInt64(Int64.max) ? Int64.max : Int64(now)
+    }
+
+    private static func zOrderFocusQuietDeadlineNs() -> Int64 {
+        let now = zOrderNowNs()
+        let delta = Int64(zOrderFocusQuietMs()) * 1_000_000
+        return now > Int64.max - delta ? Int64.max : now + delta
+    }
+
+    private static func nextZOrderLifecycleGeneration() -> Int64 {
+        OSAtomicIncrement64Barrier(&zOrderLifecycleGeneration)
+    }
+
+    private static func isCurrentZOrderLifecycleGeneration(_ generation: Int64) -> Bool {
+        generation == OSAtomicAdd64Barrier(0, &zOrderLifecycleGeneration)
+    }
+
+    private static func refreshZOrderCache(_ forceFull: Bool, topOnly: Bool = false) {
+        let now = CFAbsoluteTimeGetCurrent()
+        let fullUpdatedAt = withZOrderCacheLock { zOrderCacheFullUpdatedAt } ?? 0
+        let shouldRefreshFull = !topOnly && (forceFull || now - fullUpdatedAt > Double(zOrderCacheFullIntervalMs()) / 1000)
+        let snapshot = captureTopZRanking(maxCount: shouldRefreshFull ? zOrderCacheFullMaxCount() : zOrderCacheTopMaxCount(), timestamp: now)
+        zOrderCacheLock.lock()
+        let merged = mergeZOrderCache(snapshot, now)
+        zOrderCacheByWid = merged
+        zOrderCacheTopSnapshot = snapshot.compactMap { merged[$0.wid] }
+        zOrderCacheTopUpdatedAt = now
+        if shouldRefreshFull {
+            zOrderCacheFullSnapshot = snapshot.compactMap { merged[$0.wid] }
+            zOrderCacheFullUpdatedAt = now
+        }
+        zOrderCacheGeneration &+= 1
+        zOrderCacheLock.unlock()
+    }
+
+    private static func refreshZOrderCacheRespectingFocus(_ forceFull: Bool, topOnly: Bool, lifecycleGeneration: Int64?) {
+        if let lifecycleGeneration, !isCurrentZOrderLifecycleGeneration(lifecycleGeneration) { return }
+        let quietMs = zOrderFocusQuietRemainingMs()
+        guard quietMs == 0 else {
+            requestZOrderCacheRefresh(full: forceFull, delayMs: quietMs, lifecycleGeneration: lifecycleGeneration, topOnly: topOnly)
+            return
+        }
+        refreshZOrderCache(forceFull, topOnly: topOnly)
+    }
+
+    private static func mergeZOrderCache(_ snapshot: [PreZEntry], _ now: CFAbsoluteTime) -> [CGWindowID: PreZEntry] {
+        var merged = zOrderCacheByWid.filter { now - $0.value.lastSeenAt < 30 }
+        for entry in snapshot {
+            var updated = entry
+            if let old = merged[entry.wid], old.rank == entry.rank {
+                updated.lastRankChangedAt = old.lastRankChangedAt
+            } else {
+                updated.lastRankChangedAt = now
+            }
+            updated.lastSeenAt = now
+            merged[entry.wid] = updated
+        }
+        return merged
+    }
+
+    private static func cachedZOrderSnapshot(maxAgeMs: Double) -> (entries: [PreZEntry], ageMs: Double, generation: UInt64)? {
+        guard RuntimeFlags.zOrderCacheEnabled else { return nil }
+        guard let values = withZOrderCacheLock({
+            (zOrderCacheTopSnapshot, zOrderCacheTopUpdatedAt, zOrderCacheGeneration)
+        }) else { return nil }
+        let snapshot = values.0
+        let updatedAt = values.1
+        let generation = values.2
+        guard updatedAt > 0 else { return nil }
+        let ageMs = (CFAbsoluteTimeGetCurrent() - updatedAt) * 1000
+        guard ageMs <= maxAgeMs else { return nil }
+        return (snapshot, ageMs, generation)
+    }
+
+    private static func cachedFullZOrderSnapshot(maxAgeMs: Double) -> (entries: [PreZEntry], ageMs: Double, generation: UInt64)? {
+        guard RuntimeFlags.zOrderCacheEnabled else { return nil }
+        guard let values = withZOrderCacheLock({
+            (zOrderCacheFullSnapshot, zOrderCacheFullUpdatedAt, zOrderCacheGeneration)
+        }) else { return nil }
+        let snapshot = values.0
+        let updatedAt = values.1
+        let generation = values.2
+        guard updatedAt > 0 else { return nil }
+        let ageMs = (CFAbsoluteTimeGetCurrent() - updatedAt) * 1000
+        guard ageMs <= maxAgeMs else { return nil }
+        return (snapshot, ageMs, generation)
+    }
+
+    static func cachedFullZOrderSnapshotForFocus() -> [PreZEntry]? {
+        cachedFullZOrderSnapshot(maxAgeMs: 1500)?.entries
+    }
+
+    static func cachedZOrderSnapshotForFocus() -> [PreZEntry]? {
+        cachedZOrderSnapshot(maxAgeMs: 250)?.entries ?? cachedFullZOrderSnapshotForFocus()
+    }
+
+    static func zOrderSnapshotForFocus() -> [PreZEntry] {
+        cachedZOrderSnapshotForFocus() ?? liveZOrderSnapshotOffMain(maxCount: 64)
+    }
+
+    static func cachedTopZOrderWid(maxAgeMs: Double = 250) -> CGWindowID? {
+        cachedZOrderSnapshot(maxAgeMs: maxAgeMs)?.entries.first?.wid
+    }
+
+    private static func zRankingForRepair(maxCount: Int) -> [PreZEntry] {
+        if let cached = cachedZOrderSnapshot(maxAgeMs: 120), !cached.entries.isEmpty {
+            return Array(cached.entries.prefix(maxCount))
+        }
+        return liveZOrderSnapshotOffMain(maxCount: maxCount)
+    }
+
+    static func visibleWindowCount(pid: pid_t) -> Int {
+        list.reduce(0) { count, window in
+            guard window.application.pid == pid,
+                  !window.isWindowlessApp,
+                  !window.isMinimized else { return count }
+            return count + 1
+        }
+    }
+
+    @discardableResult
+    static func nextZOrderFocusGeneration() -> Int64 {
+        extendZOrderFocusQuietPeriod()
+        return OSAtomicIncrement64Barrier(&zOrderFocusGeneration)
+    }
+
+    static func currentZOrderFocusGeneration() -> Int64 {
+        OSAtomicAdd64Barrier(0, &zOrderFocusGeneration)
+    }
+
+    static func isCurrentZOrderFocusGeneration(_ generation: Int64) -> Bool {
+        generation == OSAtomicAdd64Barrier(0, &zOrderFocusGeneration)
+    }
+
+    static func restoreExpectedZOrderForFocus(targetWid: CGWindowID, targetPid: pid_t, preZ: [PreZEntry]) {
+        guard RuntimeFlags.zOrderFixesEnabled else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(120)) {
+            _ = restoreExpectedZOrder(targetWid: targetWid, targetPid: targetPid, preZ: preZ)
+            requestZOrderCacheRefresh(full: true, delayMs: 0)
+        }
+    }
+
+    static func retryNativeFocusTargetIfNeeded(targetWid: CGWindowID, targetPid: pid_t, delayMs: Int) {
+        guard RuntimeFlags.zOrderFixesEnabled else { return }
+        let generation = currentZOrderFocusGeneration()
+        BackgroundWork.zOrderCacheQueue.addOperationAfter(deadline: .now() + .milliseconds(delayMs)) {
+            guard isCurrentZOrderFocusGeneration(generation) else { return }
+            let actual = zRankingForRepair(maxCount: 8)
+            guard actual.first?.wid != targetWid else {
+                requestZOrderCacheRefresh(full: false)
+                return
+            }
+            let top = actual.first.map { "#\($0.wid) \($0.owner)" } ?? "nil"
+            if let blockerWid = actual.first?.wid {
+                let pairErr = CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, blockerWid)
+                if pairErr == .success {
+                    Diagnostics.log("ZRESTORE", "native target-only pair retry target=#\(targetWid) above=#\(blockerWid) top=\(top) CGS=0")
+                    requestZOrderCacheRefresh(full: false, delayMs: 0)
+                    return
+                }
+            }
+            let orderErr = CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, 0)
+            Diagnostics.log("ZRESTORE", "native target-only retry target=#\(targetWid) top=\(top) CGS=\(orderErr.rawValue)")
+            guard orderErr != .success else {
+                requestZOrderCacheRefresh(full: false, delayMs: 0)
+                return
+            }
+            DispatchQueue.main.async {
+                guard isCurrentZOrderFocusGeneration(generation) else { return }
+                guard let target = list.first(where: { $0.cgWindowId == targetWid }) else { return }
+                BackgroundWork.accessibilityCommandsQueue.addOperation { [weak target] in
+                    guard isCurrentZOrderFocusGeneration(generation) else { return }
+                    guard let target else { return }
+                    if let appAx = target.application.axUiElement, let windowAx = target.axUiElement {
+                        AXUIElementSetMessagingTimeout(appAx, 0.25)
+                        AXUIElementSetMessagingTimeout(windowAx, 0.25)
+                        try? appAx.setAttribute(kAXFocusedWindowAttribute, windowAx)
+                    }
+                    try? target.axUiElement?.focusWindow()
+                    Diagnostics.log("ZRESTORE", "native target-only AX retry done target=#\(targetWid) pid=\(targetPid)")
+                    requestZOrderCacheRefresh(full: false, delayMs: 0)
+                }
+            }
+        }
+    }
+
+    static func restoreNativeTargetSiblingOrderForFocus(targetWid: CGWindowID, targetPid: pid_t, preZ: [PreZEntry]) {
+        guard RuntimeFlags.zOrderFixesEnabled else { return }
+        let generation = currentZOrderFocusGeneration()
+        for delayMs in [80, 180, 360] {
+            BackgroundWork.zOrderCacheQueue.addOperationAfter(deadline: .now() + .milliseconds(delayMs)) {
+                guard isCurrentZOrderFocusGeneration(generation) else { return }
+                restoreNativeTargetSiblingOrder(targetWid: targetWid, targetPid: targetPid, preZ: preZ, generation: generation)
+            }
+        }
+    }
+
+    static func restoreNativeExpectedSiblingOrderImmediately(targetWid: CGWindowID, targetPid: pid_t, preZ: [PreZEntry]) {
+        guard RuntimeFlags.zOrderFixesEnabled else { return }
+        restoreNativeExpectedSiblingOrder(targetWid: targetWid, targetPid: targetPid, preZ: preZ, generation: currentZOrderFocusGeneration())
+    }
+
+    private static func restoreNativeExpectedSiblingOrder(targetWid: CGWindowID, targetPid: pid_t, preZ: [PreZEntry], generation: Int64) {
+        let expectedSiblings = expectedNativeSiblingGroup(targetWid: targetWid, targetPid: targetPid, preZ: preZ)
+        guard !expectedSiblings.isEmpty else { return }
+        let actual = zRankingForRepair(maxCount: 64)
+        let actualWids = actual.map { $0.wid }
+        guard actual.first?.wid == targetWid else { return }
+        guard let divider = preZ.first(where: { $0.wid != targetWid && $0.pid != targetPid }),
+              let dividerIndex = actualWids.firstIndex(of: divider.wid) else { return }
+        let expectedWids = expectedSiblings.map { $0.wid }
+        let prefixWids = Array(actualWids.dropFirst().prefix(expectedWids.count))
+        let misplaced = expectedWids.contains { wid in
+            guard let index = actualWids.firstIndex(of: wid) else { return false }
+            return index > dividerIndex
+        }
+        guard misplaced || prefixWids != expectedWids else { return }
+        DispatchQueue.main.async {
+            guard isCurrentZOrderFocusGeneration(generation) else { return }
+            let siblingWindows = expectedWids.compactMap { wid in list.first { $0.cgWindowId == wid } }
+            guard siblingWindows.count == expectedWids.count,
+                  let targetWindow = list.first(where: { $0.cgWindowId == targetWid }) else { return }
+            BackgroundWork.accessibilityCommandsQueue.addOperation {
+                guard isCurrentZOrderFocusGeneration(generation) else { return }
+                let startedAt = CFAbsoluteTimeGetCurrent()
+                for window in siblingWindows.reversed() {
+                    raiseSpecificWindowViaAx(window)
+                }
+                raiseSpecificWindowViaAx(targetWindow)
+                let ms = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+                Diagnostics.log("ZRESTORE", String(format: "native expected sibling repair target=#%u siblings=%@ divider=#%u ms=%.1f", targetWid, expectedWids.map { "#\($0)" }.joined(separator: ","), divider.wid, ms))
+                requestZOrderCacheRefresh(full: false)
+            }
+        }
+    }
+
+    static func restoreNativeExpectedSiblingOrderForFocus(targetWid: CGWindowID, targetPid: pid_t, preZ: [PreZEntry]) {
+        guard RuntimeFlags.zOrderFixesEnabled else { return }
+        let generation = currentZOrderFocusGeneration()
+        for delayMs in [0, 35, 100, 220] {
+            BackgroundWork.zOrderCacheQueue.addOperationAfter(deadline: .now() + .milliseconds(delayMs)) {
+                guard isCurrentZOrderFocusGeneration(generation) else { return }
+                restoreNativeExpectedSiblingOrder(targetWid: targetWid, targetPid: targetPid, preZ: preZ, generation: generation)
+            }
+        }
+    }
+
+    private static func expectedNativeSiblingGroup(targetWid: CGWindowID, targetPid: pid_t, preZ: [PreZEntry]) -> [PreZEntry] {
+        var siblings = [PreZEntry]()
+        for entry in preZ {
+            if entry.wid == targetWid { continue }
+            guard entry.pid == targetPid else { break }
+            siblings.append(entry)
+        }
+        return siblings
+    }
+
+    private static func restoreNativeTargetSiblingOrder(targetWid: CGWindowID, targetPid: pid_t, preZ: [PreZEntry], generation: Int64) {
+        let actual = zRankingForRepair(maxCount: 64)
+        let actualWids = actual.map { $0.wid }
+        guard actual.first?.wid == targetWid,
+              let divider = preZ.first(where: { $0.wid != targetWid && $0.pid != targetPid && actualWids.contains($0.wid) }),
+              let dividerIndex = actualWids.firstIndex(of: divider.wid) else { return }
+        let expectedSiblingWids = Set(expectedNativeSiblingGroup(targetWid: targetWid, targetPid: targetPid, preZ: preZ).map { $0.wid })
+        let raisedSiblings = actual.prefix(dividerIndex).dropFirst().filter { $0.pid == targetPid && !expectedSiblingWids.contains($0.wid) }
+        guard !raisedSiblings.isEmpty else { return }
+        let orderErr = CGSOrderWindow(CGS_CONNECTION, divider.wid, CGSWindowOrderingMode.below.rawValue, targetWid)
+        Diagnostics.log("ZRESTORE", "native sibling demote target=#\(targetWid) divider=#\(divider.wid) siblings=\(raisedSiblings.map { $0.wid }) CGS=\(orderErr.rawValue)")
+        guard orderErr != .success else {
+            requestZOrderCacheRefresh(full: false)
+            return
+        }
+        DispatchQueue.main.async {
+            guard isCurrentZOrderFocusGeneration(generation) else { return }
+            guard let dividerWindow = list.first(where: { $0.cgWindowId == divider.wid }),
+                  let targetWindow = list.first(where: { $0.cgWindowId == targetWid }) else { return }
+            BackgroundWork.accessibilityCommandsQueue.addOperation { [weak dividerWindow, weak targetWindow] in
+                guard isCurrentZOrderFocusGeneration(generation) else { return }
+                if let dividerWindow {
+                    focusSpecificWindowViaAx(dividerWindow)
+                }
+                if let targetWindow {
+                    focusSpecificWindowViaAx(targetWindow)
+                }
+                Diagnostics.log("ZRESTORE", "native sibling AX demote done target=#\(targetWid) divider=#\(divider.wid)")
+                requestZOrderCacheRefresh(full: false, delayMs: 0)
+            }
+        }
+    }
+
+    private static func focusSpecificWindowViaAx(_ window: Window) {
+        guard let windowAx = window.axUiElement else { return }
+        if let appAx = window.application.axUiElement {
+            AXUIElementSetMessagingTimeout(appAx, 0.25)
+            AXUIElementSetMessagingTimeout(windowAx, 0.25)
+            try? appAx.setAttribute(kAXFocusedWindowAttribute, windowAx)
+        }
+        try? windowAx.focusWindow()
+    }
+
+    private static func raiseSpecificWindowViaAx(_ window: Window) {
+        guard let windowAx = window.axUiElement else { return }
+        AXUIElementSetMessagingTimeout(windowAx, 0.25)
+        try? windowAx.performAction(kAXRaiseAction as String)
+    }
+
+    private static func zOrderCacheIntervalMs() -> Int {
+        let value = UserDefaults.standard.object(forKey: "zOrderCacheIntervalMs") as? Int ?? 150
+        return min(max(value, 50), 500)
+    }
+
+    private static func zOrderCacheFullIntervalMs() -> Int {
+        let value = UserDefaults.standard.object(forKey: "zOrderCacheFullIntervalMs") as? Int ?? 1000
+        return min(max(value, zOrderCacheIntervalMs()), 5000)
+    }
+
+    private static func zOrderCacheTopMaxCount() -> Int {
+        let value = UserDefaults.standard.object(forKey: "zOrderCacheTopMaxCount") as? Int ?? 32
+        return min(max(value, 8), 128)
+    }
+
+    private static func zOrderCacheFullMaxCount() -> Int {
+        let value = UserDefaults.standard.object(forKey: "zOrderCacheFullMaxCount") as? Int ?? 200
+        return min(max(value, zOrderCacheTopMaxCount()), 500)
+    }
+
+    private static func zOrderFocusQuietMs() -> Int {
+        let value = UserDefaults.standard.object(forKey: "zOrderFocusQuietMs") as? Int ?? 450
+        return min(max(value, 0), 600)
+    }
 
     static func armAltTabFocusGuard(for target: Window) {
         altTabFocusTarget = target
         altTabFocusTargetUntil = CFAbsoluteTimeGetCurrent() + altTabFocusGuardMs / 1000.0
         counterRaiseCount = 0
+        guard RuntimeFlags.zOrderFixesEnabled else { return }
         // Record this target's intended z-position (topmost)
         if let wid = target.cgWindowId {
             let now = CFAbsoluteTimeGetCurrent()
@@ -213,10 +736,15 @@ class Windows {
             let preZ: [PreZEntry]
             if let prior, !prior.preZRanking.isEmpty {
                 preZ = prior.preZRanking
+            } else if let cached = cachedFullZOrderSnapshot(maxAgeMs: 1500), !cached.entries.isEmpty {
+                preZ = cached.entries
+                Diagnostics.log("ZRESTORE", String(format: "preZ cached snapshot for target=#%u age=%.1fms gen=%llu n=%d", wid, cached.ageMs, cached.generation, preZ.count))
             } else {
-                preZ = Self.captureTopZRanking()
-                let preZSummary = preZ.prefix(8).enumerated().map { "z\($0.0)=#\($0.1.wid) \($0.1.owner.prefix(10))" }.joined(separator: " | ")
-                Diagnostics.log("ZRESTORE", "preZ snapshot for target=#\(wid) (n=\(preZ.count)): \(preZSummary)")
+                preZ = liveFullZOrderSnapshotForIntent()
+                if !preZ.isEmpty {
+                    let preZSummary = preZ.prefix(8).enumerated().map { "z\($0.0)=#\($0.1.wid) \($0.1.owner.prefix(10))" }.joined(separator: " | ")
+                    Diagnostics.log("ZRESTORE", "preZ snapshot for target=#\(wid) (n=\(preZ.count)): \(preZSummary)")
+                }
             }
             recentZOrderIntents.removeAll { $0.wid == wid }
             recentZOrderIntents.append(ZOrderIntent(
@@ -226,9 +754,38 @@ class Windows {
         }
     }
 
+    static func armNativeFocusZOrderIntent(for target: Window, preZ: [PreZEntry]) {
+        guard RuntimeFlags.zOrderFixesEnabled, let wid = target.cgWindowId else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        recentZOrderIntents.removeAll { now - $0.timestamp > 3.0 || $0.wid == wid }
+        recentZOrderIntents.append(ZOrderIntent(wid: wid, pid: target.application.pid, timestamp: now, window: target, preZRanking: preZ))
+        Diagnostics.log("ZENFORCE", "native intent target=#\(wid) preZ=\(preZ.count)")
+        startZOrderEnforcement()
+    }
+
+    static func releaseZOrderEnforcementForUserClick(wid: CGWindowID, pid: pid_t, label: String) {
+        guard let current = recentZOrderIntents.last, current.wid != wid else { return }
+        Diagnostics.log("ZENFORCE", "released by user click: clicked=#\(wid) pid=\(pid) \(label.prefix(30)) target=#\(current.wid)")
+        recentZOrderIntents.removeAll()
+        zOrderEnforcementGeneration &+= 1
+        zOrderEnforcementTimer?.cancel()
+        zOrderEnforcementTimer = nil
+    }
+
+    static func noteSyntheticFocusClick() {
+        syntheticFocusClickTimestamp = TimeInterval(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) / 1_000_000_000
+        syntheticFocusClickIgnoreUntil = CFAbsoluteTimeGetCurrent() + 3.0
+    }
+
+    static func shouldIgnoreSyntheticFocusClick(eventTimestamp: TimeInterval) -> Bool {
+        guard CFAbsoluteTimeGetCurrent() < syntheticFocusClickIgnoreUntil else { return false }
+        return abs(eventTimestamp - syntheticFocusClickTimestamp) < 0.5
+    }
+
     /// Poll actual z-order every 500ms for 5s after last focus target.
     /// If the most recent target isn't at z0 among app windows, re-raise.
     private static func startZOrderEnforcement() {
+        guard RuntimeFlags.zOrderFixesEnabled else { return }
         zOrderEnforcementTimer?.cancel()
         zOrderEnforcementGeneration &+= 1
         let myGen = zOrderEnforcementGeneration
@@ -292,6 +849,7 @@ class Windows {
     /// list. If not, use CGSOrderWindow to directly reorder it without
     /// process-level activation side effects.
     private static func enforceZOrder() {
+        guard RuntimeFlags.zOrderFixesEnabled else { return }
         guard let mostRecent = recentZOrderIntents.last,
               let window = mostRecent.window else { return }
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
@@ -461,8 +1019,10 @@ class Windows {
             guard isCurrent, let window else { return }
             if let appAx = window.application.axUiElement, let selfAx = window.axUiElement {
                 try? appAx.setAttribute(kAXFocusedWindowAttribute, selfAx)
-                let fmErr = AXUIElementSetAttributeValue(appAx, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
-                Diagnostics.log("FRONTMOSTSET", "ZENFORCE recovery kAXFrontmost=true pid=\(pid) wid=\(wid) → \(fmErr == .success ? "OK" : "err=\(fmErr.rawValue)")")
+                if window.application.isParallelsCoherence {
+                    let fmErr = AXUIElementSetAttributeValue(appAx, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+                    Diagnostics.log("FRONTMOSTSET", "ZENFORCE recovery kAXFrontmost=true pid=\(pid) wid=\(wid) → \(fmErr == .success ? "OK" : "err=\(fmErr.rawValue)")")
+                }
             }
             try? window.axUiElement?.performAction(kAXRaiseAction as String)
             Diagnostics.log("ZENFORCE", "AX recovery done wid=\(wid) attempt #\(attempt)")
@@ -517,7 +1077,6 @@ class Windows {
         // Capture current actual order (just the wids in z-order).
         let actual = Self.captureTopZRanking()
         let actualWids = actual.map { $0.wid }
-        let actualWidSet = Set(actualWids)
         // Pre-summary line so we can compare expected vs actual at a
         // glance even before any corrections fire.
         let expSummary = expected.prefix(8).enumerated().map { "z\($0.0)=#\($0.1.wid) \($0.1.owner.prefix(10))" }.joined(separator: " | ")
@@ -554,35 +1113,9 @@ class Windows {
             Diagnostics.log("ZRESTORE", "applied \(corrections) corrections for target=#\(targetWid)")
         }
         if failures > 0 {
-            queueExpectedZOrderAxRestore(targetWid: targetWid, targetPid: targetPid, expected: expected, actualWidSet: actualWidSet, generation: zOrderEnforcementGeneration)
+            Diagnostics.log("ZRESTORE", "CGS failed for \(failures) corrections; skipping AX full-stack restore for target=#\(targetWid)")
         }
         return corrections > 0
-    }
-
-    private static func queueExpectedZOrderAxRestore(targetWid: CGWindowID, targetPid: pid_t, expected: [PreZEntry], actualWidSet: Set<CGWindowID>, generation: UInt64) {
-        guard let targetWindow = list.first(where: { $0.cgWindowId == targetWid }),
-              !targetWindow.application.isParallelsCoherence else { return }
-        let windowsToRaise = expected.prefix(24).compactMap { entry -> (Window, CGWindowID)? in
-            guard entry.wid != targetWid,
-                  entry.pid != targetPid,
-                  actualWidSet.contains(entry.wid),
-                  let window = list.first(where: { $0.cgWindowId == entry.wid }) else { return nil }
-            return (window, entry.wid)
-        }
-        guard !windowsToRaise.isEmpty else { return }
-        Diagnostics.log("ZRESTORE", "CGS failed; AX reverse-restore \(windowsToRaise.count) non-target windows before target=#\(targetWid)")
-        BackgroundWork.accessibilityCommandsQueue.addOperation { [weak targetWindow] in
-            let isCurrent = DispatchQueue.main.sync {
-                zOrderEnforcementGeneration == generation && recentZOrderIntents.last?.wid == targetWid
-            }
-            guard isCurrent else { return }
-            for (window, wid) in windowsToRaise.reversed() {
-                try? window.axUiElement?.focusWindow()
-                Diagnostics.log("ZRESTORE", "AX restore raised #\(wid)")
-            }
-            try? targetWindow?.axUiElement?.focusWindow()
-            Diagnostics.log("ZRESTORE", "AX restore raised target #\(targetWid)")
-        }
     }
 
     /// Per-tick alignment diagnostic. Captures the three signals the
@@ -660,6 +1193,7 @@ class Windows {
     /// driven callers (e.g. click-misroute recovery) that need to fire
     /// immediately and don't repeat on their own.
     static func restoreFrontmostToTarget(targetWid: CGWindowID, targetPid: pid_t, frontPid: pid_t, source: String = "FRONT_MISMATCH", bypassThrottle: Bool = false) {
+        guard RuntimeFlags.zOrderFixesEnabled else { return }
         let now = CFAbsoluteTimeGetCurrent()
         if !bypassThrottle {
             guard now - lastFrontRestoreAt > 0.4 else { return }
@@ -679,6 +1213,7 @@ class Windows {
     /// up on top). Query actual z-order first to only raise windows that
     /// are out of position.
     static func restoreZOrderFromRecency() {
+        guard RuntimeFlags.zOrderFixesEnabled else { return }
         let topWindows = list
             .sorted { $0.lastFocusOrder < $1.lastFocusOrder }
             .prefix(5)
@@ -931,12 +1466,11 @@ class Windows {
     }
 
     static func updatesBeforeShowing() -> Bool {
+        let startedAt = CFAbsoluteTimeGetCurrent()
         if MissionControl.state() == .showAllWindows || MissionControl.state() == .showFrontWindows { return false }
         if list.isEmpty { return true }
-        // TODO: find a way to update space info when spaces are changed, instead of on every trigger
-        // workaround: when Preferences > Mission Control > "Displays have separate Spaces" is unchecked,
-        // switching between displays doesn't trigger .activeSpaceDidChangeNotification; we get the latest manually
-        Spaces.refresh()
+        refreshSpacesBeforeShowingIfNeeded()
+        let afterSpacesAt = CFAbsoluteTimeGetCurrent()
         // Parallels Coherence rewrites the guest window title on page/tab
         // navigation. Empirically (logs 2026-04-27): both
         // kAXTitleChangedNotification AND CGWindowListCopyWindowInfo's
@@ -946,11 +1480,25 @@ class Windows {
         // sysFocus probe at Logger.swift returning live titles for
         // wid=18882 while the cached title stayed "Trading - April 2026"
         // for hours).
+        let spacesPreference = Preferences.spacesToShow[App.shortcutIndex]
+        let screensPreference = Preferences.screensToShow[App.shortcutIndex]
+        let forceRefreshWindowSpaces = UserDefaults.standard.bool(forKey: "forceRefreshWindowSpacesBeforeShowing")
+        let refreshVisibleWindowIds = UserDefaults.standard.bool(forKey: "refreshVisibleWindowIdsBeforeShowing")
+        let visibleWindowIds = spacesPreference == .all || !refreshVisibleWindowIds ? nil : Set(Spaces.windowsInSpaces(Spaces.visibleSpaces))
+        let shouldRefreshWindowSpaces = screensPreference == .showingAltTab || forceRefreshWindowSpaces
+        let shouldRefreshParallelsTitles = shouldRefreshParallelsTitlesBeforeShowing()
+        let spaceRefreshMode = shouldRefreshWindowSpaces ? "per-window" : (visibleWindowIds == nil ? "cached" : "bulk-visible")
+        var parWindowsSeen = 0
         var parWindowsQueried = 0
         var parTitlesObtained = 0
         for window in list {
-            window.updateSpacesAndScreen()
-            if window.isParallelsCoherenceWindow, let axElement = window.axUiElement {
+            if shouldRefreshWindowSpaces {
+                window.updateSpacesAndScreen()
+            }
+            if window.isParallelsCoherenceWindow {
+                parWindowsSeen += 1
+            }
+            if shouldRefreshParallelsTitles, window.isParallelsCoherenceWindow, let axElement = window.axUiElement {
                 parWindowsQueried += 1
                 var titleValue: AnyObject?
                 let axStatus = AXUIElementCopyAttributeValue(axElement, kAXTitleAttribute as CFString, &titleValue)
@@ -964,19 +1512,55 @@ class Windows {
                     Diagnostics.log("AXTITLE", "wid=\(wid) cached='\(window.title ?? "")' AX failed: status=\(axStatus.rawValue)")
                 }
             }
-            refreshIfWindowShouldBeShownToTheUser(window)
+            refreshIfWindowShouldBeShownToTheUser(window, visibleWindowIds)
         }
+        let afterWindowsAt = CFAbsoluteTimeGetCurrent()
         if parWindowsQueried > 0 {
-            Diagnostics.log("REFRESH", "panel build: parallels_windows=\(parWindowsQueried) ax_titles_obtained=\(parTitlesObtained)")
+            Diagnostics.log("REFRESH", "panel build: parallels_windows=\(parWindowsQueried) ax_titles_obtained=\(parTitlesObtained) space_refresh=\(spaceRefreshMode)")
+        } else if parWindowsSeen > 0 {
+            Diagnostics.log("REFRESH", "panel build: parallels_windows=\(parWindowsSeen) ax_titles_skipped=mac-fast-path space_refresh=\(spaceRefreshMode)")
         }
         refreshWhichWindowsToShowTheUser()
         sort()
+        let afterSortAt = CFAbsoluteTimeGetCurrent()
+        Diagnostics.log("REFRESH", String(format: "updatesBeforeShowing: total=%.1fms spaces=%.1fms windows=%.1fms sort=%.1fms count=%d", (afterSortAt - startedAt) * 1000, (afterSpacesAt - startedAt) * 1000, (afterWindowsAt - afterSpacesAt) * 1000, (afterSortAt - afterWindowsAt) * 1000, list.count))
         return true
+    }
+
+    private static func refreshSpacesBeforeShowingIfNeeded() {
+        if UserDefaults.standard.bool(forKey: "forceRefreshWindowSpacesBeforeShowing") {
+            Spaces.refresh()
+            return
+        }
+        let intervalMs = UserDefaults.standard.integer(forKey: "refreshSpacesBeforeShowingIntervalMs")
+        guard intervalMs > 0 else { return }
+        let elapsedMs = (CFAbsoluteTimeGetCurrent() - Spaces.lastRefreshAt) * 1000
+        if elapsedMs > Double(intervalMs) {
+            Spaces.refresh()
+        }
+    }
+
+    private static func shouldRefreshParallelsTitlesBeforeShowing() -> Bool {
+        if UserDefaults.standard.bool(forKey: "alwaysRefreshCoherenceTitlesBeforeShowing") { return true }
+        if let sourcePid = App.sessionSourcePid,
+           Applications.list.first(where: { $0.pid == sourcePid })?.isParallelsCoherence == true {
+            return true
+        }
+        if selectedWindow()?.application.isParallelsCoherence == true {
+            return true
+        }
+        return list
+            .sorted { $0.lastFocusOrder < $1.lastFocusOrder }
+            .dropFirst()
+            .first?
+            .application
+            .isParallelsCoherence == true
     }
 
     // dispatch screenshot requests off the main-thread, then wait for completion
     static func refreshThumbnailsAsync(_ windows: [Window], _ source: RefreshCausedBy, windowRemoved: Bool = false) {
-        guard (!windows.isEmpty || windowRemoved) && ScreenRecordingPermission.status == .granted
+        guard RuntimeFlags.thumbnailCaptureEnabled
+               && (!windows.isEmpty || windowRemoved) && ScreenRecordingPermission.status == .granted
                && !Preferences.onlyShowApplications()
                && (!Appearance.hideThumbnails || Preferences.previewSelectedWindow)
                && (Preferences.captureWindowsInBackground || App.appIsBeingUsed) else { return }
@@ -1067,7 +1651,8 @@ class Windows {
         }
     }
 
-    private static func refreshIfWindowShouldBeShownToTheUser(_ window: Window) {
+    private static func refreshIfWindowShouldBeShownToTheUser(_ window: Window, _ visibleWindowIds: Set<CGWindowID>? = nil) {
+        let isInVisibleSpace = isWindowInVisibleSpace(window, visibleWindowIds)
         window.shouldShowTheUser =
             !(window.application.bundleIdentifier.flatMap { id in
                 Preferences.exceptions.contains {
@@ -1081,10 +1666,23 @@ class Windows {
                 !window.isWindowlessApp &&
                 !(!(Preferences.showFullscreenWindows[App.shortcutIndex] != .hide) && window.isFullscreen) &&
                 !(!(Preferences.showMinimizedWindows[App.shortcutIndex] != .hide) && window.isMinimized) &&
-                !(Preferences.spacesToShow[App.shortcutIndex] == .visible && !Spaces.visibleSpaces.contains { visibleSpace in window.spaceIds.contains { $0 == visibleSpace } }) &&
-                !(Preferences.spacesToShow[App.shortcutIndex] == .nonVisible && Spaces.visibleSpaces.contains { visibleSpace in window.spaceIds.contains { $0 == visibleSpace } }) &&
+                !(Preferences.spacesToShow[App.shortcutIndex] == .visible && !isInVisibleSpace) &&
+                !(Preferences.spacesToShow[App.shortcutIndex] == .nonVisible && isInVisibleSpace) &&
                 !(Preferences.screensToShow[App.shortcutIndex] == .showingAltTab && !window.isOnScreen(NSScreen.preferred)) &&
                 (Preferences.showTabsAsWindows || !window.isTabbed))
+    }
+
+    private static func isWindowInVisibleSpace(_ window: Window, _ visibleWindowIds: Set<CGWindowID>?) -> Bool {
+        if let visibleWindowIds {
+            if let wid = window.cgWindowId, visibleWindowIds.contains(wid) { return true }
+            if let activeTabWid = TabGroup.activeTabSibling(of: window)?.cgWindowId {
+                return visibleWindowIds.contains(activeTabWid)
+            }
+            return false
+        }
+        return Spaces.visibleSpaces.contains { visibleSpace in
+            window.spaceIds.contains { $0 == visibleSpace }
+        }
     }
 
     /// Selects the most appropriate main window from a given list of windows.
@@ -1381,7 +1979,10 @@ class Windows {
 
     static func updateLastFocusOrder(_ focusedWindow: Window) -> [Window]? {
         // no need to update the list is the window is already lastFocusOrder 0
-        guard focusedWindow.lastFocusOrder != 0 && list.count > 1, let previousFocus = (list.first { $0.lastFocusOrder == 0 }) else { return [focusedWindow] }
+        guard focusedWindow.lastFocusOrder != 0 && list.count > 1, let previousFocus = (list.first { $0.lastFocusOrder == 0 }) else {
+            prewarmLikelyFocusTargets()
+            return [focusedWindow]
+        }
         // 2 windows have recently changed: the one which got focused, and the one who just lost focus
         let windowsToRefresh = [focusedWindow, previousFocus]
         let focusedWindowOldFocusOrder = focusedWindow.lastFocusOrder
@@ -1392,7 +1993,17 @@ class Windows {
                 $0.lastFocusOrder += 1
             }
         }
+        prewarmLikelyFocusTargets()
         return windowsToRefresh
+    }
+
+    static func prewarmLikelyFocusTargets(limit: Int = 1) {
+        list
+            .filter { shouldDisplay($0) }
+            .sorted { $0.lastFocusOrder < $1.lastFocusOrder }
+            .dropFirst()
+            .prefix(limit)
+            .forEach { $0.prewarmNativeFocusAxElementIfNeeded() }
     }
 
     static func findOrCreate(_ windowAxUiElement: AXUIElement, _ wid: CGWindowID, _ app: Application, _ level: CGWindowLevel, _ title: String?, _ subrole: String?, _ role: String?, _ size: CGSize?, _ position: CGPoint?, _ isFullscreen: Bool?, _ isMinimized: Bool?) -> (Window?, Bool) {

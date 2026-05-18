@@ -15,6 +15,7 @@ class WindowCaptureScreenshots {
     }
 
     static func oneTimeScreenshots(_ windowsToScreenshot: [Window], _ source: RefreshCausedBy) {
+        guard RuntimeFlags.thumbnailCaptureEnabled else { return }
         let windows = windowsToScreenshot.compactMap { $0.cgWindowId }
         guard !windows.isEmpty else { return }
         BackgroundWork.screenshotsQueue.addOperation {
@@ -96,6 +97,7 @@ class WindowCaptureScreenshots {
 
 class WindowCaptureScreenshotsPrivateApi {
     static func oneTimeScreenshots(_ eligibleWindows: [Window], _ source: RefreshCausedBy) {
+        guard RuntimeFlags.thumbnailCaptureEnabled else { return }
         for window in eligibleWindows {
             BackgroundWork.screenshotsQueue.addOperation { [weak window] in
                 guard source != .refreshOnlyThumbnailsAfterShowUi || App.appIsBeingUsed else { return }

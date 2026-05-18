@@ -112,6 +112,7 @@ class Logger {
 ///   defaults write com.lwouis.alt-tab-macos diagnosticsLevel info
 ///   defaults write com.lwouis.alt-tab-macos diagnosticsLevel perf
 ///   defaults write com.lwouis.alt-tab-macos diagnosticsLevel trace
+///   defaults write com.lwouis.alt-tab-macos diagnosticsBasicPerfOnly -bool true
 ///
 /// Continuous monitoring interval (ms):
 ///   defaults write com.lwouis.alt-tab-macos diagnosticsMonitorMs -int 500
@@ -167,6 +168,7 @@ class Diagnostics {
         "AXTITLE": .warn,
         "CLICKMISROUTE": .warn,
         "CLICKAFTER": .warn,
+        "CAPTURE": .warn,
         // info — normal-flow events (default for unknown categories)
         "PANEL": .info,
         "KEY": .info,
@@ -183,7 +185,12 @@ class Diagnostics {
         // perf — switch timing & panel build counters
         "SWITCH": .perf,
         "REFRESH": .perf,
+        "AXFOCUS": .perf,
+        "LOGCOST": .perf,
         // trace — z-order/focus mechanics
+        "AXPREWARM": .trace,
+        "AXRAISE": .trace,
+        "ZWAIT": .trace,
         "SYSZ": .trace,
         "RECENCY": .trace,
         "SAMEAPP": .trace,
@@ -208,20 +215,32 @@ class Diagnostics {
         "API": .verbose,
         "CTAP": .verbose,
     ]
+    private static let basicPerfCategories: Set<String> = ["SWITCH", "REFRESH", "AXFOCUS", "LOGCOST"]
 
     private static func categoryLevel(_ category: String) -> Level {
         return categoryLevels[category] ?? .info
     }
 
+    private static let startTimeNs = DispatchTime.now().uptimeNanoseconds
+    private static let logCostQueue = DispatchQueue(label: "Diagnostics.logCost")
+    private static var logCostCount: UInt64 = 0
+    private static var logCostTotalNs: UInt64 = 0
+    private static var logCostFormatNs: UInt64 = 0
+    private static var logCostNslogNs: UInt64 = 0
+    private static var logCostMaxNs: UInt64 = 0
+    private static var logCostLastReportNs: UInt64 = 0
+
     /// Returns true iff a `log(category, …)` for this category would emit.
     /// Use to gate expensive precomputation done outside `log()`'s autoclosure.
     static func shouldLog(_ category: String) -> Bool {
-        return minLevel >= categoryLevel(category)
+        shouldEmit(category)
     }
 
     static func log(_ category: String, _ message: @autoclosure () -> String) {
-        guard minLevel >= categoryLevel(category) else { return }
-        let elapsed = Date().timeIntervalSince(startTime)
+        let baseNs = startTimeNs
+        let logStartNs = DispatchTime.now().uptimeNanoseconds
+        guard shouldEmit(category) else { return }
+        let elapsedMs = Double(logStartNs >= baseNs ? logStartNs - baseNs : 0) / 1_000_000
         // NSLog/asl truncate at the first embedded newline, splitting
         // a single logical message across multiple log lines and
         // hiding everything that came after the \n. We saw exactly
@@ -236,7 +255,53 @@ class Diagnostics {
                 .replacingOccurrences(of: "\n", with: " ")
                 .replacingOccurrences(of: "\r", with: " ")
         }
-        NSLog("[DIAG %@] t+%.3fs %@", category, elapsed, sanitized)
+        let beforeNslogNs = DispatchTime.now().uptimeNanoseconds
+        let line = "[DIAG \(category)] \(String(format: "t+%.3fms", elapsedMs)) tid=\(currentThreadId()) q=\(currentQueueLabel()) \(sanitized)"
+        NSLog("%@", line as NSString)
+        let endNs = DispatchTime.now().uptimeNanoseconds
+        recordLogCost(nowNs: endNs, totalNs: endNs - logStartNs, formatNs: beforeNslogNs - logStartNs, nslogNs: endNs - beforeNslogNs)
+    }
+
+    private static func shouldEmit(_ category: String) -> Bool {
+        let requiredLevel = categoryLevel(category)
+        guard minLevel >= requiredLevel else { return false }
+        guard RuntimeFlags.diagnosticsBasicPerfOnly else { return true }
+        return requiredLevel <= .warn || basicPerfCategories.contains(category)
+    }
+
+    private static func currentThreadId() -> String {
+        var tid: UInt64 = 0
+        pthread_threadid_np(nil, &tid)
+        return String(tid)
+    }
+
+    private static func currentQueueLabel() -> String {
+        if Thread.isMainThread { return "main" }
+        if let name = Thread.current.name, !name.isEmpty { return name }
+        let label = __dispatch_queue_get_label(nil)
+        return String(cString: label, encoding: .utf8) ?? "?"
+    }
+
+    private static func recordLogCost(nowNs: UInt64, totalNs: UInt64, formatNs: UInt64, nslogNs: UInt64) {
+        logCostQueue.async {
+            logCostCount += 1
+            logCostTotalNs += totalNs
+            logCostFormatNs += formatNs
+            logCostNslogNs += nslogNs
+            logCostMaxNs = max(logCostMaxNs, totalNs)
+            reportLogCostIfNeeded(nowNs)
+        }
+    }
+
+    private static func reportLogCostIfNeeded(_ nowNs: UInt64) {
+        guard shouldLog("LOGCOST") else { return }
+        let baseNs = startTimeNs
+        let now = nowNs >= baseNs ? nowNs - baseNs : 0
+        guard now - logCostLastReportNs >= 2_000_000_000 else { return }
+        logCostLastReportNs = now
+        let count = max(logCostCount, 1)
+        let line = String(format: "[DIAG LOGCOST] t+%.3fms tid=%@ q=%@ count=%llu avg=%.1fus max=%.1fus formatAvg=%.1fus nslogAvg=%.1fus", Double(now) / 1_000_000, currentThreadId(), currentQueueLabel(), count, Double(logCostTotalNs) / Double(count) / 1000, Double(logCostMaxNs) / 1000, Double(logCostFormatNs) / Double(count) / 1000, Double(logCostNslogNs) / Double(count) / 1000)
+        NSLog("%@", line as NSString)
     }
 
     // MARK: - Switch timing
@@ -529,7 +594,9 @@ class FocusOverlay {
     @available(macOS 14.0, *)
     static func preCapture(wid: CGWindowID, position: CGPoint, size: CGSize) {
         Diagnostics.log("OVERLAY", "preCapture wid=\(wid)")
-        guard overlayModeEnabled, ScreenRecordingPermission.status == .granted else { return }
+        guard RuntimeFlags.focusOverlayCaptureEnabled,
+              overlayModeEnabled,
+              ScreenRecordingPermission.status == .granted else { return }
         let t0 = CACurrentMediaTime()
         Task {
             do {

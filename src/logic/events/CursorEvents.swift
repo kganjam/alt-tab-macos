@@ -89,8 +89,7 @@ class CursorEvents {
         }
         mouseDownInsideSearchField = false
         guard isPointerInsideUi() else {
-            logTapDecision("left", "down", cgEvent, absorbed: true, reason: "outsideUi")
-            return nil
+            return handleOutsideUiMouseDown("left", cgEvent)
         }
         mouseDownTarget = (findButtonUnderPointer() ?? findTileViewUnderPointer()) as AnyObject?
         logTapDecision("left", "down", cgEvent, absorbed: true, reason: "insideUi")
@@ -134,8 +133,7 @@ class CursorEvents {
             logTapDecision("right", "down", cgEvent, absorbed: false, reason: "menuOpen/insideUi")
             return Unmanaged.passUnretained(cgEvent)
         }
-        logTapDecision("right", "down", cgEvent, absorbed: true, reason: "outsideUi")
-        return nil
+        return handleOutsideUiMouseDown("right", cgEvent)
     }
 
     private static func handleRightMouseUp(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
@@ -152,8 +150,7 @@ class CursorEvents {
             logTapDecision("other", "down", cgEvent, absorbed: false, reason: "menuOpen/insideUi")
             return Unmanaged.passUnretained(cgEvent)
         }
-        logTapDecision("other", "down", cgEvent, absorbed: true, reason: "outsideUi")
-        return nil
+        return handleOutsideUiMouseDown("other", cgEvent)
     }
 
     private static func handleOtherMouseUp(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
@@ -176,6 +173,15 @@ class CursorEvents {
             TilesView.thumbnailOverView.updateHover()
         }
         return Unmanaged.passUnretained(cgEvent)
+    }
+
+    private static func handleOutsideUiMouseDown(_ button: String, _ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
+        let passThrough = App.inputCaptureIsOlderThan(RuntimeFlags.inputCapturePassthroughMs)
+        logTapDecision(button, "down", cgEvent, absorbed: !passThrough, reason: passThrough ? "outsideUi-stale→hideUi-pass" : "outsideUi→hideUi")
+        mouseDownTarget = nil
+        mouseDownInsideSearchField = false
+        App.hideUi()
+        return passThrough ? Unmanaged.passUnretained(cgEvent) : nil
     }
 
     static func resetDeadzone() {

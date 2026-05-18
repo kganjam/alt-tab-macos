@@ -13,9 +13,12 @@ class BackgroundWork {
     static var repeatingKeyQueue: LabeledOperationQueue!
     static var screenshotsQueue: LabeledOperationQueue!
     static var accessibilityCommandsQueue: LabeledOperationQueue!
+    static var focusActionsQueue: LabeledOperationQueue!
+    static var focusPrewarmQueue: LabeledOperationQueue!
     static var crashReportsQueue: LabeledOperationQueue!
     static var permissionsCheckOnTimerQueue: LabeledOperationQueue!
     static var permissionsSystemCallsQueue: LabeledOperationQueue!
+    static var zOrderCacheQueue: LabeledOperationQueue!
 
     private static var debugMenu: DebugMenu!
     private static var totalPotentialThreadCount = 0
@@ -26,13 +29,15 @@ class BackgroundWork {
         // if macOS is overwhelmed, let's reduce the pressure on it by calling permission APIs one at a time
         permissionsSystemCallsQueue = LabeledOperationQueue("permissionsSystemCalls", .userInteractive, 1)
         // we update cachedSCWindows during the first permission check; so we need this queue early
-        screenshotsQueue = LabeledOperationQueue("screenshots", .userInteractive, 8)
+        screenshotsQueue = LabeledOperationQueue("screenshots", .utility, 2)
     }
 
     static func start() {
         // calls to focus/close/minimize/etc windows
         // They are tried once and if they timeout we don't retry. The OS seems to still execute them even if the call timed out
         accessibilityCommandsQueue = LabeledOperationQueue("axCommands", .userInteractive, 4)
+        focusActionsQueue = LabeledOperationQueue("focusActions", .userInteractive, 1)
+        focusPrewarmQueue = LabeledOperationQueue("focusPrewarm", .userInteractive, 1)
         // we time key repeat on a background queue. We handle their consequence on the main-thread
         repeatingKeyQueue = LabeledOperationQueue("repeatingKey", .userInteractive, 1)
         // we observe app and windows notifications. They arrive on this thread, and are handled off the main thread initially
@@ -43,6 +48,7 @@ class BackgroundWork {
         missionControlThread = BackgroundThreadWithRunLoop("missionControl", .userInteractive)
         // we listen to CLI commands (CFMessagePort events)
         cliEventsThread = BackgroundThreadWithRunLoop("cliMessages", .userInteractive)
+        zOrderCacheQueue = LabeledOperationQueue("zOrderCache", .userInteractive, 1)
        // logThreadsAndQueuesOnRepeat()
     }
 
@@ -152,7 +158,7 @@ class LabeledOperationQueue: OperationQueue, @unchecked Sendable {
     }
 
     init(_ label: String, _ qos: DispatchQoS, _ maxConcurrentOperationCount: Int) {
-        strongUnderlyingQueue = DispatchQueue(label: label, attributes: [.concurrent])
+        strongUnderlyingQueue = DispatchQueue(label: label, qos: qos, attributes: [.concurrent])
         super.init()
         self.maxConcurrentOperationCount = maxConcurrentOperationCount
         BackgroundWork.addPotentialThreadCount(maxConcurrentOperationCount)

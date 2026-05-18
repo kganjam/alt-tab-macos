@@ -31,6 +31,45 @@ Use `bash ai/build.sh {compile|dev|install}`. Three modes, one script:
   re-grant prompts.** Use only when `shim/main.c`, Pods, framework deps,
   or entitlements change — rare.
 
+# Working notes and accessory docs
+
+- Before changing focus, z-order, Alt-Tab latency, Parallels Coherence,
+  or display-transition behavior, read `experiments/focus-hypotheses.md`.
+  It is the current claims/hypotheses/evidence log. Update it whenever
+  you prove, disprove, or materially refine a hypothesis; do not repeat
+  an invalidated approach unless you add new evidence explaining why it
+  should behave differently now.
+- `experiments/notebook.md` is the chronological experiment notebook.
+  Use it for long-form run history, profiler summaries, and design notes.
+  Keep the hypothesis page concise; put verbose run narratives here.
+- `ai/build.sh` is the only supported build/install/dev loop. Use
+  `compile` after edits, `dev` for TCC-safe runtime tests, and `install`
+  only for rare full bundle/signing changes.
+- `ai/profile.sh` contains profiling helpers for Time Profiler / system
+  tracing. Prefer it when latency claims need real profiler evidence.
+- `ai/run.sh` is a lightweight local run helper for development workflows.
+- `ai/tcc.sh` inspects or repairs Accessibility/Screen Recording grants.
+  Use it only when TCC state is part of the problem; don't reset TCC as
+  a routine troubleshooting step.
+- `/tmp/alttab-run.log` is the main runtime diagnostic stream. Use
+  `diagnosticsLevel` defaults (`perf`, `trace`, etc.) to control detail.
+  When adding timing logs, include millisecond-or-better timestamps and
+  account for logging overhead if it affects the claim.
+- For UI/focus/z-order validation, run each check at least 3 times before
+  trusting it. The user may still be active during unattended runs; real
+  clicks, typing, display changes, or app activity can interfere with
+  measurements. Treat any run with user activity or unexpected external
+  events as contaminated, note it, and rerun rather than optimizing around
+  a single sample.
+- Do not run synthetic global-hotkey tests against the user's live
+  Terminal/session. They can route keystrokes to the active shell when a
+  switch lands in Terminal. Use exact-focus probes first; only run
+  hotkey-path probes on an isolated test desktop/window with explicit
+  opt-in environment flags.
+- To verify keyboard focus without typing into the target, post Shift
+  down/up only. It exercises focus delivery without inserting text or
+  sending Enter/Tab into the user's active Terminal.
+
 # Bundle architecture
 
 The installed bundle is **shim + dylib**:

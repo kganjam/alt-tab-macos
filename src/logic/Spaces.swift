@@ -6,6 +6,7 @@ class Spaces {
     static var visibleSpaces = [CGSSpaceID]()
     static var screenSpacesMap = [ScreenUuid: [CGSSpaceID]]()
     static var idsAndIndexes = [(CGSSpaceID, SpaceIndex)]()
+    static var lastRefreshAt: CFAbsoluteTime = 0
 
     static func isSingleSpace() -> Bool {
         return idsAndIndexes.count == 1
@@ -24,6 +25,7 @@ class Spaces {
     static func refresh() {
         refreshAllIdsAndIndexes()
         updateCurrentSpace()
+        lastRefreshAt = CFAbsoluteTimeGetCurrent()
     }
 
     private static func updateCurrentSpace() {

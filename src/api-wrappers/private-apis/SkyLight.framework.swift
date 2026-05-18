@@ -1,3 +1,5 @@
+import Cocoa
+
 /*
  SkyLight is the private framework in charge of interacting with the Window Server
  If we link to SkyLight.framework, we can use these private functions
@@ -242,3 +244,12 @@ func _SLPSSetFrontProcessWithOptions(_ psn: UnsafeMutablePointer<ProcessSerialNu
 /// * macOS 10.12+
 @_silgen_name("SLPSPostEventRecordTo") @discardableResult
 func SLPSPostEventRecordTo(_ psn: UnsafeMutablePointer<ProcessSerialNumber>, _ bytes: UnsafeMutablePointer<UInt8>) -> CGError
+
+@_silgen_name("SLEventPostToPid")
+func SLEventPostToPid(_ pid: pid_t, _ event: CGEvent)
+
+@_silgen_name("SLEventSetIntegerValueField")
+func SLEventSetIntegerValueField(_ event: CGEvent, _ field: UInt32, _ value: Int64)
+
+@_silgen_name("CGEventSetWindowLocation")
+func CGEventSetWindowLocation(_ event: CGEvent, _ point: CGPoint)

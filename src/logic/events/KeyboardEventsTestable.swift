@@ -20,6 +20,10 @@ func handleKeyboardEvent(_ globalId: Int?, _ shortcutState: ShortcutState?, _ ke
     }
     logKeyboardEvent(globalId, shortcutState, keyCode, modifiers, isARepeat)
     let someShortcutTriggered = triggerMatchingShortcuts(globalId, shortcutState, keyCode, modifiers, isARepeat)
+    if !someShortcutTriggered && App.appIsBeingUsed && App.inputCaptureIsOlderThan(RuntimeFlags.inputCapturePassthroughMs) {
+        Diagnostics.log("CAPTURE", "keyboard hiding stale input capture after \(RuntimeFlags.inputCapturePassthroughMs)ms")
+        App.hideUi()
+    }
     return someShortcutTriggered
 }
 

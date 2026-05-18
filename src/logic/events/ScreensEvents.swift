@@ -14,6 +14,7 @@ class ScreensEvents {
             Logger.debug { notification.name.rawValue }
             Spaces.refresh()
             Screens.refresh()
+            Windows.requestZOrderReview(reason: "screen-parameters-changed", fullDelayMs: 700)
             // a screen added or removed, or screen resolution change can mess up layout; we reset components
             App.resetPreferencesDependentComponents()
             prepareThumbnailsForDisplayChange()

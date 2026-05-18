@@ -50,6 +50,22 @@ class Preferences {
             "hideStatusIcons": "false",
             "previewFocusedWindow": "false",
             "captureWindowsInBackground": "true",
+            "thumbnailCaptureEnabled": "true",
+            "focusOverlayCaptureEnabled": "true",
+            "zOrderCacheEnabled": "true",
+            "zOrderFixesEnabled": "true",
+            "diagnosticsBasicPerfOnly": "false",
+            "nativeFocusMode": "skyLightEventFocus",
+            "nativeFocusClickFallbackEnabled": "false",
+            "nativeFocusClickFallbackDelayMs": "60",
+            "inputCaptureWatchdogMs": "15000",
+            "inputCapturePassthroughMs": "3000",
+            "parCrossBoundaryHideUiDelayMs": "200",
+            "parSameBoundaryHideUiDelayMs": "30",
+            "parHideMaxDelayMs": "1200",
+            "parHidePollIntervalMs": "25",
+            "parHideStableMs": "250",
+            "parHideRequiresFrontmost": "true",
             "screenRecordingPermissionSkipped": "false",
             "trackpadHapticFeedbackEnabled": "true",
             "settingsWindowShownOnFirstLaunch": "false",
@@ -389,6 +405,40 @@ class CachedUserDefaults {
 
     private static func jsonDecode<T>(_ value: String, _ type: T.Type) -> T? where T: Decodable {
         return value.data(using: .utf8).flatMap { try? JSONDecoder().decode(type, from: $0) }
+    }
+}
+
+enum RuntimeFlags {
+    static var diagnosticsBasicPerfOnly: Bool { bool("diagnosticsBasicPerfOnly", default: false) }
+    static var thumbnailCaptureEnabled: Bool { bool("thumbnailCaptureEnabled", default: true) }
+    static var focusOverlayCaptureEnabled: Bool { bool("focusOverlayCaptureEnabled", default: true) }
+    static var zOrderCacheEnabled: Bool { bool("zOrderCacheEnabled", default: true) }
+    static var zOrderFixesEnabled: Bool { bool("zOrderFixesEnabled", default: true) }
+    static var nativeFocusClickFallbackEnabled: Bool { bool("nativeFocusClickFallbackEnabled", default: false) }
+    static var nativeFocusClickFallbackDelayMs: Int { int("nativeFocusClickFallbackDelayMs", default: 60) }
+    static var inputCaptureWatchdogMs: Int { int("inputCaptureWatchdogMs", default: 15000) }
+    static var inputCapturePassthroughMs: Int { int("inputCapturePassthroughMs", default: 3000) }
+    static var parCrossBoundaryHideUiDelayMs: Int { int("parCrossBoundaryHideUiDelayMs", default: 200) }
+    static var parSameBoundaryHideUiDelayMs: Int { int("parSameBoundaryHideUiDelayMs", default: 30) }
+    static var parHideMaxDelayMs: Int { int("parHideMaxDelayMs", default: 1200) }
+    static var parHidePollIntervalMs: Int { int("parHidePollIntervalMs", default: 25) }
+    static var parHideStableMs: Int { int("parHideStableMs", default: 250) }
+    static var parHideRequiresFrontmost: Bool { bool("parHideRequiresFrontmost", default: true) }
+
+    private static func bool(_ key: String, default defaultValue: Bool) -> Bool {
+        guard let value = UserDefaults.standard.object(forKey: key) else { return defaultValue }
+        if let boolValue = value as? Bool { return boolValue }
+        if let numberValue = value as? NSNumber { return numberValue.boolValue }
+        if let stringValue = value as? String { return Bool(stringValue) ?? defaultValue }
+        return defaultValue
+    }
+
+    private static func int(_ key: String, default defaultValue: Int) -> Int {
+        guard let value = UserDefaults.standard.object(forKey: key) else { return defaultValue }
+        if let intValue = value as? Int { return intValue }
+        if let numberValue = value as? NSNumber { return numberValue.intValue }
+        if let stringValue = value as? String { return Int(stringValue) ?? defaultValue }
+        return defaultValue
     }
 }
 

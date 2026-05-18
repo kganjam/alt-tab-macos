@@ -50,6 +50,7 @@ class AccessibilityEvents {
                     Logger.info { "\(type) app:\(app.debugId)" }
                     if type == kAXWindowCreatedNotification {
                         Applications.manuallyUpdateWindows(app)
+                        Windows.requestZOrderReview(afterWindowLifecycleEvent: "created-app", wid: 0)
                     } else {
                         applicationHiddenOrShown(app, pid, type)
                     }
@@ -83,6 +84,7 @@ class AccessibilityEvents {
 
     private static func applicationActivated(_ app: Application, _ pid: pid_t, _ type: String, _ appFocusedWindow: AXUIElement?, _ wid: CGWindowID?) {
         Diagnostics.log("AXEVENT", "applicationActivated pid=\(pid) app=\(app.bundleIdentifier ?? "?") guardActive=\(CFAbsoluteTimeGetCurrent() < Windows.altTabFocusTargetUntil) target=\(Windows.altTabFocusTarget?.debugId ?? "nil")")
+        Windows.requestZOrderReview(reason: "app-activated", wid: wid ?? 0, fullDelayMs: 500)
         diagnoseCrossProcessActivation(activatedApp: app, activatedPid: pid)
         if Windows.shouldSuppressApplicationActivation(for: app) { return }
         Applications.frontmostPid = pid
@@ -145,6 +147,7 @@ class AccessibilityEvents {
             app.focusedWindow = nil
             return
         }
+        Windows.requestZOrderReview(reason: type, wid: wid, fullDelayMs: 500)
         AXCallScheduler.shared.schedule(key: "wid-\(wid)", context: "\(type) \(app.debugId))", pid: pid) {
             try handleEventWindow(kAXFocusedWindowChangedNotification, wid, pid, axWindow)
         }
@@ -152,6 +155,7 @@ class AccessibilityEvents {
 
     private static func applicationHiddenOrShown(_ app: Application, _ pid: pid_t, _ type: String) {
         app.isHidden = type == kAXApplicationHiddenNotification
+        Windows.requestZOrderReview(reason: type, fullDelayMs: 500)
         let windows = Windows.list.filter {
             // for AXUIElement of apps, CFEqual or == don't work; looks like a Cocoa bug
             return $0.application.pid == pid
@@ -189,10 +193,15 @@ class AccessibilityEvents {
                 if findOrCreate.1 || (tabStateChanged && App.appIsBeingUsed) {
                     App.refreshOpenUiAfterExternalEvent([window])
                 }
+                if findOrCreate.1 {
+                    Windows.requestZOrderReview(afterWindowLifecycleEvent: "created-window", wid: wid)
+                }
                 if type == kAXMainWindowChangedNotification || type == kAXFocusedWindowChangedNotification {
                     focusedWindowChanged(window)
                 } else if type == kAXWindowResizedNotification || type == kAXWindowMovedNotification {
                     windowResizedOrMoved(window)
+                } else if type == kAXWindowMiniaturizedNotification || type == kAXWindowDeminiaturizedNotification {
+                    windowMiniaturizedOrDeminiaturized(window, type)
                 } else if !findOrCreate.1 {
                     App.refreshOpenUiAfterExternalEvent([window])
                 }
@@ -204,8 +213,10 @@ class AccessibilityEvents {
         if let window = (Windows.list.first { $0.isEqualRobust(windowAxUiElement, wid) }) {
             let wasFrontmost = window.application.runningApplication.isActive
             let wasParallels = window.application.isParallelsCoherence
+            let removedWid = window.cgWindowId ?? wid
             Diagnostics.log("AXEVENT", "windowDestroyed wid=\(wid) \(window.debugId ?? "?") wasFront=\(wasFrontmost) par=\(wasParallels)")
             Windows.removeWindows([window], true)
+            Windows.requestZOrderReview(afterWindowLifecycleEvent: "destroyed", wid: removedWid)
             // When a Parallels window is closed while frontmost, macOS raises
             // the next window from the same process — which may not match our
             // recency order. Restore the correct z-order from our recency list.
@@ -219,6 +230,7 @@ class AccessibilityEvents {
         // photoshop will focus a window *after* you focus another app
         // we check that a focused window happens within an active app
         guard window.application.runningApplication.isActive else { return }
+        Windows.requestZOrderReview(reason: "focused-window", wid: window.cgWindowId ?? 0, fullDelayMs: 500)
         // if the window is shown by alt-tab, we mark it as focused for this app
         // this avoids issues with dialogs, quicklook, etc (see scenarios from #1044 and #2003)
         window.application.focusedWindow = window
@@ -229,13 +241,20 @@ class AccessibilityEvents {
         // `updateLastFocusOrder` for those so the recency list doesn't
         // get a stale window promoted to position 0.
         if Windows.shouldSuppressFocusOrderUpdate(for: window) { return }
+        App.noteObservedFocusedWindow(window.cgWindowId)
         if let windows = Windows.updateLastFocusOrder(window) {
             App.refreshOpenUiAfterExternalEvent(windows)
         }
     }
 
     private static func windowResizedOrMoved(_ window: Window) {
+        Windows.requestZOrderReview(reason: "window-moved-resized", wid: window.cgWindowId ?? 0, fullDelayMs: 700)
         window.updateSpacesAndScreen()
+        App.refreshOpenUiAfterExternalEvent([window])
+    }
+
+    private static func windowMiniaturizedOrDeminiaturized(_ window: Window, _ type: String) {
+        Windows.requestZOrderReview(reason: type, wid: window.cgWindowId ?? 0, invalidate: true, fullDelayMs: 500)
         App.refreshOpenUiAfterExternalEvent([window])
     }
 }

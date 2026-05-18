@@ -54,33 +54,33 @@ class CliServer {
         if rawValue == "--detailed-list" {
             return JsonWindowFullList(windows: Windows.list
                 .filter { !$0.isWindowlessApp }
-                .map {
-                    JsonWindowFull(
-                        id: $0.cgWindowId,
-                        title: $0.title,
-                        appName: $0.application.localizedName,
-                        appBundleId: $0.application.bundleIdentifier,
-                        spaceIndexes: $0.spaceIndexes,
-                        lastFocusOrder: $0.lastFocusOrder,
-                        creationOrder: $0.creationOrder,
-                        isTabbed: $0.isTabbed,
-                        isHidden: $0.isHidden,
-                        isFullscreen: $0.isFullscreen,
-                        isMinimized: $0.isMinimized,
-                        isOnAllSpaces: $0.isOnAllSpaces,
-                        position: $0.position,
-                        size: $0.size
-                    )
-                }
+                .map { jsonWindowFull($0) }
             )
+        }
+        if rawValue == "--selection-state" {
+            return JsonSelectionState(
+                appIsBeingUsed: App.appIsBeingUsed,
+                selectedIndex: Windows.selectedWindowIndex,
+                selectedWindow: Windows.selectedWindow().map { jsonWindowFull($0) },
+                windows: Windows.list.filter { !$0.isWindowlessApp }.map { jsonWindowFull($0) })
+        }
+        if rawValue == "--hide" {
+            App.hideUi(true)
+            return noOutput
+        }
+        if rawValue == "--focus-target" {
+            App.focusTarget()
+            return noOutput
         }
         if rawValue.hasPrefix("--focus="),
            let id = CGWindowID(rawValue.dropFirst("--focus=".count)), let window = (Windows.list.first { $0.cgWindowId == id }) {
+            App.hideUi(true)
             window.focus()
             return noOutput
         }
         if rawValue.hasPrefix("--focusUsingLastFocusOrder="),
            let lastFocusOrder = Int(rawValue.dropFirst("--focusUsingLastFocusOrder=".count)), let window = (Windows.list.first { $0.lastFocusOrder == lastFocusOrder }) {
+            App.hideUi(true)
             window.focus()
             return noOutput
         }
@@ -90,6 +90,31 @@ class CliServer {
             return noOutput
         }
         return error
+    }
+
+    private static func jsonWindowFull(_ window: Window) -> JsonWindowFull {
+        let now = CFAbsoluteTimeGetCurrent()
+        let thumbnailAgeMs = window.thumbnailUpdatedAt > 0 ? (now - window.thumbnailUpdatedAt) * 1000 : nil
+        return JsonWindowFull(
+            id: window.cgWindowId,
+            pid: window.application.pid,
+            title: window.title,
+            appName: window.application.localizedName,
+            appBundleId: window.application.bundleIdentifier,
+            spaceIndexes: window.spaceIndexes,
+            lastFocusOrder: window.lastFocusOrder,
+            creationOrder: window.creationOrder,
+            isTabbed: window.isTabbed,
+            isHidden: window.isHidden,
+            isFullscreen: window.isFullscreen,
+            isMinimized: window.isMinimized,
+            isOnAllSpaces: window.isOnAllSpaces,
+            position: window.position,
+            size: window.size,
+            hasThumbnail: window.thumbnail != nil,
+            thumbnailAgeMs: thumbnailAgeMs,
+            thumbnailUpdateCount: window.thumbnailUpdateCount
+        )
     }
 
     private struct JsonWindowList: Codable {
@@ -105,8 +130,16 @@ class CliServer {
         var windows: [JsonWindowFull]
     }
 
+    private struct JsonSelectionState: Codable {
+        var appIsBeingUsed: Bool
+        var selectedIndex: Int
+        var selectedWindow: JsonWindowFull?
+        var windows: [JsonWindowFull]
+    }
+
     private struct JsonWindowFull: Codable {
         var id: CGWindowID?
+        var pid: pid_t
         var title: String
         // -- additional properties
         var appName: String?
@@ -121,6 +154,9 @@ class CliServer {
         var isOnAllSpaces: Bool
         var position: CGPoint?
         var size: CGSize?
+        var hasThumbnail: Bool
+        var thumbnailAgeMs: Double?
+        var thumbnailUpdateCount: Int
     }
 }
 
@@ -128,7 +164,7 @@ class CliClient {
     static func detectCommand() -> String? {
         let args = CommandLine.arguments
         if args.count == 2 && !args[1].starts(with: "--logs=") {
-            if args[1] == "--list" || args[1] == "--detailed-list" || args[1].hasPrefix("--focus=") || args[1].hasPrefix("--focusUsingLastFocusOrder=") || args[1].hasPrefix("--show=") {
+            if args[1] == "--list" || args[1] == "--detailed-list" || args[1] == "--selection-state" || args[1] == "--hide" || args[1] == "--focus-target" || args[1].hasPrefix("--focus=") || args[1].hasPrefix("--focusUsingLastFocusOrder=") || args[1].hasPrefix("--show=") {
                 return args[1]
             }
         }
