@@ -274,6 +274,7 @@ class Window {
             } else {
                 application.runningApplication.activate(options: .activateAllWindows)
             }
+            manuallyUpdateFocusOrderForDirectFocus()
             Windows.previewSelectedWindowIfNeeded()
         } else if isParallelsCoherenceWindow && isSameProcessAsCurrentFrontmost() {
             focusParallelsCoherenceWindowSameProcess()
@@ -305,11 +306,13 @@ class Window {
             if wasAlreadyFrontmost && orderErr != .success {
                 try? axUiElement!.focusWindow()
                 Diagnostics.markSwitchPhase("axSyncDone", extra: "wid=\(cgWindowId ?? 0)")
+                manuallyUpdateFocusOrderForDirectFocus()
                 DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
                     Windows.previewSelectedWindowIfNeeded()
                 }
                 return
             }
+            manuallyUpdateFocusOrderForDirectFocus()
             BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
                 guard let self else { return }
                 Diagnostics.markSwitchPhase("axQueueEntry")
@@ -319,6 +322,17 @@ class Window {
                     Windows.previewSelectedWindowIfNeeded()
                 }
             }
+        }
+    }
+
+    private func manuallyUpdateFocusOrderForDirectFocus() {
+        application.focusedWindow = self
+        Applications.frontmostPid = application.pid
+        App.lastFocusedTargetWid = cgWindowId
+        App.lastFocusedTargetPid = application.pid
+        App.lastFocusedTargetTime = CFAbsoluteTimeGetCurrent()
+        if let windows = Windows.updateLastFocusOrder(self) {
+            App.refreshOpenUiAfterExternalEvent(windows)
         }
     }
 
