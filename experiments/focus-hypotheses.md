@@ -10,6 +10,7 @@ Living decision log for the current AltTab performance/correctness work. Keep th
 | Synthetic hotkey tests are unsafe on the live Terminal session. | Standing rule | A hotkey-path probe switched back to Terminal while the user observed keystrokes being routed to the Terminal session. Even if the helper intends to post only modifier/tab events, global hotkeys are real input and can leak into the active app if AltTab/system handling differs from expectations. | Do not run global-hotkey probes against the user's active Terminal. Require explicit opt-in flags and an isolated test desktop/window. Prefer exact-focus and noninteractive samplers unless the user explicitly approves live hotkey input. |
 | Safari same-app switching is fast; cross-app Safari switching is slow. | Supported | User observation; CLI probes showed Safari window-to-window feels fast, while Terminal→Safari and Activity Monitor→Safari leave Safari frontmost in the menubar but not z0 for ~750-1500ms. | Treat Safari delay as cross-app WindowServer/z-order handoff, not Safari tab/window selection. |
 | Native Mac↔Mac focus is not blocked on AltTab queue contention. | Supported | `AXFOCUS queue` usually ~0.0-0.1ms; panel refresh logs around ~1ms; logging overhead around ~70us average. | Do not spend more time on locks/main-thread z-cache unless new evidence shows queue wait or refresh spikes. |
+| Instruments attach profiling is useful; all-process `xctrace` is not safe unattended here. | Supported | `xctrace record --template 'Time Profiler' --attach <AltTab pid>` captured clean data while CLI panel switches ran. `--all-processes` exceeded its 14s limit and had to be killed, likely due Instruments privilege/collection behavior. | Use attach traces for AltTab CPU/main-thread evidence. Avoid unattended all-process Instruments unless manually supervised. |
 | `CGSOrderWindow` is not a valid cross-process native-window fast path. | Supported | Native path call returned `cgsErr=1000`; web research also reports error 1000 when a process tries to order another app's window. It sometimes added tens of ms. | Do not put `CGSOrderWindow(..., above, 0)` in normal native Mac↔Mac focus. |
 | App-level activation/frontmost APIs can violate AltTab's per-window invariant. | Supported | `kAXFrontmost=true` experiment eventually raised many Safari windows; system app-level activation also raises app groups. AGENTS says this is a hard regression. | Do not use `NSRunningApplication.activate(.activateAllWindows)` or app-level `kAXFrontmost` for standard native focus. Restrict app-level frontmost recovery to Parallels-only cases. |
 | `CGSSetWindowLevel`/temporary level pin is not a reliable fix for Safari z-order delay. | Supported | Level pin returned success but did not make Safari z0 immediately; visible delay stayed hundreds of ms. | Do not rely on cross-process level pin for native Safari/Terminal switching. |
@@ -238,6 +239,22 @@ Living decision log for the current AltTab performance/correctness work. Keep th
   - OneNote→Safari z0 remained variable around 716.8 and 870.5ms in the later reps, with no flicker or sibling intrusion.
   - Outlook→Safari z0 was 391.9, 785.3, 165.5ms, with no flicker or sibling intrusion.
   - The focus API logs still finish in tens of milliseconds; remaining lag is WindowServer/Parallels/native app surfacing after focus, so the readiness-gated hide remains the important flicker prevention.
+
+### 2026-05-18 — Instruments attach profile
+
+- Ran `xcrun xctrace record --template 'Time Profiler' --attach <AltTab pid>` for 16s while executing safe CLI panel switches with Shift probing.
+- Trace files:
+  - `/tmp/alttab-profile/alttab-timeprof-20260518_153907.trace`
+  - `/tmp/alttab-profile/alttab-timeprof-20260518_153907-time-profile.xml`
+- Switches during the attached trace:
+  - Terminal→Safari z0: 210.1ms, no flicker/source reappear/sibling intrusion.
+  - Safari→Terminal z0: 424.5ms, no flicker/source reappear/sibling intrusion.
+- CPU samples showed expected work:
+  - main thread: panel build/layout/rendering (`App.refreshUi`, `TilesView.updateItemsAndLayout`, title/status drawing) plus some z-enforcement samples,
+  - background threads: AX brute-force window scans and z-cache `CGWindowListCopyWindowInfo` parsing,
+  - CLI thread: JSON encoding for evaluator commands.
+- The profile did not show focus waiting on a lock or a long synchronous main-thread focus block. This supports the earlier claim that remaining visible handoff delay is outside AltTab CPU execution.
+- Tried `xctrace --all-processes` for a WindowServer/Safari view, but it ran past its 14s limit and was killed. Do not repeat all-process Instruments unattended on this machine.
 
 ## Current Implementation Direction
 

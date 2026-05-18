@@ -520,3 +520,22 @@ corrections below the visible-fold reflect the user's expected order.
   - OneNote(132443)→Safari(125024) after target-only Par→Mac z repair: later reps reached target z0 at 716.8 and 870.5ms, no flicker/sibling intrusion.
   - Outlook(132442)→Safari(125024): 391.9, 785.3, 165.5ms, no flicker/sibling intrusion.
   - Conclusion: Par→Mac visible handoff remains variable, but the current readiness gate prevents the old-window flash; the remaining delay is downstream WindowServer/Parallels/app surfacing, not AltTab main-thread blocking.
+
+## 2026-05-18 — Instruments / xctrace profile
+
+- Ran an attached Instruments Time Profiler capture against live AltTab PID 87720:
+  - command shape: `xcrun xctrace record --template 'Time Profiler' --attach <pid> --time-limit 16s`,
+  - trace: `/tmp/alttab-profile/alttab-timeprof-20260518_153907.trace`,
+  - export: `/tmp/alttab-profile/alttab-timeprof-20260518_153907-time-profile.xml`.
+- Drove two safe CLI panel switches during the capture:
+  - Terminal(130253)→Safari(125024): first target z0 at 210.1ms; no post-z0 flicker, source reappear, or sibling intrusion.
+  - Safari(125024)→Terminal(130253): first target z0 at 424.5ms; no post-z0 flicker, source reappear, or sibling intrusion.
+- Aggregated Time Profiler samples:
+  - main thread had 367/1817 samples; top AltTab work was UI refresh/layout/rendering (`App.refreshUi`, `TilesView.updateItemsAndLayout`, `TilesView.resolveAutoSize`, `TileTitleView.draw`, `StatusIconsView.layoutIcons`) and some `Windows.enforceZOrder`/`captureTopZRanking`,
+  - background worker threads were dominated by AX brute-force window scans (`AXCallScheduler`, `Applications.manuallyUpdateWindows`, `AXUIElementRef.windowsByBruteForce`, `AXUIElementRef.attributes`) and z-cache `CGWindowListCopyWindowInfo` parsing,
+  - CLI evaluator requests showed JSON encoding work on `cliMessages`.
+- Interpretation:
+  - no evidence of lock contention or a long synchronous main-thread focus block during the measured switches,
+  - remaining visible handoff time is not AltTab CPU-bound in this profile,
+  - UI layout/render cost remains worth optimizing for show latency, but it is separate from the observed WindowServer/app z0 handoff delay.
+- Attempted an all-process Time Profiler run to include WindowServer/Safari/Terminal. It exceeded the requested 14s limit and had to be killed. Treat all-process Instruments as manually supervised only; do not use it in unattended test loops.
