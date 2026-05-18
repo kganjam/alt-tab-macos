@@ -385,47 +385,28 @@ class Window {
     /// that intermediate raise.
     ///
     /// `makeKeyWindow` (the Hammerspoon byte-blob fake-event trick) is
-    /// intentionally omitted — Parallels' event mirror reads the synthetic
-    /// events as a click back on the source Coherence window and immediately
-    /// re-raises. SLPS-with-wid alone is enough when the target is a
-    /// well-behaved macOS app.
+    /// intentionally omitted here. When the target is a multi-window app
+    /// like Terminal, the fake event can promote every sibling window in
+    /// that process above the Parallels source. `CGSOrderWindow` can't
+    /// repair that afterwards on current macOS (`err=1000`), so avoid
+    /// creating the sibling stack in the first place.
     private func focusMacOsWindowOverParallelsCoherence() {
         Diagnostics.log("FOCUS", "enter focusMacOsWindowOverParallelsCoherence target=\(debugId ?? "?")")
         guard let targetWid = cgWindowId else { return }
         Windows.armAltTabFocusGuard(for: self)
-        let transitionGeneration = Windows.parallelsTransitionGeneration
         var psn = ProcessSerialNumber()
         GetProcessForPID(application.pid, &psn)
-        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.noWindows.rawValue)
+        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
         Diagnostics.markSwitchPhase("slpsDone", extra: "parToMac")
-        makeKeyWindow(&psn)
-        Diagnostics.markSwitchPhase("makeKeyDone", extra: "parToMac")
-        let orderErr = CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, 0)
-        Diagnostics.markSwitchPhase("cgsOrderDone", extra: "err=\(orderErr.rawValue)")
-        Diagnostics.log("FOCUS", "Par→mac: SLPS(noWin)+makeKey+orderTop(wid=\(targetWid)) → \(orderErr == .success ? "OK" : "err=\(orderErr.rawValue)")")
+        try? axUiElement?.focusWindow()
+        Diagnostics.markSwitchPhase("axSyncDone", extra: "parToMac wid=\(targetWid)")
+        Diagnostics.log("FOCUS", "Par→mac: SLPS(userGenerated)+AX focus(wid=\(targetWid)) done")
         snapshotTopWindowsForParMac(label: "Par→mac+0ms", targetWid: targetWid)
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(30)) { [weak self] in
             self?.snapshotTopWindowsForParMac(label: "Par→mac+30ms", targetWid: targetWid)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
             self?.snapshotTopWindowsForParMac(label: "Par→mac+100ms", targetWid: targetWid)
-        }
-        BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
-            guard let self else { return }
-            let isCurrent = DispatchQueue.main.sync {
-                Windows.parallelsTransitionGeneration == transitionGeneration &&
-                    Windows.altTabFocusTarget?.cgWindowId == targetWid
-            }
-            guard isCurrent else { return }
-            Diagnostics.markSwitchPhase("axQueueEntry", extra: "parToMac")
-            if let appAx = self.application.axUiElement, let selfAx = self.axUiElement {
-                try? appAx.setAttribute(kAXFocusedWindowAttribute, selfAx)
-                let fmErr = AXUIElementSetAttributeValue(appAx, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
-                Diagnostics.log("FRONTMOSTSET", "Par→mac kAXFrontmost=true pid=\(self.application.pid) wid=\(targetWid) → \(fmErr == .success ? "OK" : "err=\(fmErr.rawValue)")")
-            }
-            try? self.axUiElement?.focusWindow()
-            Diagnostics.markSwitchPhase("axDone", extra: "parToMac wid=\(targetWid)")
-            Diagnostics.log("FOCUS", "Par→mac: AX raise(wid=\(targetWid)) done (async)")
         }
         manuallyUpdateFocusOrderForParallelsTransition()
     }

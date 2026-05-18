@@ -62,6 +62,9 @@ class Windows {
     private static func liveFrontmostWindow() -> Window? {
         let workspaceFrontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
         let frontPid = workspaceFrontPid ?? Applications.frontmostPid
+        if let guardedTarget = activeGuardedTarget(frontPid) {
+            return guardedTarget
+        }
         if let topZWindow = topKnownZOrderWindow(), topZWindow.application.pid == frontPid {
             return topZWindow
         }
@@ -74,6 +77,13 @@ class Windows {
         guard let frontPid,
               let app = Applications.list.first(where: { $0.pid == frontPid }) else { return nil }
         return app.focusedWindow
+    }
+
+    private static func activeGuardedTarget(_ frontPid: pid_t?) -> Window? {
+        guard CFAbsoluteTimeGetCurrent() < altTabFocusTargetUntil,
+              let target = altTabFocusTarget,
+              target.application.pid == frontPid else { return nil }
+        return target
     }
 
     private static func liveAxFocusedWindow(_ pid: pid_t?) -> Window? {
@@ -125,6 +135,8 @@ class Windows {
         weak var window: Window?
         var raiseAttempts: Int = 0
         var wasEverAtZ0: Bool = false
+        var expectedRestoreAttempts: Int = 0
+        var lastExpectedRestoreAt: CFAbsoluteTime = 0
         /// Snapshot of the top window-list z-order taken BEFORE we
         /// fired any focus call. Used to compute the *expected*
         /// post-focus order = [target] + preZ.filter{ != target }.
@@ -134,6 +146,7 @@ class Windows {
         /// activation.
         var preZRanking: [PreZEntry] = []
         static let maxRaiseAttempts = 6
+        static let maxExpectedRestoreAttempts = 6
     }
 
     struct PreZEntry {
@@ -360,8 +373,9 @@ class Windows {
         diagnoseFrontmostMismatch(targetWid: mostRecent.wid, targetPid: mostRecent.pid, atZ0: targetZPos == 0)
         if targetZPos == 0 {
             if !mostRecent.wasEverAtZ0 {
-                recentZOrderIntents[recentZOrderIntents.count - 1].wasEverAtZ0 = true
-                recentZOrderIntents[recentZOrderIntents.count - 1].raiseAttempts = 0
+                let intentIndex = recentZOrderIntents.count - 1
+                recentZOrderIntents[intentIndex].wasEverAtZ0 = true
+                recentZOrderIntents[intentIndex].raiseAttempts = 0
                 // Target just reached z0 for the first time this session.
                 // Some focus paths (`_SLPSSetFrontProcessWithOptions`,
                 // process activation) inadvertently bring multiple
@@ -373,7 +387,9 @@ class Windows {
                 // sibling that's now sandwiched ABOVE a non-target-app
                 // window is a regression introduced by our intervention
                 // → push it below the divider.
-                restoreExpectedZOrder(targetWid: mostRecent.wid, targetPid: mostRecent.pid, preZ: mostRecent.preZRanking)
+                restoreExpectedZOrderIfNeeded(intentIndex: intentIndex, force: true)
+            } else {
+                restoreExpectedZOrderIfNeeded(intentIndex: recentZOrderIntents.count - 1)
             }
         } else if targetZPos > 0 && sameAppBlockerWid != nil && mostRecent.wasEverAtZ0 {
             // Target was already at z0 once; an untracked same-app window
@@ -456,25 +472,36 @@ class Windows {
     /// Restore the *full* user-expected z-order after a focus call.
     /// Computes expected = [target] + (preZRanking minus target,
     /// preserving prior relative order). Then walks expected top→down
-    /// and pairwise-CGSOrderWindow's each entry to its expected slot —
-    /// this corrects ALL disagreements, not just same-app sibling
-    /// promotions. Without this, a process-level activation that pulls
-    /// multiple of target's app windows up will leave them above OTHER
-    /// apps that previously sat between them (the user's "messed up
-    /// window-level z-order" complaint).
+    /// and pairwise-CGSOrderWindow's each entry to its expected slot.
+    /// If WindowServer rejects those cross-process moves, fall back to
+    /// AX-raising the prior non-target app windows, then re-raise the
+    /// selected target. That demotes same-app siblings without reordering
+    /// every window in a large process like Terminal.
     ///
-    /// Runs ONCE per focus session, on the tick when target first
-    /// reaches z0. After that, ZENFORCE keeps target at z0 but doesn't
-    /// keep re-fighting natural app-driven z-order changes (modals,
-    /// dialogs, the user dragging a window forward).
+    /// Runs when the target first reaches z0, then re-checks for a few
+    /// bounded guard ticks. That covers delayed app-level sibling raises
+    /// without fighting natural app-driven z-order changes indefinitely.
     ///
     /// Skips windows that disappeared between snapshot and now, and
     /// windows that newly appeared (not in the snapshot — could be
     /// legitimate notifications, sheets, etc).
-    private static func restoreExpectedZOrder(targetWid: CGWindowID, targetPid: pid_t, preZ: [PreZEntry]) {
+    private static func restoreExpectedZOrderIfNeeded(intentIndex: Int, force: Bool = false) {
+        guard recentZOrderIntents.indices.contains(intentIndex) else { return }
+        let intent = recentZOrderIntents[intentIndex]
+        let now = CFAbsoluteTimeGetCurrent()
+        guard force || now - intent.lastExpectedRestoreAt > 0.25 else { return }
+        guard force || intent.expectedRestoreAttempts < ZOrderIntent.maxExpectedRestoreAttempts else { return }
+        recentZOrderIntents[intentIndex].lastExpectedRestoreAt = now
+        if restoreExpectedZOrder(targetWid: intent.wid, targetPid: intent.pid, preZ: intent.preZRanking) {
+            recentZOrderIntents[intentIndex].expectedRestoreAttempts += 1
+        }
+    }
+
+    @discardableResult
+    private static func restoreExpectedZOrder(targetWid: CGWindowID, targetPid: pid_t, preZ: [PreZEntry]) -> Bool {
         guard !preZ.isEmpty else {
             Diagnostics.log("ZRESTORE", "no preZ snapshot for target=#\(targetWid); skipping")
-            return
+            return false
         }
         // Build expected order: [target] + (preZ minus target)
         var expected: [PreZEntry] = []
@@ -490,6 +517,7 @@ class Windows {
         // Capture current actual order (just the wids in z-order).
         let actual = Self.captureTopZRanking()
         let actualWids = actual.map { $0.wid }
+        let actualWidSet = Set(actualWids)
         // Pre-summary line so we can compare expected vs actual at a
         // glance even before any corrections fire.
         let expSummary = expected.prefix(8).enumerated().map { "z\($0.0)=#\($0.1.wid) \($0.1.owner.prefix(10))" }.joined(separator: " | ")
@@ -500,6 +528,7 @@ class Windows {
         // ZENFORCE — don't touch it here, the relativeTo-0 .above call
         // is what ZENFORCE already does.
         var corrections = 0
+        var failures = 0
         var prevWid: CGWindowID = targetWid
         for entry in expected.dropFirst() {
             // Skip if this window is no longer visible.
@@ -516,12 +545,43 @@ class Windows {
                                      CGSWindowOrderingMode.below.rawValue, prevWid)
             Diagnostics.log("ZRESTORE", "place #\(entry.wid) \(entry.owner.prefix(15)) below #\(prevWid) → \(err == .success ? "OK" : "err=\(err.rawValue)")")
             corrections += 1
+            if err != .success { failures += 1 }
             prevWid = entry.wid
         }
         if corrections == 0 {
             Diagnostics.log("ZRESTORE", "no corrections needed (z-order matches expected) for target=#\(targetWid)")
         } else {
             Diagnostics.log("ZRESTORE", "applied \(corrections) corrections for target=#\(targetWid)")
+        }
+        if failures > 0 {
+            queueExpectedZOrderAxRestore(targetWid: targetWid, targetPid: targetPid, expected: expected, actualWidSet: actualWidSet, generation: zOrderEnforcementGeneration)
+        }
+        return corrections > 0
+    }
+
+    private static func queueExpectedZOrderAxRestore(targetWid: CGWindowID, targetPid: pid_t, expected: [PreZEntry], actualWidSet: Set<CGWindowID>, generation: UInt64) {
+        guard let targetWindow = list.first(where: { $0.cgWindowId == targetWid }),
+              !targetWindow.application.isParallelsCoherence else { return }
+        let windowsToRaise = expected.prefix(24).compactMap { entry -> (Window, CGWindowID)? in
+            guard entry.wid != targetWid,
+                  entry.pid != targetPid,
+                  actualWidSet.contains(entry.wid),
+                  let window = list.first(where: { $0.cgWindowId == entry.wid }) else { return nil }
+            return (window, entry.wid)
+        }
+        guard !windowsToRaise.isEmpty else { return }
+        Diagnostics.log("ZRESTORE", "CGS failed; AX reverse-restore \(windowsToRaise.count) non-target windows before target=#\(targetWid)")
+        BackgroundWork.accessibilityCommandsQueue.addOperation { [weak targetWindow] in
+            let isCurrent = DispatchQueue.main.sync {
+                zOrderEnforcementGeneration == generation && recentZOrderIntents.last?.wid == targetWid
+            }
+            guard isCurrent else { return }
+            for (window, wid) in windowsToRaise.reversed() {
+                try? window.axUiElement?.focusWindow()
+                Diagnostics.log("ZRESTORE", "AX restore raised #\(wid)")
+            }
+            try? targetWindow?.axUiElement?.focusWindow()
+            Diagnostics.log("ZRESTORE", "AX restore raised target #\(targetWid)")
         }
     }
 
