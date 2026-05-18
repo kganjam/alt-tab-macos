@@ -78,10 +78,21 @@ class Window {
 
     deinit {
         Logger.info { self.debugId }
+        // AXObserverCreate + CFRunLoopAddSource pin the observer to the
+        // accessibility events runloop. Without explicit removal, the
+        // runloop source keeps a strong reference to the observer (which
+        // in turn back-references this Window's axUiElement and the
+        // notification callbacks). ARC can't reclaim any of it. Pair the
+        // observe with this teardown so closed windows release cleanly.
+        if let axObserver {
+            CFRunLoopRemoveSource(BackgroundWork.accessibilityEventsThread.runLoop,
+                                  AXObserverGetRunLoopSource(axObserver), .commonModes)
+        }
     }
 
     func updateFromAxAttributes(_ title: String?, _ size: CGSize?, _ position: CGPoint?, _ isFullscreen: Bool?, _ isMinimized: Bool?) {
         let newTitle = bestEffortTitle(title)
+        let geometryChanged = self.size != nil && size != nil && self.size != size
         self.title = newTitle
         self.size = size
         self.position = position
@@ -96,6 +107,21 @@ class Window {
             debugId = "\(application.debugId) (wid:\(wid) title:\(newTitle))"
         } else {
             debugId = "\(application.debugId) (title:\(newTitle))"
+        }
+        if geometryChanged {
+            invalidateThumbnail()
+        }
+    }
+
+    func invalidateThumbnail() {
+        thumbnail = nil
+        guard App.appIsBeingUsed,
+              let view = (TilesView.recycledViews.first { $0.window_?.cgWindowId == cgWindowId }),
+              !view.thumbnail.isHidden else { return }
+        if let icon {
+            view.thumbnail.updateContents(.cgImage(icon), TileView.thumbnailSize(icon.size(), true))
+        } else {
+            view.thumbnail.releaseImage()
         }
     }
 
@@ -266,12 +292,24 @@ class Window {
             // to that space, but quickly switches back to another window
             // in that space. Reproducible via Dock-icon click → it's an
             // OS bug, not threading-related.
+            let wasAlreadyFrontmost = Applications.frontmostPid == application.pid ||
+                NSWorkspace.shared.frontmostApplication?.processIdentifier == application.pid
             var psn = ProcessSerialNumber()
             GetProcessForPID(application.pid, &psn)
             _SLPSSetFrontProcessWithOptions(&psn, cgWindowId!, SLPSMode.userGenerated.rawValue)
             Diagnostics.markSwitchPhase("slpsDone")
             makeKeyWindow(&psn)
             Diagnostics.markSwitchPhase("makeKeyDone")
+            let orderErr = CGSOrderWindow(CGS_CONNECTION, cgWindowId!, CGSWindowOrderingMode.above.rawValue, 0)
+            Diagnostics.markSwitchPhase("cgsOrderDone", extra: "err=\(orderErr.rawValue)")
+            if wasAlreadyFrontmost && orderErr != .success {
+                try? axUiElement!.focusWindow()
+                Diagnostics.markSwitchPhase("axSyncDone", extra: "wid=\(cgWindowId ?? 0)")
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
+                    Windows.previewSelectedWindowIfNeeded()
+                }
+                return
+            }
             BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
                 guard let self else { return }
                 Diagnostics.markSwitchPhase("axQueueEntry")
@@ -341,23 +379,72 @@ class Window {
         Diagnostics.log("FOCUS", "enter focusMacOsWindowOverParallelsCoherence target=\(debugId ?? "?")")
         guard let targetWid = cgWindowId else { return }
         Windows.armAltTabFocusGuard(for: self)
+        let transitionGeneration = Windows.parallelsTransitionGeneration
         var psn = ProcessSerialNumber()
         GetProcessForPID(application.pid, &psn)
-        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
+        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.noWindows.rawValue)
+        Diagnostics.markSwitchPhase("slpsDone", extra: "parToMac")
         makeKeyWindow(&psn)
-        Diagnostics.log("API", "Par→mac: SLPS+makeKey(wid=\(targetWid))")
-        // AX `focusWindow()` is synchronous AX RPC with a 1s timeout; if the
-        // target app is inactive (Safari WebApps especially), this blocks the
-        // main thread for hundreds of ms — the panel freezes, queued
-        // keystrokes fire late, and Parallels' coherence reconciliation can
-        // win the z-order race during the freeze. SLPS-with-wid already
-        // raised the target; this AX raise is supplementary, so safe to
-        // run off-thread.
+        Diagnostics.markSwitchPhase("makeKeyDone", extra: "parToMac")
+        let orderErr = CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, 0)
+        Diagnostics.markSwitchPhase("cgsOrderDone", extra: "err=\(orderErr.rawValue)")
+        Diagnostics.log("FOCUS", "Par→mac: SLPS(noWin)+makeKey+orderTop(wid=\(targetWid)) → \(orderErr == .success ? "OK" : "err=\(orderErr.rawValue)")")
+        snapshotTopWindowsForParMac(label: "Par→mac+0ms", targetWid: targetWid)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(30)) { [weak self] in
+            self?.snapshotTopWindowsForParMac(label: "Par→mac+30ms", targetWid: targetWid)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
+            self?.snapshotTopWindowsForParMac(label: "Par→mac+100ms", targetWid: targetWid)
+        }
         BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
-            try? self?.axUiElement?.focusWindow()
-            Diagnostics.log("API", "Par→mac: AX raise(wid=\(targetWid)) done")
+            guard let self else { return }
+            let isCurrent = DispatchQueue.main.sync {
+                Windows.parallelsTransitionGeneration == transitionGeneration &&
+                    Windows.altTabFocusTarget?.cgWindowId == targetWid
+            }
+            guard isCurrent else { return }
+            Diagnostics.markSwitchPhase("axQueueEntry", extra: "parToMac")
+            if let appAx = self.application.axUiElement, let selfAx = self.axUiElement {
+                try? appAx.setAttribute(kAXFocusedWindowAttribute, selfAx)
+                let fmErr = AXUIElementSetAttributeValue(appAx, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+                Diagnostics.log("FRONTMOSTSET", "Par→mac kAXFrontmost=true pid=\(self.application.pid) wid=\(targetWid) → \(fmErr == .success ? "OK" : "err=\(fmErr.rawValue)")")
+            }
+            try? self.axUiElement?.focusWindow()
+            Diagnostics.markSwitchPhase("axDone", extra: "parToMac wid=\(targetWid)")
+            Diagnostics.log("FOCUS", "Par→mac: AX raise(wid=\(targetWid)) done (async)")
         }
         manuallyUpdateFocusOrderForParallelsTransition()
+    }
+
+    /// Diagnostic: top-8 z-order with per-window owner+wid+level. Lets us
+    /// see exactly which app's windows surface above the target after a
+    /// Par→Mac transition. Same shape as ZENFORCE's SYSZ but at .info
+    /// level so it shows up at default log level, scoped to this path.
+    private func snapshotTopWindowsForParMac(label: String, targetWid: CGWindowID) {
+        guard Diagnostics.shouldLog("PARMAC") else { return }
+        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let info = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return }
+        let skip: Set<String> = ["Window Server", "Control Center", "Dock", "AltTab", "Notification Center", "SystemUIServer", "Spotlight", "Menubar", "Wallpaper", "CursorUIViewService", "LocalAuthenticationRemoteService"]
+        var rows = [String]()
+        var pos = 0
+        var targetPos = -1
+        var siblingCount = 0
+        let targetOwner = application.bundleIdentifier ?? "?"
+        for w in info {
+            let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
+            if skip.contains(owner) { continue }
+            let wid = CGWindowID((w[kCGWindowNumber as String] as? Int) ?? 0)
+            let layer = (w[kCGWindowLayer as String] as? Int) ?? 0
+            let name = (w[kCGWindowName as String] as? String) ?? ""
+            if pos < 8 { rows.append("z\(pos)=#\(wid) Lv\(layer) \(owner.prefix(10)):\(name.prefix(15))") }
+            if wid == targetWid { targetPos = pos }
+            if owner == "Terminal" || (application.localizedName != nil && owner == application.localizedName!) {
+                siblingCount += 1
+            }
+            pos += 1
+            if pos >= 24 { break }
+        }
+        Diagnostics.log("PARMAC", "\(label) target=#\(targetWid)(\(targetOwner.suffix(20))) atZ=\(targetPos) sameAppCount=\(siblingCount) topZ=[\(rows.joined(separator: " | "))]")
     }
 
     /// Atomically pin the target to kCGScreenSaverWindowLevel AND set it as

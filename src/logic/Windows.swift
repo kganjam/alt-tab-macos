@@ -50,6 +50,50 @@ class Windows {
         setTargetAndSourceAsMostRecent(target: currentWindow, source: previousWindow)
     }
 
+    @discardableResult
+    static func syncFocusOrderWithLiveFrontmostWindow() -> CGWindowID? {
+        guard let window = liveFrontmostWindow() else { return nil }
+        window.application.focusedWindow = window
+        Applications.frontmostPid = window.application.pid
+        _ = updateLastFocusOrder(window)
+        return window.cgWindowId
+    }
+
+    private static func liveFrontmostWindow() -> Window? {
+        let workspaceFrontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let frontPid = workspaceFrontPid ?? Applications.frontmostPid
+        if let topZWindow = topKnownZOrderWindow(), topZWindow.application.pid == frontPid {
+            return topZWindow
+        }
+        if let axWindow = liveAxFocusedWindow(frontPid) {
+            return axWindow
+        }
+        if let topZWindow = topKnownZOrderWindow() {
+            return topZWindow
+        }
+        guard let frontPid,
+              let app = Applications.list.first(where: { $0.pid == frontPid }) else { return nil }
+        return app.focusedWindow
+    }
+
+    private static func liveAxFocusedWindow(_ pid: pid_t?) -> Window? {
+        guard let pid,
+              let app = Applications.list.first(where: { $0.pid == pid }),
+              let appAxElement = app.axUiElement,
+              let focusedAxElement = try? appAxElement.attributes([kAXFocusedWindowAttribute]).focusedWindow,
+              let focusedWid = try? focusedAxElement.cgWindowId() else { return nil }
+        return list.first { $0.isEqualRobust(focusedAxElement, focusedWid) }
+    }
+
+    private static func topKnownZOrderWindow() -> Window? {
+        for entry in captureTopZRanking(maxCount: 24) {
+            if let window = list.first(where: { $0.cgWindowId == entry.wid }) {
+                return window
+            }
+        }
+        return nil
+    }
+
     /// Set `target` to lastFocusOrder 0 AND `source` (if provided) to 1,
     /// with all other windows shifted to 2, 3, … preserving their
     /// relative recency. Used for Parallels-involved transitions where
@@ -135,6 +179,7 @@ class Windows {
     static var recentZOrderIntents = [ZOrderIntent]()
     private static var zOrderEnforcementTimer: DispatchSourceTimer?
     private static var zOrderEnforcementGeneration: UInt64 = 0
+    private static var queuedAxRecoveryWids = Set<CGWindowID>()
 
     static func armAltTabFocusGuard(for target: Window) {
         altTabFocusTarget = target
@@ -377,22 +422,34 @@ class Windows {
                 // as before.
                 _SLPSSetFrontProcessWithOptions(&psn, mostRecent.wid, SLPSMode.noWindows.rawValue)
                 window.makeKeyWindow(&psn)
-                if let appAx = window.application.axUiElement,
-                   let selfAx = window.axUiElement {
-                    try? appAx.setAttribute(kAXFocusedWindowAttribute, selfAx)
-                    // Belt-and-suspenders kAXFrontmost setter: forces
-                    // app-level AX frontmost flag along with the
-                    // window-level kAXFocusedWindow. Without this, a
-                    // stale source app can keep claiming AX frontmost
-                    // even though SLPS moved the process state.
-                    let fmErr = AXUIElementSetAttributeValue(appAx, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
-                    Diagnostics.log("FRONTMOSTSET", "ZENFORCE recovery kAXFrontmost=true pid=\(mostRecent.pid) wid=\(mostRecent.wid) → \(fmErr == .success ? "OK" : "err=\(fmErr.rawValue)")")
-                }
-                try? window.axUiElement?.performAction(kAXRaiseAction as String)
-                Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), SLPS+makeKey+setFocused+raise #\(attempt)/\(ZOrderIntent.maxRaiseAttempts)")
+                queueAxRecovery(for: window, wid: mostRecent.wid, pid: mostRecent.pid, attempt: attempt, generation: zOrderEnforcementGeneration)
+                Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), SLPS+makeKey queued AX recovery #\(attempt)/\(ZOrderIntent.maxRaiseAttempts)")
             }
         } else {
             Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) not found in z-order (offscreen?)")
+        }
+    }
+
+    private static func queueAxRecovery(for window: Window, wid: CGWindowID, pid: pid_t, attempt: Int, generation: UInt64) {
+        guard !queuedAxRecoveryWids.contains(wid) else { return }
+        queuedAxRecoveryWids.insert(wid)
+        BackgroundWork.accessibilityCommandsQueue.addOperation { [weak window] in
+            defer {
+                DispatchQueue.main.async {
+                    queuedAxRecoveryWids.remove(wid)
+                }
+            }
+            let isCurrent = DispatchQueue.main.sync {
+                zOrderEnforcementGeneration == generation && recentZOrderIntents.last?.wid == wid
+            }
+            guard isCurrent, let window else { return }
+            if let appAx = window.application.axUiElement, let selfAx = window.axUiElement {
+                try? appAx.setAttribute(kAXFocusedWindowAttribute, selfAx)
+                let fmErr = AXUIElementSetAttributeValue(appAx, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+                Diagnostics.log("FRONTMOSTSET", "ZENFORCE recovery kAXFrontmost=true pid=\(pid) wid=\(wid) → \(fmErr == .success ? "OK" : "err=\(fmErr.rawValue)")")
+            }
+            try? window.axUiElement?.performAction(kAXRaiseAction as String)
+            Diagnostics.log("ZENFORCE", "AX recovery done wid=\(wid) attempt #\(attempt)")
         }
     }
 
@@ -478,6 +535,7 @@ class Windows {
     /// consecutive identical alignment states (same target/z0/axFoc).
     private static var lastZAlignSignature: String = ""
     private static func logZAlignment(target: CGWindowID, z0Wid: CGWindowID?, z0Label: String) {
+        guard Diagnostics.shouldLog("ZALIGN") else { return }
         let nsApp = NSWorkspace.shared.frontmostApplication
         let frontPid = nsApp?.processIdentifier
         let frontApp = nsApp?.localizedName ?? "?"
@@ -913,6 +971,10 @@ class Windows {
         }
     }
 
+    static func invalidateThumbnails(_ windows: [Window] = list) {
+        windows.forEach { $0.invalidateThumbnail() }
+    }
+
     static func refreshWhichWindowsToShowTheUser() {
         if Preferences.onlyShowApplications() {
             // Group windows by application and select the optimal main window
@@ -1320,6 +1382,22 @@ class Windows {
         }
         if addWindowlessWindowIfNeeded {
             windows.forEach { $0.application.addWindowlessWindowIfNeeded() }
+        }
+        // Clear orphaned TileViews. `recycledViews` is append-only — it
+        // grows to peak window count and never shrinks. Now that `list`
+        // is shorter, indices `[list.count, recycledViews.count)` keep a
+        // strong `window_` reference to the Window we just removed, plus
+        // an IOSurface in the thumbnail layer's `contents`. Both pin the
+        // Window alive (preventing its `thumbnail: CALayerContents?`
+        // from releasing too) and pile up across hours of churn —
+        // observed as ~370 MB unique footprint + 700+ IOSurface regions
+        // after a 30-hour session. Releasing the orphans here is what
+        // actually frees the chain. (Window.deinit then runs and tears
+        // down the AX observer; see deinit comment.)
+        for i in list.count..<TilesView.recycledViews.count {
+            let view = TilesView.recycledViews[i]
+            view.window_ = nil
+            view.thumbnail.releaseImage()
         }
         lastFocusedWindowTarget = getLastFocusedOrderWindowIndex().map { list[$0].id }
         App.refreshOpenUiAfterExternalEvent([], windowRemoved: true)

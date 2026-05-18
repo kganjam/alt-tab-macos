@@ -6,6 +6,14 @@ class WindowCaptureScreenshots {
     // SCShareableContent.getExcludingDesktopWindows is expensive for the OS; we cache as much as possible
     static var cachedSCWindows = [SCWindow]()
 
+    static func invalidateCache() {
+        cachedSCWindows.removeAll(keepingCapacity: true)
+    }
+
+    private static func invalidateCache(_ wid: CGWindowID) {
+        cachedSCWindows.removeAll { $0.windowID == wid }
+    }
+
     static func oneTimeScreenshots(_ windowsToScreenshot: [Window], _ source: RefreshCausedBy) {
         let windows = windowsToScreenshot.compactMap { $0.cgWindowId }
         guard !windows.isEmpty else { return }
@@ -65,7 +73,14 @@ class WindowCaptureScreenshots {
         ActiveWindowCaptures.increment()
         SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { sampleBuffer, error in
             ActiveWindowCaptures.decrement()
-            guard let sampleBuffer, error == nil else { Logger.error { "\(window.debugId) \(sampleBuffer == nil) \(error)" }; return }
+            guard let sampleBuffer, error == nil else {
+                Logger.error { "\(window.debugId) \(sampleBuffer == nil) \(error)" }
+                BackgroundWork.screenshotsQueue.addOperation {
+                    invalidateCache(scWindow.windowID)
+                    WindowCaptureScreenshotsPrivateApi.oneTimeScreenshots([window], source)
+                }
+                return
+            }
             guard source != .refreshOnlyThumbnailsAfterShowUi || App.appIsBeingUsed else { return }
             let pixelBuffer: CVPixelBuffer? = sampleBuffer.pixelBuffer() ?? sampleBuffer.imageBuffer
             guard let pixelBuffer else { Logger.error { "\(window.debugId) no pixelBuffer" }; return }

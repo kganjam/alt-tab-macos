@@ -56,6 +56,9 @@ class Menubar {
         winsideToggle.target = App.self
         winsideToggle.state = Winside.isEnabled ? .on : .off
         overlayMenu.addItem(winsideToggle)
+        let flushPopupsItem = NSMenuItem(title: "Flush Stuck Permission Prompts", action: #selector(App.flushStuckAuthPopupsAction), keyEquivalent: "")
+        flushPopupsItem.target = App.self
+        overlayMenu.addItem(flushPopupsItem)
         let parallelsItem = NSMenuItem(title: "Parallels Mode", action: nil, keyEquivalent: "")
         parallelsItem.submenu = overlayMenu
         menu.addItem(parallelsItem)

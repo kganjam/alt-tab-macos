@@ -7,6 +7,7 @@ IDEWorkspaceChecks.plist
 /node_modules/
 /DerivedData/
 /build/
+/dev/
 .DS_Store
 /docs/_site/
 /docs/vendor/

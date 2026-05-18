@@ -12,6 +12,65 @@ class SystemPermissions {
         timer.setEventHandler(handler: checkPermissionsOnTimer)
         setImmediateTimer()
         timer.resume()
+        startStuckAuthPopupWatcher()
+    }
+
+    // MARK: - Stuck-popup watcher
+    //
+    // Background: when AltTab's TCC entries are in a fragmented state
+    // (multiple stale code-signature hashes, or cleared mid-launch), tccd
+    // can queue many "AltTab would like to control your computer using
+    // accessibility features" prompts via UserNotificationCenter. Each
+    // prompt is a separate window, and they pile up because the user
+    // can't dismiss them fast enough — visible as 50–90 stacked dialogs
+    // intercepting clicks. The right long-term fix is upstream (don't
+    // queue them in the first place). This watcher is the safety net:
+    // if more than `flushStuckAuthPopupsThreshold` UserNotificationCenter
+    // windows are onscreen, kill the daemons. macOS respawns them with
+    // an empty queue. Other apps' pending prompts get cleared too, but
+    // those clients re-request when they next hit a TCC API, so the
+    // user only loses an immediate request — not a granted permission.
+    private static var stuckPopupTimer: DispatchSourceTimer?
+
+    static var flushStuckAuthPopupsThreshold: Int {
+        // 0 = disabled; otherwise auto-flush when count > threshold
+        let v = UserDefaults.standard.object(forKey: "flushStuckAuthPopupsThreshold") as? Int
+        return v ?? 1
+    }
+
+    static func startStuckAuthPopupWatcher() {
+        guard stuckPopupTimer == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: BackgroundWork.permissionsCheckOnTimerQueue.strongUnderlyingQueue)
+        t.schedule(deadline: .now() + 10, repeating: 10, leeway: .seconds(1))
+        t.setEventHandler {
+            let n = countUserNotificationCenterWindows()
+            let threshold = flushStuckAuthPopupsThreshold
+            if threshold > 0 && n > threshold {
+                Diagnostics.log("AUTHCHECK", "stuck-popup detection: \(n) UserNotificationCenter windows on screen (> threshold \(threshold)); flushing")
+                Logger.error { "Detected \(n) stuck auth popups; flushing UserNotificationCenter" }
+                flushStuckAuthPopups()
+            } else if n >= 1 {
+                Diagnostics.log("AUTHCHECK", "UserNotificationCenter windows: \(n) (threshold=\(threshold))")
+            }
+        }
+        t.resume()
+        stuckPopupTimer = t
+    }
+
+    static func countUserNotificationCenterWindows() -> Int {
+        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let info = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return 0 }
+        return info.reduce(0) { count, w in
+            let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
+            return count + (owner == "UserNotificationCenter" ? 1 : 0)
+        }
+    }
+
+    static func flushStuckAuthPopups() {
+        // Use the older `launchedProcess` API; the project's
+        // MACOSX_DEPLOYMENT_TARGET is 10.12 which predates `Process.run()`.
+        Process.launchedProcess(launchPath: "/usr/bin/killall",
+                                arguments: ["UserNotificationCenter", "usernotificationsd"])
     }
 
     private static func checkPermissionsOnTimer() {
@@ -51,7 +110,21 @@ class SystemPermissions {
             DispatchQueue.main.async {
                 App.showPermissionsWindow()
             }
+            // Re-arm the timer so we keep polling for the permission flip.
+            // Original code left the timer at `.never` after a single
+            // immediate fire — meaning if the very first AX check returned
+            // "not granted" (or, post-timeout-fix, returned the lastKnown
+            // fallback), AltTab would silently never re-check, the
+            // PermissionsWindow would sit there forever, and Cmd-Tab would
+            // never start working even after the user grants. Schedule
+            // a 1s follow-up so the next tick can pick up a granted state.
+            setShortRetryTimer()
         }
+    }
+
+    private static func setShortRetryTimer() {
+        timerIsFrequent = false
+        timer.schedule(deadline: .now() + 1, repeating: .never, leeway: .milliseconds(500))
     }
 
     private static func checkPermissionsPostStartup() {
@@ -79,6 +152,12 @@ class SystemPermissions {
 
 class AccessibilityPermission {
     static var status = PermissionStatus.notGranted
+    // Last-known status, used as a fallback when the AX trust check
+    // hangs (see `detect`). On a fresh process this starts at
+    // `.notGranted`; once we successfully probe a "granted" result, we
+    // remember it and serve it on subsequent timeouts so init
+    // (continueAppLaunchAfterPermissionsAreGranted) doesn't deadlock.
+    private static var lastKnownStatus: PermissionStatus = .notGranted
 
     @discardableResult
     static func update() -> PermissionStatus {
@@ -87,7 +166,38 @@ class AccessibilityPermission {
     }
 
     private static func detect() -> PermissionStatus {
-        return AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeRetainedValue(): false] as CFDictionary) ? .granted : .notGranted
+        // AXIsProcessTrustedWithOptions(prompt:false) is documented as
+        // a quick local check, but in practice (observed 2026-05-08)
+        // can hang indefinitely against a tccd that is mid-cache-flush
+        // — e.g. right after `tccutil reset` + `notifyutil` storms or
+        // a tccd kill. Because the permissions timer was scheduled
+        // single-shot (`repeating: .never`) and only re-armed *after*
+        // a successful check, a single hung call wedged init: the
+        // hotkey was never registered and Cmd-Tab silently did nothing.
+        // Wrap the call in the same `runWithTimeout` pattern we
+        // already use for the Screen-Recording probe so a hung
+        // tccd at most stalls one tick — not the whole app.
+        return runAxTrustedCheckWithTimeout()
+    }
+
+    private static func runAxTrustedCheckWithTimeout() -> PermissionStatus {
+        let semaphore = DispatchSemaphore(value: 0)
+        var trusted = false
+        var completed = false
+        BackgroundWork.permissionsSystemCallsQueue.addOperation {
+            trusted = AXIsProcessTrustedWithOptions(
+                [kAXTrustedCheckOptionPrompt.takeRetainedValue(): false] as CFDictionary)
+            completed = true
+            semaphore.signal()
+        }
+        let waitResult = semaphore.wait(timeout: .now() + 3)
+        if waitResult == .timedOut || !completed {
+            Logger.error { "AXIsProcessTrustedWithOptions timed out; falling back to lastKnown=\(lastKnownStatus)" }
+            return lastKnownStatus
+        }
+        let next: PermissionStatus = trusted ? .granted : .notGranted
+        lastKnownStatus = next
+        return next
     }
 }
 
@@ -102,8 +212,20 @@ class ScreenRecordingPermission {
 
     private static func detect() -> PermissionStatus {
         if #available(macOS 10.15, *) {
-            return isGrantedOnSomeDisplay() ? .granted :
-                (Preferences.screenRecordingPermissionSkipped ? .skipped : .notGranted)
+            // Short-circuit when the user has explicitly skipped Screen
+            // Recording. The original code probed `isGrantedOnSomeDisplay()`
+            // first and only consulted the skip flag for the negative-result
+            // branch. That meant the expensive `SCShareableContent.getExcludingDesktopWindows`
+            // call still ran every 5 s on the permissions timer — and each
+            // call, when permission isn't clearly granted, queues a tccd
+            // prompt via UserNotificationCenter. With a 6 s call-timeout
+            // and a 5 s polling cadence, that produced ~12 prompts/min,
+            // stacking into 50–90 visible auth popups within minutes.
+            // Honor the skip flag up front so we never trigger that path.
+            if Preferences.screenRecordingPermissionSkipped {
+                return .skipped
+            }
+            return isGrantedOnSomeDisplay() ? .granted : .notGranted
         }
         return .granted
     }

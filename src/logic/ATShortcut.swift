@@ -3,6 +3,7 @@ import ShortcutRecorder
 
 class ATShortcut {
     static var lastEventIsARepeat = false
+    private static var didTriggerHoldShortcutRelease = false
     var shortcut: Shortcut
     var id: String
     var scope: ShortcutScope
@@ -79,6 +80,11 @@ class ATShortcut {
     func executeAction(_ isARepeat: Bool) {
         Logger.info { self.id }
         ATShortcut.lastEventIsARepeat = isARepeat
+        if id.hasPrefix("nextWindowShortcut") && triggerPhase == .down {
+            ATShortcut.didTriggerHoldShortcutRelease = false
+        } else if id.hasPrefix("holdShortcut") {
+            ATShortcut.didTriggerHoldShortcutRelease = true
+        }
         ControlsTab.executeAction(id)
     }
 
@@ -95,15 +101,9 @@ class ATShortcut {
                id == currentHoldShortcut.id {
                 let currentModifiers = cocoaToCarbonFlags(ModifierFlags.current)
                 if currentModifiers != (currentModifiers | (currentHoldShortcut.shortcut.carbonModifierFlags)) {
-                    // Safety net only: if matches() Path B already detected the
-                    // .up transition and fired executeAction this iteration,
-                    // `state` is already `.up` and we'd just be duplicating.
-                    // Without this guard, every normal Alt-release fires
-                    // focusTarget twice (once from matches(), once from here)
-                    // — caught downstream by the 200ms debounce, but waste.
-                    if currentHoldShortcut.state != .up {
+                    if !ATShortcut.didTriggerHoldShortcutRelease {
                         currentHoldShortcut.state = .up
-                        ControlsTab.executeAction(currentHoldShortcut.id)
+                        currentHoldShortcut.executeAction(false)
                     }
                 }
             }

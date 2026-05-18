@@ -110,6 +110,11 @@ class Logger {
     static func error(_ message: @escaping () -> Any?, file: String = #file, function: String = #function, line: Int = #line, context: Any? = nil) {}
 }
 
+class Diagnostics {
+    static func log(_ tag: String, _ message: @autoclosure () -> String) {}
+    static func startSwitchTiming(_ label: String) {}
+}
+
 class Preferences {
     static var shortcutStyle: ShortcutStylePreference = .focusOnRelease
     static var holdShortcut = ["⌥", "⌥", "⌥"]

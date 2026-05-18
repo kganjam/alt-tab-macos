@@ -121,6 +121,30 @@ class App: AppCenterApplication {
             return
         }
         didCallRestart = true
+        // Permission-aware suppression. Most restart() callers are
+        // "my CGEvent tap couldn't be created — try again from scratch."
+        // If the underlying cause is "TCC denied this cert hash for
+        // Input Monitoring / Accessibility", spawning a successor with
+        // `open -n` will hit the SAME wall, fail the same way, and
+        // queue ANOTHER tccd prompt via UserNotificationCenter — which
+        // lingers in the system queue even after the AltTab process
+        // exits. Observed symptom: dozens of stale "AltTab would like
+        // to control your computer using accessibility features"
+        // popups long after every AltTab pid is gone, with the queue
+        // only flushing when UserNotificationCenter is killed. Since
+        // a respawn won't recover, suppress the spawn entirely when
+        // AX is denied: stay running, show the permissions window,
+        // and let the user grant access in System Settings.
+        let axTrusted = AXIsProcessTrustedWithOptions(
+            [kAXTrustedCheckOptionPrompt.takeRetainedValue(): false] as CFDictionary)
+        if !axTrusted {
+            Logger.error { "restart() suppressed: AX denied; respawn would only queue another tccd prompt" }
+            DispatchQueue.main.async {
+                SystemPermissions.preStartupPermissionsPassed = false
+                App.showPermissionsWindow()
+            }
+            return
+        }
         let now = Date().timeIntervalSince1970
         if let attrs = try? FileManager.default.attributesOfItem(atPath: restartLockPath),
            let mtime = attrs[.modificationDate] as? Date {
@@ -324,6 +348,12 @@ class App: AppCenterApplication {
         let newValue = !Winside.isEnabled
         Winside.setEnabled(newValue)
         updateParallelsMenuStates()
+    }
+
+    @objc static func flushStuckAuthPopupsAction() {
+        let n = SystemPermissions.countUserNotificationCenterWindows()
+        Diagnostics.log("AUTHCHECK", "manual flush triggered; \(n) UserNotificationCenter windows on screen")
+        SystemPermissions.flushStuckAuthPopups()
     }
 
     private static func updateParallelsMenuStates() {
@@ -535,8 +565,8 @@ class App: AppCenterApplication {
         CGWarpMouseCursorPosition(point)
     }
 
-    static func refreshOpenUiAfterExternalEvent(_ windowsToScreenshot: [Window], windowRemoved: Bool = false) {
-        Windows.refreshThumbnailsAsync(windowsToScreenshot, .refreshUiAfterExternalEvent, windowRemoved: windowRemoved)
+    static func refreshOpenUiAfterExternalEvent(_ windowsToScreenshot: [Window], windowRemoved: Bool = false, source: RefreshCausedBy = .refreshUiAfterExternalEvent) {
+        Windows.refreshThumbnailsAsync(windowsToScreenshot, source, windowRemoved: windowRemoved)
         refreshOpenUiThrottler.throttleOrProceed {
             guard appIsBeingUsed else { return }
             if !Windows.updatesBeforeShowing() { hideUi(); return }
@@ -571,11 +601,11 @@ class App: AppCenterApplication {
             Diagnostics.log("SESSION", "new session shortcutIndex=\(shortcutIndex)")
             Diagnostics.logFrontmostSignals("session-start pre")
             Diagnostics.logTrackedRecency("session-start pre")
-            // Prefer the LIVE AX-based source of truth: current frontmost
-            // app + its focused window. This is kept current by
-            // AccessibilityEvents for mac→mac transitions AND by our
-            // manualUpdate for Parallels transitions. Fall back to
-            // lastFocusedTargetWid only if the live path returns nil.
+            // Prefer a live source of truth at session start. Some apps
+            // (Terminal in particular) can visually raise a same-process
+            // sibling without AltTab receiving the AX focus notification, so
+            // cached `Application.focusedWindow` can drift behind WindowServer.
+            // Sync from WindowServer/AX before building the list.
             //
             // Bug that motivated this order: lastFocusedTargetWid is
             // only set by our Parallels-involved paths. After a pure
@@ -583,6 +613,9 @@ class App: AppCenterApplication {
             // "current source" at next session start caused normalize
             // to promote the wrong window to position 0.
             let newSourceWid: CGWindowID? = {
+                if let wid = Windows.syncFocusOrderWithLiveFrontmostWindow() {
+                    return wid
+                }
                 if let pid = Applications.frontmostPid,
                    let app = (Applications.list.first { $0.pid == pid }),
                    let focused = app.focusedWindow {
@@ -965,4 +998,5 @@ extension App: NSApplicationDelegate {
 enum RefreshCausedBy {
     case refreshOnlyThumbnailsAfterShowUi
     case refreshUiAfterExternalEvent
+    case screenParametersChanged
 }

@@ -187,7 +187,8 @@ class Diagnostics {
         "SYSZ": .trace,
         "RECENCY": .trace,
         "SAMEAPP": .trace,
-        "ZALIGN": .trace,
+        "PARMAC": .verbose,
+        "ZALIGN": .verbose,
         "ZENFORCE": .trace,
         "ZRESTORE": .trace,
         "ZQUICK": .trace,
@@ -1215,6 +1216,33 @@ class Winside {
     private static let defaultsEnabledKey = "winsideHelperEnabled"
     private static let helperScriptHostPath = "\(NSHomeDirectory())/.alttab/winside-helper.ps1"
     private static let helperScriptGuestPath = #"\\Mac\Home\.alttab\winside-helper.ps1"#
+    // Tiny VBS launcher invoked via wscript.exe (GUI subsystem app, no
+    // console window). It re-launches powershell with WScript.Shell.Run
+    // intWindowStyle=0 (SW_HIDE), which means the spawned powershell
+    // process never has a visible console — no flash, no minimize
+    // animation. Direct `prlctl exec --current-user powershell` would
+    // create a visible console host first and only hide it once
+    // PowerShell processes -WindowStyle Hidden a few hundred ms in.
+    private static let helperLauncherHostPath = "\(NSHomeDirectory())/.alttab/winside-launcher.vbs"
+    private static let helperLauncherGuestPath = #"\\Mac\Home\.alttab\winside-launcher.vbs"#
+    // Precise kill script. Lives in the same .alttab dir so it's always
+    // available alongside the helper script. Targets ONLY powershell
+    // processes whose command line contains the FULL UNC path to
+    // winside-helper.ps1 — guarantees we don't kill anything else even
+    // if a user happens to be running another script also named
+    // winside-helper.ps1 from a different location.
+    private static let helperKillerHostPath = "\(NSHomeDirectory())/.alttab/winside-kill.ps1"
+    private static let helperKillerGuestPath = #"\\Mac\Home\.alttab\winside-kill.ps1"#
+    private static let helperStatusHostPath = "\(NSHomeDirectory())/.alttab/winside-status.json"
+    /// Native Windows GUI-subsystem launcher .exe. Spawns powershell with
+    /// CREATE_NO_WINDOW (native flag, neither WSH nor WMI expose it) →
+    /// helper has no console at all → Parallels Coherence has no window
+    /// to flash. Compiled by helper.ps1 on first run via Add-Type
+    /// -OutputType WindowsApplication. Once present, AltTab launches all
+    /// subsequent helpers/kills through this .exe instead of the
+    /// wscript+VBS+WMI(SW_HIDE) fallback (which has the flash).
+    private static let helperLauncherExeHostPath = "\(NSHomeDirectory())/.alttab/winside-launcher.exe"
+    private static let helperLauncherExeGuestPath = #"\\Mac\Home\.alttab\winside-launcher.exe"#
     private static let statusJsonPath = "\(NSHomeDirectory())/.alttab/winside-status.json"
     private static let vmName = "Windows 11"
     /// Serial queue so concurrent commands don't trample each other's
@@ -1441,15 +1469,7 @@ class Winside {
             restartInProgress = true
             Diagnostics.log("WINSIDE", "helper appears hung (\(consecutiveFailures) failures); killing + restarting")
             closeSocket("auto-restart")
-            // Kill any existing helper inside the guest, then re-launch.
-            let kill = Process()
-            kill.launchPath = "/bin/sh"
-            kill.arguments = [
-                "-c",
-                "/usr/local/bin/prlctl exec '\(vmName)' --current-user powershell -Command \"Get-WmiObject Win32_Process | Where-Object { $_.CommandLine -like '*winside-helper.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }\" 2>/dev/null"
-            ]
-            kill.launch()
-            kill.waitUntilExit()
+            killHelperInGuest(reason: "auto-restart after \(consecutiveFailures) failures")
             consecutiveFailures = 0
             restartInProgress = false
             // Re-launch via the public path so probe + log fire normally.
@@ -1467,7 +1487,13 @@ class Winside {
         task.launchPath = "/bin/sh"
         task.arguments = [
             "-c",
-            "nohup /usr/local/bin/prlctl exec '\(vmName)' --current-user powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File '\(helperScriptGuestPath)' >/tmp/alttab-winside-launch.log 2>&1 &"
+            { () -> String in
+                let useExe = FileManager.default.fileExists(atPath: helperLauncherExeHostPath)
+                let prefix = useExe
+                    ? "'\(helperLauncherExeGuestPath)'"
+                    : "wscript.exe '\(helperLauncherGuestPath)'"
+                return "nohup /usr/local/bin/prlctl exec '\(vmName)' --current-user \(prefix) '\(helperScriptGuestPath)' >/tmp/alttab-winside-launch.log 2>&1 &"
+            }()
         ]
         task.launch()
         task.waitUntilExit()
@@ -1489,11 +1515,15 @@ class Winside {
             return
         }
         queue.async {
-            // Make sure ~/.alttab and the helper script exist.
+            // Make sure ~/.alttab and the helper/launcher/kill scripts exist.
             ensureHelperScriptOnDisk()
-            if let resp = sendCommandSync("PING", timeoutSeconds: 1), resp.hasPrefix("PONG") {
-                Diagnostics.log("WINSIDE", "startIfNeeded: helper already healthy at \(lastKnownIp ?? "?"):\(port)")
-                return
+            // AltTab.stop() always kills the helper on exit, so a status
+            // file at startup means a previous AltTab crashed (orphaned
+            // helper). Kill defensively. With the native .exe launcher,
+            // both the kill and the new launch are flash-free.
+            if FileManager.default.fileExists(atPath: helperStatusHostPath) {
+                Diagnostics.log("WINSIDE", "startIfNeeded: orphaned status file at startup — killing prior helper")
+                killHelperInGuest(reason: "orphan from prior AltTab crash")
             }
             Diagnostics.log("WINSIDE", "startIfNeeded: launching helper via prlctl exec")
             let task = Process()
@@ -1503,7 +1533,13 @@ class Winside {
             // call returns immediately.
             task.arguments = [
                 "-c",
-                "nohup /usr/local/bin/prlctl exec '\(vmName)' --current-user powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File '\(helperScriptGuestPath)' >/tmp/alttab-winside-launch.log 2>&1 &"
+                { () -> String in
+                let useExe = FileManager.default.fileExists(atPath: helperLauncherExeHostPath)
+                let prefix = useExe
+                    ? "'\(helperLauncherExeGuestPath)'"
+                    : "wscript.exe '\(helperLauncherGuestPath)'"
+                return "nohup /usr/local/bin/prlctl exec '\(vmName)' --current-user \(prefix) '\(helperScriptGuestPath)' >/tmp/alttab-winside-launch.log 2>&1 &"
+            }()
             ]
             task.launch()
             task.waitUntilExit()  // wait only for the shell, not the prlctl
@@ -1539,27 +1575,22 @@ class Winside {
         }
     }
 
-    /// Tell the helper to terminate. Best-effort; falls back to
-    /// taskkill if EXIT fails. Sync — caller may want to wait.
+    /// Called from applicationWillTerminate. Always kills the helper
+    /// in the guest so we never leave an orphaned PowerShell daemon
+    /// behind. With the native .exe launcher in place, the next AltTab
+    /// launch spawns a fresh helper without any visible window flash,
+    /// so kill-on-exit costs nothing visually.
     static func stop() {
         queue.sync {
             if let resp = sendCommandSync("EXIT", timeoutSeconds: 2) {
                 Diagnostics.log("WINSIDE", "stop: helper acknowledged → \(resp)")
                 closeSocket("after EXIT ack")
+                try? FileManager.default.removeItem(atPath: helperStatusHostPath)
                 return
             }
             closeSocket("after EXIT failure")
-            Diagnostics.log("WINSIDE", "stop: EXIT command failed; falling back to taskkill via prlctl exec")
-            // Fallback: kill any winside-helper.ps1 process inside the
-            // guest. Coarse but reliable.
-            let task = Process()
-            task.launchPath = "/bin/sh"
-            task.arguments = [
-                "-c",
-                "/usr/local/bin/prlctl exec '\(vmName)' --current-user powershell -Command \"Get-WmiObject Win32_Process | Where-Object { $_.CommandLine -like '*winside-helper.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }\" 2>/dev/null"
-            ]
-            task.launch()
-            task.waitUntilExit()
+            Diagnostics.log("WINSIDE", "stop: EXIT failed; falling back to precise kill")
+            killHelperInGuest(reason: "EXIT-failed fallback", timeoutSeconds: 3)
         }
     }
 
@@ -1697,22 +1728,164 @@ class Winside {
     /// Idempotent: write the embedded PS script to disk if missing or
     /// out-of-date. Source string is bundled here so AltTab.app is
     /// self-contained — no manual placement needed.
-    private static func ensureHelperScriptOnDisk() {
+    /// Returns true iff the helper script content on disk was changed
+    /// (or written for the first time). Caller uses this to decide
+    /// whether a running helper is stale and needs killing — if the
+    /// script bytes are unchanged, an existing healthy helper is
+    /// running our embedded version and we can re-use it without
+    /// the kill+launch flash cycle.
+    @discardableResult
+    private static func ensureHelperScriptOnDisk() -> Bool {
         let dir = "\(NSHomeDirectory())/.alttab"
         if !FileManager.default.fileExists(atPath: dir) {
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         }
-        let existing = (try? String(contentsOfFile: helperScriptHostPath, encoding: .utf8)) ?? ""
-        if existing == helperScriptSource {
-            return
+        var helperChanged = false
+        let existingScript = (try? String(contentsOfFile: helperScriptHostPath, encoding: .utf8)) ?? ""
+        if existingScript != helperScriptSource {
+            helperChanged = true
+            do {
+                try helperScriptSource.write(toFile: helperScriptHostPath, atomically: true, encoding: .utf8)
+                Diagnostics.log("WINSIDE", "wrote embedded helper script to \(helperScriptHostPath) (\(helperScriptSource.utf8.count) bytes)")
+            } catch {
+                Diagnostics.log("WINSIDE", "FAILED to write helper script: \(error)")
+            }
         }
-        do {
-            try helperScriptSource.write(toFile: helperScriptHostPath, atomically: true, encoding: .utf8)
-            Diagnostics.log("WINSIDE", "wrote embedded helper script to \(helperScriptHostPath) (\(helperScriptSource.utf8.count) bytes)")
-        } catch {
-            Diagnostics.log("WINSIDE", "FAILED to write helper script: \(error)")
+        let existingLauncher = (try? String(contentsOfFile: helperLauncherHostPath, encoding: .utf8)) ?? ""
+        if existingLauncher != helperLauncherSource {
+            do {
+                try helperLauncherSource.write(toFile: helperLauncherHostPath, atomically: true, encoding: .utf8)
+                Diagnostics.log("WINSIDE", "wrote embedded VBS launcher to \(helperLauncherHostPath) (\(helperLauncherSource.utf8.count) bytes)")
+            } catch {
+                Diagnostics.log("WINSIDE", "FAILED to write VBS launcher: \(error)")
+            }
+        }
+        let existingKiller = (try? String(contentsOfFile: helperKillerHostPath, encoding: .utf8)) ?? ""
+        if existingKiller != helperKillerSource {
+            do {
+                try helperKillerSource.write(toFile: helperKillerHostPath, atomically: true, encoding: .utf8)
+                Diagnostics.log("WINSIDE", "wrote embedded kill script to \(helperKillerHostPath) (\(helperKillerSource.utf8.count) bytes)")
+            } catch {
+                Diagnostics.log("WINSIDE", "FAILED to write kill script: \(error)")
+            }
+        }
+        return helperChanged
+    }
+
+    /// Run the embedded winside-kill.ps1 in the guest. Precisely targets
+    /// powershell processes running our helper script (matched by full
+    /// UNC path, not just filename). Invoked via the same hidden-launch
+    /// path as the helper itself (wscript+VBS+WMI with SW_HIDE) so the
+    /// kill script doesn't visibly flash a powershell console window
+    /// on the user's screen via Parallels Coherence. The "wait" arg
+    /// makes the VBS block until the kill script's powershell process
+    /// exits.
+    /// Bounded by `timeoutSeconds`. prlctl exec can take 10-20s; if the
+    /// caller is shutdown-time-sensitive (applicationWillTerminate has
+    /// ~5s before macOS forces SIGKILL), pass a short timeout and we'll
+    /// terminate the wait early. The kill itself runs to completion in
+    /// the guest regardless.
+    private static func killHelperInGuest(reason: String, timeoutSeconds: Double = 15) {
+        Diagnostics.log("WINSIDE", "killHelperInGuest (\(reason), timeout=\(timeoutSeconds)s): invoking winside-kill.ps1 (hidden) in '\(vmName)'")
+        ensureHelperScriptOnDisk()
+        let task = Process()
+        task.launchPath = "/bin/sh"
+        let useExe = FileManager.default.fileExists(atPath: helperLauncherExeHostPath)
+        let prefix = useExe
+            ? "'\(helperLauncherExeGuestPath)'"
+            : "wscript.exe '\(helperLauncherGuestPath)'"
+        task.arguments = [
+            "-c",
+            "/usr/local/bin/prlctl exec '\(vmName)' --current-user \(prefix) '\(helperKillerGuestPath)' wait 2>/tmp/alttab-winside-kill.log",
+        ]
+        task.launch()
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while task.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        if task.isRunning {
+            Diagnostics.log("WINSIDE", "killHelperInGuest: prlctl exec exceeded \(timeoutSeconds)s — terminating local wait (kill continues async in guest)")
+            task.terminate()
         }
     }
+
+    /// Generic VBS runner. Invoked via `wscript.exe` (GUI subsystem, no
+    /// console). Uses WMI Win32_Process.Create with
+    /// STARTUPINFO.wShowWindow=SW_HIDE so the powershell console is
+    /// created already-hidden — no visible flash, unlike
+    /// WScript.Shell.Run which hides AFTER creation.
+    /// Note: WMI's CreateFlags does NOT support CREATE_NO_WINDOW
+    /// (0x08000000) — only DEBUG_PROCESS, CREATE_SUSPENDED,
+    /// CREATE_SHARED_WOW_VDM, CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP.
+    /// Setting CREATE_NO_WINDOW returns ret=21 (Invalid Parameter).
+    /// SW_HIDE in STARTUPINFO is the closest we can get from VBS.
+    /// Usage: wscript winside-launcher.vbs <ps1-path> [wait]
+    ///   <ps1-path>  Full UNC/local path to the .ps1 script
+    ///   wait        Optional literal "wait" to block until the spawned
+    ///               powershell exits (used for the kill script; the
+    ///               helper launches async).
+    private static let helperLauncherSource = #"""
+    If WScript.Arguments.Count < 1 Then WScript.Quit 2
+    Dim scriptPath, waitFlag
+    scriptPath = WScript.Arguments(0)
+    waitFlag = False
+    ' VBScript And does NOT short-circuit; nested If avoids
+    ' "Subscript out of range" when Arguments(1) doesn't exist.
+    If WScript.Arguments.Count >= 2 Then
+        If LCase(WScript.Arguments(1)) = "wait" Then waitFlag = True
+    End If
+    On Error Resume Next
+    Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+    Set su = wmi.Get("Win32_ProcessStartup").SpawnInstance_
+    su.ShowWindow = 0
+    Dim pid
+    ret = wmi.Get("Win32_Process").Create("powershell -NoProfile -ExecutionPolicy Bypass -File """ & scriptPath & """", Null, su, pid)
+    If ret <> 0 Then WScript.Quit ret
+    If waitFlag Then
+        Do
+            Set procs = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE ProcessId=" & pid)
+            If procs.Count = 0 Then Exit Do
+            WScript.Sleep 100
+        Loop
+    End If
+    WScript.Quit 0
+    """#
+
+    /// Precise kill: only powershell.exe / pwsh.exe processes whose
+    /// command line contains the full UNC path to winside-helper.ps1.
+    /// CommandLine.Contains() avoids the wildcard / quote escaping
+    /// pitfalls of `-like '*...*'`. Uses Get-CimInstance (modern, faster)
+    /// with Get-WmiObject fallback for legacy PowerShell. Also removes
+    /// winside-status.json so a subsequent PING attempt from AltTab
+    /// doesn't see a stale "helper is alive" signal.
+    private static let helperKillerSource = #"""
+    if (-not $env:WINSIDE_HIDDEN_RUN) {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = "powershell"
+        $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+        $psi.CreateNoWindow = $true
+        $psi.UseShellExecute = $false
+        $psi.WindowStyle = "Hidden"
+        $psi.EnvironmentVariables["WINSIDE_HIDDEN_RUN"] = "1"
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $proc.WaitForExit()
+        exit $proc.ExitCode
+    }
+    $expected = '\\Mac\Home\.alttab\winside-helper.ps1'
+    $procs = $null
+    try {
+        $procs = Get-CimInstance Win32_Process -ErrorAction Stop
+    } catch {
+        $procs = Get-WmiObject Win32_Process
+    }
+    $procs |
+        Where-Object { ($_.Name -eq 'powershell.exe' -or $_.Name -eq 'pwsh.exe') -and $_.CommandLine -and $_.CommandLine.Contains($expected) } |
+        ForEach-Object {
+            Write-Output ("kill pid=" + $_.ProcessId + " cmd=" + $_.CommandLine)
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    Remove-Item '\\Mac\Home\.alttab\winside-status.json' -ErrorAction SilentlyContinue
+    """#
 
     /// Embedded source of `winside-helper.ps1`. Updated whenever the
     /// guest-side daemon needs to change. Keep in sync with the file
@@ -1722,6 +1895,63 @@ class Winside {
     private static let helperScriptSource = #"""
 ## winside-helper.ps1 — TCP daemon for fast Windows-side window control.
 ## Started by AltTab via prlctl exec; talks to host over TCP.
+##
+## SELF-REHIDE: on first entry, re-spawn ourselves via
+## [Diagnostics.Process]::Start with CreateNoWindow=$true. That uses the
+## native CREATE_NO_WINDOW flag (0x08000000) which prevents Windows
+## from allocating a console window at all — strictly stronger than
+## SW_HIDE (which the launching layer uses). WMI's Win32_Process.Create
+## doesn't expose CREATE_NO_WINDOW, so it can only hide an already-
+## created console; that brief "hidden but exists" state is what
+## Parallels Coherence flashes. Self-rehide eliminates the flash.
+if (-not $env:WINSIDE_HIDDEN_RUN) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "powershell"
+    $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    $psi.CreateNoWindow = $true
+    $psi.UseShellExecute = $false
+    $psi.WindowStyle = "Hidden"
+    $psi.EnvironmentVariables["WINSIDE_HIDDEN_RUN"] = "1"
+    [void][System.Diagnostics.Process]::Start($psi)
+    exit 0
+}
+
+## Compile winside-launcher.exe on first run if not present. This .exe
+## is GUI-subsystem (no console of its own) and uses CreateProcess via
+## ProcessStartInfo.CreateNoWindow=true to spawn powershell with the
+## native CREATE_NO_WINDOW flag — strictly stronger than wscript+VBS+
+## WMI(SW_HIDE) which only hides an already-allocated console.
+## We're running here in a CreateNoWindow process, so Add-Type's
+## inline csc.exe invocation is also invisible (no Coherence flash).
+$LauncherExe = '\\Mac\Home\.alttab\winside-launcher.exe'
+if (-not (Test-Path $LauncherExe)) {
+    try {
+        Add-Type -OutputType WindowsApplication -OutputAssembly $LauncherExe -TypeDefinition @"
+using System;
+using System.Diagnostics;
+public class L {
+    public static int Main(string[] args) {
+        if (args.Length < 1) return 1;
+        var psi = new ProcessStartInfo {
+            FileName = "powershell",
+            Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + args[0] + "\"",
+            CreateNoWindow = true,
+            UseShellExecute = false,
+            WindowStyle = ProcessWindowStyle.Hidden,
+        };
+        if (args.Length >= 2 && args[1] == "wait") {
+            var p = Process.Start(psi);
+            p.WaitForExit();
+            return p.ExitCode;
+        }
+        Process.Start(psi);
+        return 0;
+    }
+}
+"@
+    } catch {}
+}
+
 ## Wire protocol (line-based ASCII, \r\n or \n terminator):
 ##   PING                → PONG
 ##   FG                  → OK <hwnd> <pid> <title>
@@ -1827,6 +2057,12 @@ $endpoint = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, $Port)
 $listener = New-Object System.Net.Sockets.TcpListener -ArgumentList $endpoint
 try { $listener.Start() } catch { exit 1 }
 
+# Pre-warm: force JIT of the Add-Type'd C# stub by issuing one P/Invoke
+# call now. Without this, the FIRST request after cold start can take
+# 5-15s while csc.exe + JIT run, during which the client times out and
+# closes — leaving the helper stuck in ReadLine on a half-open socket.
+[WinSide]::GetForegroundWindow() | Out-Null
+
 Write-Status -Ip $ip -Port $Port -ProcessId $PID
 
 $shouldExit = $false
@@ -1834,7 +2070,14 @@ while (-not $shouldExit) {
     try {
         $client = $listener.AcceptTcpClient()
         $client.NoDelay = $true
+        # Fail-fast on dead/half-open clients: if a client connects but
+        # doesn't send a full line within 5s, ReadLine throws and we
+        # close + accept the next one. Without this, ANY misbehaving
+        # connection (e.g. host-side `nc` that closes early) wedges the
+        # helper in ReadLine forever and blocks all future PINGs.
+        $client.ReceiveTimeout = 5000
         $stream = $client.GetStream()
+        $stream.ReadTimeout = 5000
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
         $reader = New-Object System.IO.StreamReader($stream, $utf8NoBom)
         $writer = New-Object System.IO.StreamWriter($stream, $utf8NoBom)

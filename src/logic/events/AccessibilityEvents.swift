@@ -15,12 +15,18 @@ class AccessibilityEvents {
     private static func handleEvent(_ type: String, _ element: AXUIElement) throws {
         let pid = try element.pid()
         Logger.debug { "\(type) pid:\(pid)" }
-        if [kAXApplicationActivatedNotification, kAXApplicationHiddenNotification, kAXApplicationShownNotification].contains(type) {
+        if [kAXApplicationActivatedNotification, kAXApplicationHiddenNotification, kAXApplicationShownNotification, kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification].contains(type) {
             AXCallScheduler.shared.schedule(key: "pid-\(pid)", context: "(pid:\(pid))", pid: pid) {
                 try handleEventApp(type, pid, element)
             }
         } else {
             let wid = (try? element.cgWindowId()) ?? 0
+            if type == kAXWindowCreatedNotification && wid == 0 {
+                AXCallScheduler.shared.schedule(key: "pid-\(pid)", context: "(pid:\(pid))", pid: pid) {
+                    try handleEventApp(type, pid, element)
+                }
+                return
+            }
             guard wid != 0 || type == kAXUIElementDestroyedNotification,
                   wid != TilesPanel.shared.windowNumber else { return }
             if type == kAXUIElementDestroyedNotification {
@@ -37,16 +43,39 @@ class AccessibilityEvents {
     }
 
     private static func handleEventApp(_ type: String, _ pid: pid_t, _ element: AXUIElement) throws {
-        let appFocusedWindow = try element.attributes([kAXFocusedWindowAttribute]).focusedWindow
-        let wid = try appFocusedWindow?.cgWindowId()
+        if type == kAXApplicationHiddenNotification || type == kAXApplicationShownNotification || type == kAXWindowCreatedNotification {
+            DispatchQueue.main.async {
+                Applications.appListUpdateThrottler.throttleOrProceed(key: "\(pid)") {
+                    guard let app = Applications.findOrCreate(pid, false) else { return }
+                    Logger.info { "\(type) app:\(app.debugId)" }
+                    if type == kAXWindowCreatedNotification {
+                        Applications.manuallyUpdateWindows(app)
+                    } else {
+                        applicationHiddenOrShown(app, pid, type)
+                    }
+                }
+            }
+            return
+        }
+        let attributes = try element.attributes([kAXFocusedWindowAttribute, kAXMainWindowAttribute])
+        let appFocusedWindow = attributes.focusedWindow
+        let appFocusedWid = try appFocusedWindow?.cgWindowId()
+        let appMainWindow = attributes.mainWindow
+        let appMainWid = try appMainWindow?.cgWindowId()
+        if type == kAXFocusedWindowChangedNotification || type == kAXMainWindowChangedNotification {
+            DispatchQueue.main.async {
+                guard let app = Applications.findOrCreate(pid, false) else { return }
+                Logger.info { "\(type) app:\(app.debugId)" }
+                applicationFocusedOrMainWindowChanged(app, pid, type, appFocusedWindow, appFocusedWid, appMainWindow, appMainWid)
+            }
+            return
+        }
         DispatchQueue.main.async {
             Applications.appListUpdateThrottler.throttleOrProceed(key: "\(pid)") {
                 guard let app = Applications.findOrCreate(pid, false) else { return }
                 Logger.info { "\(type) app:\(app.debugId)" }
                 if type == kAXApplicationActivatedNotification {
-                    applicationActivated(app, pid, type, appFocusedWindow, wid)
-                } else if type == kAXApplicationHiddenNotification || type == kAXApplicationShownNotification {
-                    applicationHiddenOrShown(app, pid, type)
+                    applicationActivated(app, pid, type, appFocusedWindow, appFocusedWid)
                 }
             }
         }
@@ -105,6 +134,20 @@ class AccessibilityEvents {
         guard let clickedWindow = Windows.list.first(where: { $0.cgWindowId == Windows.lastMouseClickWid }),
               clickedWindow.application.isParallelsCoherence else { return }
         Windows.restoreFrontmostToTarget(targetWid: Windows.lastMouseClickWid, targetPid: Windows.lastMouseClickPid, frontPid: activatedPid, source: "XPROC", bypassThrottle: true)
+    }
+
+    private static func applicationFocusedOrMainWindowChanged(_ app: Application, _ pid: pid_t, _ type: String, _ appFocusedWindow: AXUIElement?, _ appFocusedWid: CGWindowID?, _ appMainWindow: AXUIElement?, _ appMainWid: CGWindowID?) {
+        guard app.runningApplication.isActive else { return }
+        Applications.frontmostPid = pid
+        let axWindow = appFocusedWindow ?? appMainWindow
+        let wid = appFocusedWid ?? appMainWid
+        guard let axWindow, let wid else {
+            app.focusedWindow = nil
+            return
+        }
+        AXCallScheduler.shared.schedule(key: "wid-\(wid)", context: "\(type) \(app.debugId))", pid: pid) {
+            try handleEventWindow(kAXFocusedWindowChangedNotification, wid, pid, axWindow)
+        }
     }
 
     private static func applicationHiddenOrShown(_ app: Application, _ pid: pid_t, _ type: String) {

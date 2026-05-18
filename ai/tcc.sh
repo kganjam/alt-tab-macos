@@ -92,9 +92,9 @@ upsert_one() {
         (service, client, client_type, auth_value, auth_reason, auth_version, csreq, flags, last_modified) \
         VALUES ('$svc', '$BUNDLE_ID', 0, 2, 4, 1, X'$csreq_hex', 0, $now);"
     if [[ -n "$sudo_prefix" ]]; then
-        $sudo_prefix sqlite3 "$db" "$sql" 2>&1
+        $sudo_prefix sqlite3 -cmd ".timeout 5000" "$db" "$sql" 2>&1
     else
-        sqlite3 "$db" "$sql" 2>&1
+        sqlite3 -cmd ".timeout 5000" "$db" "$sql" 2>&1
     fi
 }
 
@@ -103,6 +103,19 @@ cmd_grant() {
     local csreq_hex now
     csreq_hex=$(build_csreq_hex) || return 1
     now=$(date +%s)
+    # Drop any stale entries for our bundle id BEFORE writing fresh ones.
+    # Old entries may have a different csreq (from a previous code-sign
+    # cert) that shadow our new entry — observed in practice as
+    # repeated tccd prompts even after a successful grant. tccutil is
+    # the supported API for resetting per-(service, client) state.
+    echo "Resetting any stale TCC entries..."
+    for svc_short in Accessibility ScreenCapture PostEvent ListenEvent SystemPolicyAppBundles; do
+        tccutil reset "$svc_short" "$BUNDLE_ID" >/dev/null 2>&1 || true
+    done
+    # Brief settle so tccd releases its write lock on TCC.db before our
+    # UPSERTs run; otherwise sqlite3 hits SQLITE_BUSY ("database is
+    # locked") even with .timeout set, since tccd is mid-flush.
+    sleep 1
     echo "Upserting TCC entries (csreq=${#csreq_hex} hex chars, now=$now)"
     for svc in "${SERVICES[@]}"; do
         local err
@@ -119,6 +132,11 @@ cmd_grant() {
             echo "  system TCC: $svc FAILED: $err  (SIP usually blocks system-DB writes)"
         fi
     done
+    # Tell tccd to invalidate its in-memory cache so the rows we just
+    # wrote take effect for the next AX/SC call. Without this, tccd may
+    # serve a stale "no decision" verdict and queue another prompt.
+    notifyutil -p com.apple.private.tcc.changed.user 2>/dev/null || true
+    notifyutil -p com.apple.private.tcc.changed 2>/dev/null || true
 }
 
 case "${1:-}" in

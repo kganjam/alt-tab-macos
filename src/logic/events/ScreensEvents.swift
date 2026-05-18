@@ -2,6 +2,7 @@ import Cocoa
 
 class ScreensEvents {
     private static let throttler = Throttler(delayInMs: 200)
+    private static var refreshGeneration = 0
 
     static func observe() {
         NotificationCenter.default.addObserver(self, selector: #selector(handleEvent), name: NSApplication.didChangeScreenParametersNotification, object: nil)
@@ -15,10 +16,29 @@ class ScreensEvents {
             Screens.refresh()
             // a screen added or removed, or screen resolution change can mess up layout; we reset components
             App.resetPreferencesDependentComponents()
-            // a screen added or removed can shuffle windows around Spaces; we refresh them
-            App.refreshOpenUiAfterExternalEvent(Windows.list)
+            prepareThumbnailsForDisplayChange()
+            App.refreshOpenUiAfterExternalEvent([])
+            scheduleThumbnailRefreshes()
             Logger.info { "screens:\(NSScreen.screens.map { ($0.cachedUuid() ?? "nil" as CFString, $0.frame) })" }
             Logger.info { "currentSpace:\(Spaces.currentSpaceIndex) (id:\(Spaces.currentSpaceId)) spaces:\(Spaces.screenSpacesMap)" }
+        }
+    }
+
+    private static func prepareThumbnailsForDisplayChange() {
+        refreshGeneration += 1
+        Windows.invalidateThumbnails()
+        if #available(macOS 14.0, *) {
+            WindowCaptureScreenshots.invalidateCache()
+        }
+    }
+
+    private static func scheduleThumbnailRefreshes() {
+        let generation = refreshGeneration
+        [700, 2200, 5000].forEach { delayMs in
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) {
+                guard generation == refreshGeneration else { return }
+                App.refreshOpenUiAfterExternalEvent(Windows.list, source: .screenParametersChanged)
+            }
         }
     }
 }
