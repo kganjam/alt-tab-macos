@@ -1,4 +1,5 @@
 import Cocoa
+import Carbon.HIToolbox.Events
 import ShortcutRecorder
 
 class KeyboardEvents {
@@ -73,6 +74,11 @@ class KeyboardEvents {
 
     private static func registerHotKeyIfNeeded(_ controlId: String, _ shortcut: Shortcut) {
         if shortcut.keyCode != .none {
+            if shouldProtectNativeCommandBacktick(controlId, shortcut) {
+                unregisterHotKeyIfNeeded(controlId, shortcut)
+                Diagnostics.log("KEYEVENT", "not registering \(controlId): reserved native Cmd+`/Cmd+Shift+`")
+                return
+            }
             guard let id = KeyboardEventsTestable.globalShortcutsIds[controlId] else { return }
             let hotkeyId = EventHotKeyID(signature: signature, id: UInt32(id))
             let key = shortcut.carbonKeyCode
@@ -82,6 +88,14 @@ class KeyboardEvents {
             RegisterEventHotKey(key, mods, hotkeyId, shortcutEventTarget, options, &shortcutsReference)
             eventHotKeyRefs[controlId] = shortcutsReference
         }
+    }
+
+    private static func shouldProtectNativeCommandBacktick(_ controlId: String, _ shortcut: Shortcut) -> Bool {
+        guard RuntimeFlags.protectNativeCommandBacktickShortcut, controlId.hasPrefix("nextWindowShortcut") else { return false }
+        let modifiers = shortcut.carbonModifierFlags.cleaned()
+        let hasCommand = modifiers & UInt32(cmdKey) == UInt32(cmdKey)
+        let hasUnsupportedModifier = modifiers & (UInt32(optionKey) | UInt32(controlKey) | UInt32(alphaLock)) != 0
+        return shortcut.carbonKeyCode == UInt32(kVK_ANSI_Grave) && hasCommand && !hasUnsupportedModifier
     }
 
     // TODO: handle this on a background thread?

@@ -102,8 +102,8 @@ class Logger {
 ///   info     — adds normal-flow events (PANEL show/hide, KEY release,
 ///              MOUSE click, FOCUS, SESSION, GUARD, TITLE refresh). DEFAULT.
 ///   perf     — adds end-to-end switch timing breakdown (SWITCH phases,
-///              REFRESH counters). Use when measuring latency.
-///   trace    — adds z-order debugging (SYSZ, SAMEAPP, RECENCY, ZALIGN,
+///              REFRESH counters, SAMEAPP regression signal). Use when measuring latency.
+///   trace    — adds z-order debugging (SYSZ, RECENCY, ZALIGN,
 ///              ZENFORCE, ZRESTORE, ZQUICK, SIBLINGSDEMOTE, FRONTMOSTSET,
 ///              AXEVENT, COUNTER, OVERLAY, XPROC). Use when chasing
 ///              focus/z-order regressions.
@@ -164,6 +164,7 @@ class Diagnostics {
     private static let categoryLevels: [String: Level] = [
         // warn — anomalies worth surfacing without full debug spew
         "TITLEMISS": .warn,
+        "ANOMALY": .warn,
         "FRONT_MISMATCH": .warn,
         "AXTITLE": .warn,
         "CLICKMISROUTE": .warn,
@@ -177,6 +178,7 @@ class Diagnostics {
         "MOUSE": .info,
         "CLICK": .info,
         "SESSION": .info,
+        "MONITOR": .info,
         "INIT": .info,
         "MANUAL": .info,
         "HIDE": .info,
@@ -193,13 +195,16 @@ class Diagnostics {
         "ZWAIT": .trace,
         "SYSZ": .trace,
         "RECENCY": .trace,
-        "SAMEAPP": .trace,
+        "SAMEAPP": .perf,
+        "ZPROMOTE": .perf,
+        "WINSIDEFG": .perf,
         "PARMAC": .verbose,
         "ZALIGN": .verbose,
         "ZENFORCE": .trace,
         "ZRESTORE": .trace,
         "ZQUICK": .trace,
-        "FRONTMOSTSET": .trace,
+        "ZFAST": .trace,
+        "FRONTMOSTSET": .perf,
         "SIBLINGSDEMOTE": .trace,
         "FRONT": .trace,
         "AXEVENT": .trace,
@@ -211,7 +216,7 @@ class Diagnostics {
         // (PROFILER is opt-in via runProfilerAtLaunch; surface its lines
         // at info so an automated profiling run is visible at default level.)
         "PROFILER": .info,
-        "WINSIDE": .verbose,
+        "WINSIDE": .perf,
         "API": .verbose,
         "CTAP": .verbose,
     ]
@@ -241,6 +246,7 @@ class Diagnostics {
         let logStartNs = DispatchTime.now().uptimeNanoseconds
         guard shouldEmit(category) else { return }
         let elapsedMs = Double(logStartNs >= baseNs ? logStartNs - baseNs : 0) / 1_000_000
+        let utcMs = Int64(Date().timeIntervalSince1970 * 1000)
         // NSLog/asl truncate at the first embedded newline, splitting
         // a single logical message across multiple log lines and
         // hiding everything that came after the \n. We saw exactly
@@ -256,7 +262,7 @@ class Diagnostics {
                 .replacingOccurrences(of: "\r", with: " ")
         }
         let beforeNslogNs = DispatchTime.now().uptimeNanoseconds
-        let line = "[DIAG \(category)] \(String(format: "t+%.3fms", elapsedMs)) tid=\(currentThreadId()) q=\(currentQueueLabel()) \(sanitized)"
+        let line = "[DIAG \(category)] \(String(format: "t+%.3fms", elapsedMs)) utcMs=\(utcMs) tid=\(currentThreadId()) q=\(currentQueueLabel()) \(sanitized)"
         NSLog("%@", line as NSString)
         let endNs = DispatchTime.now().uptimeNanoseconds
         recordLogCost(nowNs: endNs, totalNs: endNs - logStartNs, formatNs: beforeNslogNs - logStartNs, nslogNs: endNs - beforeNslogNs)
@@ -300,7 +306,7 @@ class Diagnostics {
         guard now - logCostLastReportNs >= 2_000_000_000 else { return }
         logCostLastReportNs = now
         let count = max(logCostCount, 1)
-        let line = String(format: "[DIAG LOGCOST] t+%.3fms tid=%@ q=%@ count=%llu avg=%.1fus max=%.1fus formatAvg=%.1fus nslogAvg=%.1fus", Double(now) / 1_000_000, currentThreadId(), currentQueueLabel(), count, Double(logCostTotalNs) / Double(count) / 1000, Double(logCostMaxNs) / 1000, Double(logCostFormatNs) / Double(count) / 1000, Double(logCostNslogNs) / Double(count) / 1000)
+        let line = String(format: "[DIAG LOGCOST] t+%.3fms utcMs=%lld tid=%@ q=%@ count=%llu avg=%.1fus max=%.1fus formatAvg=%.1fus nslogAvg=%.1fus", Double(now) / 1_000_000, Int64(Date().timeIntervalSince1970 * 1000), currentThreadId(), currentQueueLabel(), count, Double(logCostTotalNs) / Double(count) / 1000, Double(logCostMaxNs) / 1000, Double(logCostFormatNs) / Double(count) / 1000, Double(logCostNslogNs) / Double(count) / 1000)
         NSLog("%@", line as NSString)
     }
 
@@ -352,7 +358,7 @@ class Diagnostics {
     private static let sysZOwnerBlocklist: Set<String> = [
         "Window Server", "Control Center", "Dock", "AltTab",
         "Notification Center", "SystemUIServer", "Spotlight",
-        "Menubar", "Wallpaper", "CursorUIViewService",
+        "Menubar", "Wallpaper", "CursorUIViewService", "UserNotificationCenter",
         "LocalAuthenticationRemoteService",
     ]
 
@@ -361,7 +367,9 @@ class Diagnostics {
         // inside this function. If both SYSZ and SAMEAPP are below the
         // active level, the entire CGWindowListCopyWindowInfo + per-window
         // CGSGetWindowLevel scan is skipped.
-        guard shouldLog("SYSZ") || shouldLog("SAMEAPP") else { return }
+        let logSysZ = shouldLog("SYSZ")
+        let logSameApp = shouldLog("SAMEAPP")
+        guard logSysZ || logSameApp else { return }
         // Use .optionOnScreenOnly — Apple only guarantees front-to-back
         // z-order for "OnScreen" options. Without it, ordering is undefined.
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
@@ -372,34 +380,148 @@ class Diagnostics {
             let alpha = (w[kCGWindowAlpha as String] as? Double) ?? 1.0
             if alpha < 0.1 { return false }
             if let bounds = w[kCGWindowBounds as String] as? [String: Any],
-               let width = bounds["Width"] as? Double, width < 40 { return false }
+               let width = bounds["Width"] as? Double,
+               let height = bounds["Height"] as? Double, (width < 40 || height < 40) { return false }
             return true
         }
-        var idx = 0
         var ownerCounts: [String: Int] = [:]
-        let top = filtered.prefix(8).map { (w: [String: Any]) -> String in
+        var top = [String]()
+        for (idx, w) in filtered.prefix(8).enumerated() {
             let owner = (w[kCGWindowOwnerName as String] as? String) ?? "?"
             ownerCounts[owner, default: 0] += 1
             let name = (w[kCGWindowName as String] as? String) ?? ""
             let wid = (w[kCGWindowNumber as String] as? Int) ?? 0
             let layer = (w[kCGWindowLayer as String] as? Int) ?? 0
-            var actualLevel: CGWindowLevel = -1
-            CGSGetWindowLevel(CGS_CONNECTION, CGWindowID(wid), &actualLevel)
             let short = name.isEmpty ? "" : ":\(name.prefix(22))"
-            let result = "z\(idx) Lv\(layer) #\(wid) \(owner)\(short)"
-            idx += 1
-            return result
+            top.append("z\(idx) Lv\(layer) #\(wid) \(owner)\(short)")
         }
-        log("SYSZ", "\(label): \(top.joined(separator: " || "))")
+        if logSysZ {
+            log("SYSZ", "\(label): \(top.joined(separator: " || "))")
+        }
         // Surfaces the "all-windows-up" regression. AltTab must focus a
         // single window per app — if multiple windows of the same owner
         // appear in the top-8 z-order after a focus, _SLPSSetFrontProcess
         // brought the whole process forward instead of just the target.
         let multi = ownerCounts.filter { $0.value > 1 }
-        if !multi.isEmpty {
+        if logSameApp && !multi.isEmpty {
             let summary = multi.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: " ")
-            log("SAMEAPP", "\(label): top8 has \(summary) (>1 window of same app at top — should be 1)")
+            log("SAMEAPP", "\(label): top8 has \(summary) (>1 window of same app at top — should be 1) top=[\(top.joined(separator: " || "))]")
         }
+    }
+
+    static func scheduleFocusInvariantChecks(target: Window, sourceWid: CGWindowID?, generation: Int64, label: String) {
+        guard let targetWid = target.cgWindowId else {
+            log("ANOMALY", "\(label): target has no wid pid=\(target.application.pid) app=\(target.application.localizedName ?? "?")")
+            return
+        }
+        for delayMs in [150, 500, 1200, 2500] {
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(delayMs)) {
+                logFocusInvariant("\(label) +\(delayMs)ms", targetWid: targetWid, targetPid: target.application.pid, sourceWid: sourceWid, generation: generation, delayMs: delayMs)
+            }
+        }
+    }
+
+    static func logFocusInvariant(_ label: String, targetWid: CGWindowID, targetPid: pid_t, sourceWid: CGWindowID?, generation: Int64, delayMs: Int? = nil) {
+        guard shouldLog("ANOMALY") || shouldLog("MONITOR") else { return }
+        guard Windows.isCurrentZOrderFocusGeneration(generation) else {
+            log("MONITOR", "\(label): skipped stale generation target=#\(targetWid) source=#\(sourceWid ?? 0)")
+            return
+        }
+        guard App.lastAltTabFocusTargetWid == targetWid, !App.altTabFocusSourceInvalidated else {
+            log("MONITOR", "\(label): skipped no longer current target=#\(targetWid) current=#\(App.lastAltTabFocusTargetWid ?? 0) invalidated=\(App.altTabFocusSourceInvalidated)")
+            return
+        }
+        let rows = currentAppZRows(limit: 12)
+        let targetZ = rows.firstIndex { $0.wid == targetWid }
+        let top = rows.first
+        let ax = focusedAxSignals()
+        let panelActive = App.appIsBeingUsed
+        if let axWid = ax.wid, ax.pid == targetPid, axWid != targetWid, Windows.recentExternalKeyboardInputFollowsAltTabTarget() {
+            log("MONITOR", "\(label): same-app focus moved after keyboard input target=#\(targetWid) axWid=#\(axWid); not repairing stale AltTab target")
+            DispatchQueue.main.async {
+                _ = Windows.releaseZOrderEnforcementForSameAppKeyboardFocusMove(wid: axWid, pid: targetPid, label: label)
+                App.noteObservedFocusedWindow(axWid)
+            }
+            return
+        }
+        let rawFailures = focusInvariantFailures(targetWid: targetWid, targetPid: targetPid, targetZ: targetZ, top: top, ax: ax, panelActive: panelActive)
+        let failures = reportableFocusInvariantFailures(rawFailures, delayMs: delayMs)
+        let topSummary = rows.prefix(8).enumerated().map { "z\($0.offset)=#\($0.element.wid) \($0.element.owner.prefix(18))" }.joined(separator: " | ")
+        let signalSummary = "target=#\(targetWid) pid=\(targetPid) source=#\(sourceWid ?? 0) top=#\(top?.wid ?? 0) \(top?.owner ?? "nil") targetZ=\(targetZ.map(String.init) ?? "nil") axPid=\(ax.pid ?? 0) axWid=#\(ax.wid ?? 0) panelActive=\(panelActive)"
+        if rawFailures.isEmpty {
+            log("MONITOR", "\(label): OK \(signalSummary) top=[\(topSummary)]")
+        } else if failures.isEmpty {
+            log("MONITOR", "\(label): pending \(rawFailures.joined(separator: " ")) \(signalSummary) top=[\(topSummary)]")
+        } else {
+            log("ANOMALY", "\(label): \(failures.joined(separator: " ")) \(signalSummary) top=[\(topSummary)]")
+            Windows.repairFocusInvariantMismatch(targetWid: targetWid, targetPid: targetPid, failures: failures, label: label)
+        }
+    }
+
+    private struct ZRow {
+        let wid: CGWindowID
+        let pid: pid_t
+        let owner: String
+    }
+
+    private static func currentAppZRows(limit: Int) -> [ZRow] {
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return [] }
+        var rows = [ZRow]()
+        for row in info {
+            let owner = (row[kCGWindowOwnerName as String] as? String) ?? ""
+            if sysZOwnerBlocklist.contains(owner) { continue }
+            if (row[kCGWindowAlpha as String] as? Double ?? 1.0) < 0.1 { continue }
+            guard let boundsDict = row[kCGWindowBounds as String] as? [String: Any],
+                  let bounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary),
+                  bounds.width >= 40, bounds.height >= 40 else { continue }
+            let wid = CGWindowID((row[kCGWindowNumber as String] as? Int) ?? 0)
+            let pid = pid_t((row[kCGWindowOwnerPID as String] as? Int32) ?? 0)
+            rows.append(ZRow(wid: wid, pid: pid, owner: owner))
+            if rows.count >= limit { break }
+        }
+        return rows
+    }
+
+    private static func focusedAxSignals() -> (pid: pid_t?, wid: CGWindowID?) {
+        let system = AXUIElementCreateSystemWide()
+        var focusedApp: AnyObject?
+        guard AXUIElementCopyAttributeValue(system, kAXFocusedApplicationAttribute as CFString, &focusedApp) == .success,
+              let focusedApp else { return (nil, nil) }
+        let app = focusedApp as! AXUIElement
+        var pid: pid_t = 0
+        _ = AXUIElementGetPid(app, &pid)
+        var focusedWindow: AnyObject?
+        guard AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success,
+              let focusedWindow else { return (pid == 0 ? nil : pid, nil) }
+        var wid: CGWindowID = 0
+        _ = _AXUIElementGetWindow(focusedWindow as! AXUIElement, &wid)
+        return (pid == 0 ? nil : pid, wid == 0 ? nil : wid)
+    }
+
+    private static func focusInvariantFailures(targetWid: CGWindowID, targetPid: pid_t, targetZ: Int?, top: ZRow?, ax: (pid: pid_t?, wid: CGWindowID?), panelActive: Bool) -> [String] {
+        if panelActive { return [] }
+        var failures = [String]()
+        if targetZ == nil {
+            failures.append("targetMissing")
+        } else if targetZ != 0 {
+            failures.append("targetNotZ0")
+        }
+        if let axPid = ax.pid, axPid != targetPid {
+            failures.append("axPidMismatch")
+        }
+        if let axWid = ax.wid, ax.pid == targetPid, axWid != targetWid {
+            failures.append("axWidMismatch")
+        }
+        if let top, top.wid != targetWid, top.pid != targetPid {
+            failures.append("topPidMismatch")
+        }
+        return failures
+    }
+
+    private static func reportableFocusInvariantFailures(_ failures: [String], delayMs: Int?) -> [String] {
+        guard let delayMs, delayMs < 1200 else { return failures }
+        return failures.filter { $0 != "targetNotZ0" && $0 != "topPidMismatch" }
     }
 
     static func logFrontmostSignals(_ label: String) {
@@ -1144,7 +1266,7 @@ class Profiler {
         let blocklist: Set<String> = [
             "Window Server", "Control Center", "Dock", "AltTab",
             "Notification Center", "SystemUIServer", "Spotlight",
-            "Menubar", "Wallpaper", "CursorUIViewService",
+            "Menubar", "Wallpaper", "CursorUIViewService", "UserNotificationCenter",
             "LocalAuthenticationRemoteService",
         ]
         for w in info {
@@ -1153,7 +1275,8 @@ class Profiler {
             let alpha = (w[kCGWindowAlpha as String] as? Double) ?? 1.0
             if alpha < 0.1 { continue }
             if let bounds = w[kCGWindowBounds as String] as? [String: Any],
-               let width = bounds["Width"] as? Double, width < 40 { continue }
+               let width = bounds["Width"] as? Double,
+               let height = bounds["Height"] as? Double, (width < 40 || height < 40) { continue }
             if let wid = w[kCGWindowNumber as String] as? Int {
                 return (CGWindowID(wid), owner)
             }
@@ -1274,6 +1397,9 @@ class Profiler {
 ///   - queryForegroundAsync(): `FG` command, parses
 ///     `OK <hwnd> <pid> <title>` and logs as `[DIAG WINSIDE]`.
 ///   - setForegroundAsync(hwnd:): `SET <hwnd>`; logs result.
+///   - setForegroundForTitleMeasuredAsync(): `SETTITLE64 <base64 title>`;
+///     resolves title and foregrounds the HWND inside the guest in one
+///     round-trip, avoiding slow host-side LIST parsing on the focus path.
 ///
 /// All commands run on a serial background queue so they don't block
 /// the focus path. Defaults key `winsideHelperEnabled` controls
@@ -1281,6 +1407,7 @@ class Profiler {
 class Winside {
     private static let port: Int = 18765
     private static let defaultsEnabledKey = "winsideHelperEnabled"
+    private static let useNativeLauncherKey = "winsideUseNativeLauncher"
     private static let helperScriptHostPath = "\(NSHomeDirectory())/.alttab/winside-helper.ps1"
     private static let helperScriptGuestPath = #"\\Mac\Home\.alttab\winside-helper.ps1"#
     // Tiny VBS launcher invoked via wscript.exe (GUI subsystem app, no
@@ -1315,7 +1442,10 @@ class Winside {
     /// Serial queue so concurrent commands don't trample each other's
     /// stdin/stdout (we use one-shot Process invocations).
     private static let queue = DispatchQueue(label: "alttab.winside", qos: .utility)
+    private static let focusQueue = DispatchQueue(label: "alttab.winside.focus", qos: .userInitiated)
+    private static let startupQueue = DispatchQueue(label: "alttab.winside.startup", qos: .utility)
     private static var lastKnownIp: String?
+    private static var startupInProgress = false
 
     static var isEnabled: Bool {
         if UserDefaults.standard.object(forKey: defaultsEnabledKey) == nil { return true }
@@ -1330,6 +1460,15 @@ class Winside {
         } else {
             stop()
         }
+    }
+
+    struct ForegroundResult {
+        let ok: Bool
+        let hwnd: Int?
+        let reason: String
+        let elapsedMs: Double
+        let listMs: Double
+        let setMs: Double
     }
 
     /// Cache of the helper's IP from the status JSON. Tries up to N
@@ -1380,6 +1519,41 @@ class Winside {
     /// Open a persistent TCP socket to the helper. Returns true on
     /// success. Caller must be on `queue`. Idempotent: returns true
     /// quickly if socket is already open.
+    private static func connectWithTimeout(_ fd: Int32, address: inout sockaddr_in, timeoutMs: Int) -> Int32? {
+        let flags = fcntl(fd, F_GETFL, 0)
+        if flags >= 0 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
+        let connectResult = withUnsafePointer(to: &address) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if connectResult == 0 {
+            if flags >= 0 { _ = fcntl(fd, F_SETFL, flags) }
+            return nil
+        }
+        guard errno == EINPROGRESS else {
+            let error = errno
+            if flags >= 0 { _ = fcntl(fd, F_SETFL, flags) }
+            return error
+        }
+        var descriptor = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+        let pollResult = poll(&descriptor, 1, Int32(max(1, timeoutMs)))
+        guard pollResult > 0 else {
+            let error = pollResult == 0 ? ETIMEDOUT : errno
+            if flags >= 0 { _ = fcntl(fd, F_SETFL, flags) }
+            return error
+        }
+        var socketError: Int32 = 0
+        var length = socklen_t(MemoryLayout<Int32>.size)
+        guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &socketError, &length) == 0 else {
+            let error = errno
+            if flags >= 0 { _ = fcntl(fd, F_SETFL, flags) }
+            return error
+        }
+        if flags >= 0 { _ = fcntl(fd, F_SETFL, flags) }
+        return socketError == 0 ? nil : socketError
+    }
+
     private static func connectIfNeeded() -> Bool {
         if socketFd >= 0 { return true }
         guard let ip = readStatusIp() else { return false }
@@ -1396,13 +1570,10 @@ class Winside {
         // way to suppress.
         var noSigPipe: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
-        // 5s read timeout. LIST can take 1-3s on a freshly-warmed
-        // helper because PowerShell's first EnumWindows + JIT for
-        // Add-Type imports is slow. With a 2s timeout we were
-        // tripping on partial responses and dropping back to nc
-        // fallback, where the parse only saw the first line and
-        // declared "1 windows cached".
-        var tv = timeval(tv_sec: 5, tv_usec: 0)
+        // Keep the persistent command socket fail-fast. LIST no longer
+        // uses this path first, so a stale socket must not block the
+        // focus-command queue for the old 5s multiline timeout.
+        var tv = timeval(tv_sec: 1, tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         // TCP_NODELAY for low latency (small commands).
@@ -1413,13 +1584,8 @@ class Winside {
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = in_port_t(UInt16(port).bigEndian)
         addr.sin_addr.s_addr = inet_addr(ip)
-        let connectResult = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        if connectResult != 0 {
-            Diagnostics.log("WINSIDE", "connect(\(ip):\(port)) failed: errno=\(errno)")
+        if let error = connectWithTimeout(fd, address: &addr, timeoutMs: 1000) {
+            Diagnostics.log("WINSIDE", "connect(\(ip):\(port)) failed: errno=\(error)")
             close(fd)
             return false
         }
@@ -1484,6 +1650,11 @@ class Winside {
     /// helper restart when the threshold is hit.
     private static func sendCommandSync(_ cmd: String, timeoutSeconds: Int = 2) -> String? {
         let multiline = (cmd == "LIST")
+        if multiline, let resp = sendCommandViaNetcat(cmd, timeoutSeconds: timeoutSeconds) {
+            consecutiveFailures = 0
+            everConnected = true
+            return resp
+        }
         // Try the persistent socket first. ~50x faster than spawning nc.
         if let resp = sendOverSocket(cmd, expectMultiline: multiline) {
             consecutiveFailures = 0
@@ -1491,6 +1662,13 @@ class Winside {
             return resp
         }
         // Socket path failed (or no IP yet). Fall back to nc one-shot.
+        guard let resp = sendCommandViaNetcat(cmd, timeoutSeconds: timeoutSeconds) else { return nil }
+        consecutiveFailures = 0
+        everConnected = true
+        return resp
+    }
+
+    private static func sendCommandViaNetcat(_ cmd: String, timeoutSeconds: Int) -> String? {
         guard let ip = readStatusIp() else {
             recordFailure(reason: "no status file")
             return nil
@@ -1514,9 +1692,52 @@ class Winside {
             recordFailure(reason: "empty nc response")
             return nil
         }
-        consecutiveFailures = 0
-        everConnected = true
         return resp
+    }
+
+    private static func sendOneShotCommandSync(_ cmd: String, timeoutMs: Int) -> String? {
+        guard let ip = readStatusIp() else { return nil }
+        let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+        guard fd >= 0 else {
+            Diagnostics.log("WINSIDE", "one-shot socket() failed: errno=\(errno)")
+            return nil
+        }
+        defer { close(fd) }
+        var noSigPipe: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        var tv = timeval(tv_sec: timeoutMs / 1000, tv_usec: Int32((timeoutMs % 1000) * 1000))
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var one: Int32 = 1
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(UInt16(port).bigEndian)
+        addr.sin_addr.s_addr = inet_addr(ip)
+        if let error = connectWithTimeout(fd, address: &addr, timeoutMs: timeoutMs) {
+            Diagnostics.log("WINSIDE", "one-shot connect(\(ip):\(port)) failed: errno=\(error)")
+            return nil
+        }
+        let payload = (cmd + "\n").data(using: .utf8)!
+        let written = payload.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int in
+            Darwin.send(fd, raw.baseAddress, payload.count, 0)
+        }
+        guard written == payload.count else {
+            Diagnostics.log("WINSIDE", "one-shot send failed: errno=\(errno)")
+            return nil
+        }
+        var buf = [UInt8](repeating: 0, count: 4096)
+        var accumulated = Data()
+        while true {
+            let n = recv(fd, &buf, buf.count, 0)
+            guard n > 0 else { return nil }
+            accumulated.append(contentsOf: buf[0..<n])
+            if accumulated.contains(0x0A) { break }
+            if accumulated.count > 16_384 { return nil }
+        }
+        return (String(data: accumulated, encoding: .utf8) ?? "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\r\n \u{FEFF}"))
     }
 
     /// Bump the failure counter. After `failureThreshold` consecutive
@@ -1552,18 +1773,16 @@ class Winside {
         Diagnostics.log("WINSIDE", "startInternal: launching helper via prlctl exec")
         let task = Process()
         task.launchPath = "/bin/sh"
-        task.arguments = [
-            "-c",
-            { () -> String in
-                let useExe = FileManager.default.fileExists(atPath: helperLauncherExeHostPath)
-                let prefix = useExe
-                    ? "'\(helperLauncherExeGuestPath)'"
-                    : "wscript.exe '\(helperLauncherGuestPath)'"
-                return "nohup /usr/local/bin/prlctl exec '\(vmName)' --current-user \(prefix) '\(helperScriptGuestPath)' >/tmp/alttab-winside-launch.log 2>&1 &"
-            }()
-        ]
+        task.arguments = ["-c", helperLaunchCommand()]
         task.launch()
         task.waitUntilExit()
+    }
+
+    private static func helperLaunchCommand() -> String {
+        let useNativeLauncher = UserDefaults.standard.bool(forKey: useNativeLauncherKey)
+            && FileManager.default.fileExists(atPath: helperLauncherExeHostPath)
+        let prefix = useNativeLauncher ? "'\(helperLauncherExeGuestPath)'" : "wscript.exe '\(helperLauncherGuestPath)'"
+        return "nohup /usr/local/bin/prlctl exec '\(vmName)' --current-user \(prefix) '\(helperScriptGuestPath)' >/tmp/alttab-winside-launch.log 2>&1 &"
     }
 
     /// True if helper responds to PING within `timeoutSeconds`.
@@ -1581,16 +1800,26 @@ class Winside {
             Diagnostics.log("WINSIDE", "startIfNeeded: disabled in prefs, skipping")
             return
         }
-        queue.async {
+        startupQueue.async {
+            guard !startupInProgress else { return }
+            startupInProgress = true
+            defer { startupInProgress = false }
             // Make sure ~/.alttab and the helper/launcher/kill scripts exist.
-            ensureHelperScriptOnDisk()
-            // AltTab.stop() always kills the helper on exit, so a status
-            // file at startup means a previous AltTab crashed (orphaned
-            // helper). Kill defensively. With the native .exe launcher,
-            // both the kill and the new launch are flash-free.
+            let helperChanged = ensureHelperScriptOnDisk()
             if FileManager.default.fileExists(atPath: helperStatusHostPath) {
-                Diagnostics.log("WINSIDE", "startIfNeeded: orphaned status file at startup — killing prior helper")
-                killHelperInGuest(reason: "orphan from prior AltTab crash")
+                if helperChanged {
+                    Diagnostics.log("WINSIDE", "startIfNeeded: helper script changed — killing prior helper")
+                    queue.sync { closeSocket("helper script changed") }
+                    killHelperInGuest(reason: "helper script changed")
+                } else {
+                    let healthy = queue.sync { sendCommandSync("PING", timeoutSeconds: 1)?.hasPrefix("PONG") == true }
+                    if healthy {
+                        Diagnostics.log("WINSIDE", "startIfNeeded: existing helper is healthy at \(lastKnownIp ?? "?"):\(port)")
+                        return
+                    }
+                    Diagnostics.log("WINSIDE", "startIfNeeded: stale status file at startup — killing prior helper")
+                    killHelperInGuest(reason: "stale status from prior AltTab")
+                }
             }
             Diagnostics.log("WINSIDE", "startIfNeeded: launching helper via prlctl exec")
             let task = Process()
@@ -1598,16 +1827,7 @@ class Winside {
             // Fire-and-forget. The helper is a long-running PS process;
             // we don't waitUntilExit. `nohup` + `&` so the prlctl exec
             // call returns immediately.
-            task.arguments = [
-                "-c",
-                { () -> String in
-                let useExe = FileManager.default.fileExists(atPath: helperLauncherExeHostPath)
-                let prefix = useExe
-                    ? "'\(helperLauncherExeGuestPath)'"
-                    : "wscript.exe '\(helperLauncherGuestPath)'"
-                return "nohup /usr/local/bin/prlctl exec '\(vmName)' --current-user \(prefix) '\(helperScriptGuestPath)' >/tmp/alttab-winside-launch.log 2>&1 &"
-            }()
-            ]
+            task.arguments = ["-c", helperLaunchCommand()]
             task.launch()
             task.waitUntilExit()  // wait only for the shell, not the prlctl
             // Probe up to 60s. Cold-start budget covers:
@@ -1627,7 +1847,16 @@ class Winside {
             var lastHeartbeat = 0
             for attempt in 1...polls {
                 Thread.sleep(forTimeInterval: pollIntervalSec)
-                if let resp = sendCommandSync("PING", timeoutSeconds: 1), resp.hasPrefix("PONG") {
+                guard readStatusIp() != nil else {
+                    let elapsedSec = Int(Double(attempt) * pollIntervalSec)
+                    if elapsedSec >= lastHeartbeat + 5 {
+                        Diagnostics.log("WINSIDE", "startIfNeeded: waiting for status at \(elapsedSec)s (cold-start budget = \(totalSeconds)s)")
+                        lastHeartbeat = elapsedSec
+                    }
+                    continue
+                }
+                let ready = queue.sync { sendCommandSync("PING", timeoutSeconds: 1)?.hasPrefix("PONG") == true }
+                if ready {
                     let elapsedMs = Int(Double(attempt) * pollIntervalSec * 1000)
                     Diagnostics.log("WINSIDE", "startIfNeeded: helper ready after \(elapsedMs)ms at \(lastKnownIp ?? "?"):\(port)")
                     return
@@ -1666,20 +1895,22 @@ class Winside {
     static func queryForegroundAsync(label: String = "", callback: @escaping ((Int, Int, String)?) -> Void = { _ in }) {
         queue.async {
             guard let resp = sendCommandSync("FG", timeoutSeconds: 2) else {
-                Diagnostics.log("WINSIDE", "FG \(label): no response (helper down?)")
+                Diagnostics.log("WINSIDEFG", "FG \(label): no response (helper down?)")
                 callback(nil)
                 return
             }
-            // Expected: "OK <hwnd> <pid> <title>"
-            let parts = resp.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: false).map(String.init)
+            // Expected: "OK <hwnd> <pid> [winMs=<epochMs>] <title>"
+            let parts = resp.split(separator: " ", maxSplits: 4, omittingEmptySubsequences: false).map(String.init)
             guard parts.count >= 3, parts[0] == "OK",
                   let hwnd = Int(parts[1]), let pid = Int(parts[2]) else {
-                Diagnostics.log("WINSIDE", "FG \(label): bad response: \(resp.prefix(80))")
+                Diagnostics.log("WINSIDEFG", "FG \(label): bad response: \(resp.prefix(80))")
                 callback(nil)
                 return
             }
-            let title = parts.count >= 4 ? parts[3] : ""
-            Diagnostics.log("WINSIDE", "FG \(label): hwnd=\(hwnd) pid=\(pid) title='\(title.prefix(40))'")
+            let hasWinMs = parts.count >= 4 && parts[3].hasPrefix("winMs=")
+            let winMs = hasWinMs ? parts[3] : "winMs=unknown"
+            let title = hasWinMs ? (parts.count >= 5 ? parts[4] : "") : (parts.count >= 4 ? parts[3] : "")
+            Diagnostics.log("WINSIDEFG", "FG \(label): hwnd=\(hwnd) pid=\(pid) \(winMs) title='\(title.prefix(40))'")
             callback((hwnd, pid, title))
         }
     }
@@ -1745,6 +1976,133 @@ class Winside {
         }
     }
 
+    private static func hwndForTitle(_ needle: String) -> (Int?, String) {
+        if let hwnd = hwndCache[needle] { return (hwnd, "exact") }
+        let candidates = hwndCache.keys.filter { $0.hasPrefix(needle) || needle.hasPrefix($0) }
+        guard let bestTitle = candidates.max(by: { $0.count < $1.count }),
+              let hwnd = hwndCache[bestTitle] else { return (nil, "no-hwnd") }
+        return (hwnd, "prefix:\(bestTitle.prefix(40))")
+    }
+
+    private static func parseSetTitleResponse(_ resp: String) -> (Bool, Int?, String)? {
+        let parts = resp.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: false).map(String.init)
+        guard parts.count >= 3, parts[0] == "OK", let flag = Int(parts[1]) else { return nil }
+        return (flag != 0, Int(parts[2]), parts.count >= 4 ? parts[3] : resp)
+    }
+
+    private static func setForegroundForTitleInGuest(_ needle: String, label: String, queuedAt: CFAbsoluteTime, shouldProceed: @escaping () -> Bool) -> ForegroundResult? {
+        let encoded = Data(needle.utf8).base64EncodedString()
+        guard shouldProceed() else { return ForegroundResult(ok: false, hwnd: nil, reason: "stale-before-settitle", elapsedMs: (CFAbsoluteTimeGetCurrent() - queuedAt) * 1000, listMs: 0, setMs: 0) }
+        let ageMs = Int((CFAbsoluteTimeGetCurrent() - queuedAt) * 1000)
+        let remainingMs = RuntimeFlags.parGuestPrefocusMaxAgeMs - ageMs
+        guard remainingMs > 50 else {
+            return ForegroundResult(ok: false, hwnd: nil, reason: "stale-before-settitle age=\(ageMs)ms", elapsedMs: Double(ageMs), listMs: 0, setMs: 0)
+        }
+        queue.async { closeSocket("focus SETTITLE one-shot") }
+        let setStartedAt = CFAbsoluteTimeGetCurrent()
+        let timeoutMs = max(50, min(remainingMs, RuntimeFlags.parGuestPrefocusMaxAgeMs, 350))
+        guard let resp = sendOneShotCommandSync("SETTITLE64 \(encoded)", timeoutMs: timeoutMs) else {
+            Diagnostics.log("WINSIDE", "SETTITLE \(label): no response for title='\(needle.prefix(40))'")
+            return ForegroundResult(ok: false, hwnd: nil, reason: "settitle-no-response", elapsedMs: (CFAbsoluteTimeGetCurrent() - queuedAt) * 1000, listMs: 0, setMs: (CFAbsoluteTimeGetCurrent() - setStartedAt) * 1000)
+        }
+        if resp.hasPrefix("ERR unknown") { return nil }
+        let setMs = (CFAbsoluteTimeGetCurrent() - setStartedAt) * 1000
+        guard shouldProceed() else {
+            Diagnostics.log("WINSIDE", "SETTITLE \(label): completed but stale after \(String(format: "%.1f", setMs))ms for title='\(needle.prefix(40))'")
+            return ForegroundResult(ok: false, hwnd: nil, reason: "stale-after-settitle", elapsedMs: (CFAbsoluteTimeGetCurrent() - queuedAt) * 1000, listMs: 0, setMs: setMs)
+        }
+        guard let parsed = parseSetTitleResponse(resp) else {
+            Diagnostics.log("WINSIDE", "SETTITLE \(label): bad response \(resp.prefix(80))")
+            return ForegroundResult(ok: false, hwnd: nil, reason: resp, elapsedMs: (CFAbsoluteTimeGetCurrent() - queuedAt) * 1000, listMs: 0, setMs: setMs)
+        }
+        Diagnostics.log("WINSIDE", "SETTITLE \(label) hwnd=\(parsed.1.map(String.init) ?? "nil") title='\(needle.prefix(40))': \(resp)")
+        return ForegroundResult(ok: parsed.0, hwnd: parsed.1, reason: parsed.2, elapsedMs: (CFAbsoluteTimeGetCurrent() - queuedAt) * 1000, listMs: 0, setMs: setMs)
+    }
+
+    static func setForegroundForTitleMeasuredAsync(_ title: String, label: String = "", shouldProceed: @escaping () -> Bool = { true }, completion: @escaping (ForegroundResult) -> Void = { _ in }) {
+        let queuedAt = CFAbsoluteTimeGetCurrent()
+        guard isEnabled else {
+            DispatchQueue.main.async { completion(ForegroundResult(ok: false, hwnd: nil, reason: "disabled", elapsedMs: 0, listMs: 0, setMs: 0)) }
+            return
+        }
+        let needle = sanitizeTitle(title)
+        guard !needle.isEmpty else {
+            DispatchQueue.main.async { completion(ForegroundResult(ok: false, hwnd: nil, reason: "empty-title", elapsedMs: 0, listMs: 0, setMs: 0)) }
+            return
+        }
+        focusQueue.async {
+            let startedAt = CFAbsoluteTimeGetCurrent()
+            let queueMs = (startedAt - queuedAt) * 1000
+            guard shouldProceed() else {
+                Diagnostics.log("WINSIDE", "SET \(label): skipped stale request after queue=\(String(format: "%.1f", queueMs))ms for title='\(needle.prefix(40))'")
+                DispatchQueue.main.async { completion(ForegroundResult(ok: false, hwnd: nil, reason: "stale-before-set queue=\(Int(queueMs))ms", elapsedMs: queueMs, listMs: 0, setMs: 0)) }
+                return
+            }
+            if let result = setForegroundForTitleInGuest(needle, label: label, queuedAt: queuedAt, shouldProceed: shouldProceed) {
+                DispatchQueue.main.async { completion(result) }
+                return
+            }
+            Diagnostics.log("WINSIDE", "SETTITLE \(label): unsupported helper response; skipping slow cache fallback on focus path for title='\(needle.prefix(40))'")
+            DispatchQueue.main.async { completion(ForegroundResult(ok: false, hwnd: nil, reason: "settitle-unsupported", elapsedMs: (CFAbsoluteTimeGetCurrent() - queuedAt) * 1000, listMs: 0, setMs: 0)) }
+        }
+    }
+
+    static func setForegroundForTitleWithCacheFallbackAsync(_ title: String, label: String = "", shouldProceed: @escaping () -> Bool = { true }, completion: @escaping (ForegroundResult) -> Void = { _ in }) {
+        let queuedAt = CFAbsoluteTimeGetCurrent()
+        guard isEnabled else {
+            DispatchQueue.main.async { completion(ForegroundResult(ok: false, hwnd: nil, reason: "disabled", elapsedMs: 0, listMs: 0, setMs: 0)) }
+            return
+        }
+        let needle = sanitizeTitle(title)
+        guard !needle.isEmpty else {
+            DispatchQueue.main.async { completion(ForegroundResult(ok: false, hwnd: nil, reason: "empty-title", elapsedMs: 0, listMs: 0, setMs: 0)) }
+            return
+        }
+        queue.async {
+            let startedAt = CFAbsoluteTimeGetCurrent()
+            let queueMs = (startedAt - queuedAt) * 1000
+            guard shouldProceed() else {
+                Diagnostics.log("WINSIDE", "SET \(label): skipped stale request after queue=\(String(format: "%.1f", queueMs))ms for title='\(needle.prefix(40))'")
+                DispatchQueue.main.async { completion(ForegroundResult(ok: false, hwnd: nil, reason: "stale-before-set queue=\(Int(queueMs))ms", elapsedMs: queueMs, listMs: 0, setMs: 0)) }
+                return
+            }
+            let listStartedAt = CFAbsoluteTimeGetCurrent()
+            refreshHwndCacheIfStale()
+            let listMs = (CFAbsoluteTimeGetCurrent() - listStartedAt) * 1000
+            guard shouldProceed() else {
+                let result = ForegroundResult(ok: false, hwnd: nil, reason: "stale-after-list", elapsedMs: (CFAbsoluteTimeGetCurrent() - queuedAt) * 1000, listMs: listMs, setMs: 0)
+                Diagnostics.log("WINSIDE", "SET \(label): skipped stale request after LIST for title='\(needle.prefix(40))'")
+                DispatchQueue.main.async { completion(result) }
+                return
+            }
+            let match = hwndForTitle(needle)
+            guard let hwnd = match.0 else {
+                let result = ForegroundResult(ok: false, hwnd: nil, reason: "no-hwnd cache=\(hwndCache.count)", elapsedMs: (CFAbsoluteTimeGetCurrent() - queuedAt) * 1000, listMs: listMs, setMs: 0)
+                Diagnostics.log("WINSIDE", "SET \(label): no hwnd found for title='\(needle.prefix(40))' (cache size=\(hwndCache.count))")
+                DispatchQueue.main.async { completion(result) }
+                return
+            }
+            guard shouldProceed() else {
+                let result = ForegroundResult(ok: false, hwnd: hwnd, reason: "stale-before-set", elapsedMs: (CFAbsoluteTimeGetCurrent() - queuedAt) * 1000, listMs: listMs, setMs: 0)
+                Diagnostics.log("WINSIDE", "SET \(hwnd) \(label): skipped stale \(match.1) request")
+                DispatchQueue.main.async { completion(result) }
+                return
+            }
+            let setStartedAt = CFAbsoluteTimeGetCurrent()
+            guard let resp = sendCommandSync("SET \(hwnd)", timeoutSeconds: 2) else {
+                let result = ForegroundResult(ok: false, hwnd: hwnd, reason: "no-response match=\(match.1)", elapsedMs: (CFAbsoluteTimeGetCurrent() - queuedAt) * 1000, listMs: listMs, setMs: (CFAbsoluteTimeGetCurrent() - setStartedAt) * 1000)
+                Diagnostics.log("WINSIDE", "SET \(hwnd) \(label) for title='\(needle.prefix(40))': no response")
+                DispatchQueue.main.async { completion(result) }
+                return
+            }
+            let setMs = (CFAbsoluteTimeGetCurrent() - setStartedAt) * 1000
+            let ok = resp.hasPrefix("OK")
+            let result = ForegroundResult(ok: ok, hwnd: hwnd, reason: resp, elapsedMs: (CFAbsoluteTimeGetCurrent() - queuedAt) * 1000, listMs: listMs, setMs: setMs)
+            Diagnostics.log("WINSIDE", "SET \(hwnd) \(label) (\(match.1)) title='\(needle.prefix(40))': \(resp)")
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
     /// Async: resolve hwnd from a Window's title, then SetForegroundWindow.
     /// Belt-and-suspenders intervention to fire after AltTab's macOS-side
     /// focus path completes — when SLPS+AX has succeeded but axFoc hasn't
@@ -1753,43 +2111,8 @@ class Winside {
     /// foreground-management path). No-op if the helper isn't running.
     /// Title-match strategy: exact match first, then prefix-match
     /// (handles cases where macOS-side title got truncated/altered).
-    static func setForegroundForTitleAsync(_ title: String, label: String = "") {
-        guard isEnabled else { return }
-        // Parallels Coherence titles can contain INTERNAL newlines
-        // (multi-line titles returned by AX), not just trailing ones.
-        // `.trimmingCharacters(in: .whitespacesAndNewlines)` only strips
-        // leading + trailing whitespace; internal `\n` survives. Replace
-        // ALL line-break chars with a space so cache key + lookup match
-        // and so NSLog doesn't truncate at an embedded newline.
-        let needle = sanitizeTitle(title)
-        guard !needle.isEmpty else { return }
-        queue.async {
-            refreshHwndCacheIfStale()
-            // Exact match first.
-            if let hwnd = hwndCache[needle] {
-                guard let resp = sendCommandSync("SET \(hwnd)", timeoutSeconds: 2) else {
-                    Diagnostics.log("WINSIDE", "SET \(hwnd) \(label) for title='\(needle.prefix(40))': no response")
-                    return
-                }
-                Diagnostics.log("WINSIDE", "SET \(hwnd) \(label) (exact-match) title='\(needle.prefix(40))': \(resp)")
-                return
-            }
-            // Prefix-match fallback: macOS sometimes truncates the
-            // Coherence window title at ~30-50 chars; the guest still
-            // has the full title. Match the longest cache key whose
-            // prefix matches our title (or vice versa).
-            let candidates = hwndCache.keys.filter { $0.hasPrefix(needle) || needle.hasPrefix($0) }
-            if let bestTitle = candidates.max(by: { $0.count < $1.count }),
-               let hwnd = hwndCache[bestTitle] {
-                guard let resp = sendCommandSync("SET \(hwnd)", timeoutSeconds: 2) else {
-                    Diagnostics.log("WINSIDE", "SET \(hwnd) \(label) for title-prefix='\(needle.prefix(40))': no response")
-                    return
-                }
-                Diagnostics.log("WINSIDE", "SET \(hwnd) \(label) (prefix-match) title='\(needle.prefix(40))' → '\(bestTitle.prefix(40))': \(resp)")
-                return
-            }
-            Diagnostics.log("WINSIDE", "SET \(label): no hwnd found for title='\(needle.prefix(40))' (cache size=\(hwndCache.count))")
-        }
+    static func setForegroundForTitleAsync(_ title: String, label: String = "", shouldProceed: @escaping () -> Bool = { true }) {
+        setForegroundForTitleMeasuredAsync(title, label: label, shouldProceed: shouldProceed)
     }
 
     /// Idempotent: write the embedded PS script to disk if missing or
@@ -2020,9 +2343,10 @@ public class L {
 }
 
 ## Wire protocol (line-based ASCII, \r\n or \n terminator):
-##   PING                → PONG
-##   FG                  → OK <hwnd> <pid> <title>
-##   SET <hwnd>          → OK <0|1>   (1 = SetForegroundWindow returned true)
+##   PING                → PONG winMs=<utc-epoch-ms>
+##   FG                  → OK <hwnd> <pid> winMs=<utc-epoch-ms> <title>
+##   SET <hwnd>          → OK <0|1> winMs=<utc-epoch-ms> ...
+##   SETTITLE64 <title>  → OK <0|1> <hwnd> <match> winMs=<utc-epoch-ms> (title is UTF-8 base64)
 ##   LIST                → multiple lines "<hwnd> <pid> <title>", terminated by END
 ##   EXIT                → OK BYE   (helper terminates after replying)
 ## Status JSON (so host can discover IP+port without prlctl exec each time):
@@ -2032,6 +2356,10 @@ public class L {
 $ErrorActionPreference = 'Stop'
 $Port = 18765
 $StatusPath = '\\Mac\Home\.alttab\winside-status.json'
+
+function Get-UtcMs {
+    return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+}
 
 Add-Type @"
 using System;
@@ -2044,7 +2372,10 @@ public class WinSide {
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int nCmdShow);
   [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr insertAfter, int x, int y, int cx, int cy, UInt32 flags);
+  [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr h, bool altTab);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
   public delegate bool EnumProc(IntPtr h, IntPtr lp);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lp);
@@ -2086,18 +2417,80 @@ function Get-FG-Line {
     [WinSide]::GetWindowText($h, $sb, 512) | Out-Null
     $procId = 0
     [WinSide]::GetWindowThreadProcessId($h, [ref]$procId) | Out-Null
-    return "OK $($h.ToInt64()) $procId $($sb.ToString())"
+    return "OK $($h.ToInt64()) $procId winMs=$(Get-UtcMs) $($sb.ToString())"
 }
 
 function Do-SetForeground {
     param([Int64]$HwndInt)
     $h = New-Object IntPtr -ArgumentList $HwndInt
+    $HWND_TOP = [IntPtr]::Zero
+    $SWP_NOSIZE = [UInt32]0x0001
+    $SWP_NOMOVE = [UInt32]0x0002
+    $SWP_SHOWWINDOW = [UInt32]0x0040
+    $SWP_FLAGS = $SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_SHOWWINDOW
     if ([WinSide]::IsIconic($h)) {
         [WinSide]::ShowWindow($h, 9) | Out-Null
+    } else {
+        [WinSide]::ShowWindowAsync($h, 5) | Out-Null
     }
+    $pos = [WinSide]::SetWindowPos($h, $HWND_TOP, 0, 0, 0, 0, $SWP_FLAGS)
     [WinSide]::BringWindowToTop($h) | Out-Null
     $r = [WinSide]::SetForegroundWindow($h)
-    return "OK $([int]$r)"
+    [WinSide]::SwitchToThisWindow($h, $true)
+    return "OK $([int]$r) winMs=$(Get-UtcMs) pos=$([int]$pos)"
+}
+
+function Normalize-Title {
+    param([string]$Text)
+    return (($Text -replace "[`r`n]+", " ") -replace "\s+", " ").Trim()
+}
+
+function Normalize-TitleKey {
+    param([string]$Text)
+    $norm = Normalize-Title -Text $Text
+    return (($norm -replace '^[^\p{L}\p{Nd}\[]+', '') -replace "\s+", " ").Trim()
+}
+
+function Find-WindowByTitle {
+    param([string]$Needle)
+    $needleNorm = Normalize-Title -Text $Needle
+    $needleKey = Normalize-TitleKey -Text $Needle
+    if ($needleNorm.Length -eq 0) { return $null }
+    $found = New-Object System.Collections.ArrayList
+    $cb = {
+        param([IntPtr]$h, [IntPtr]$lp)
+        if ([WinSide]::IsWindowVisible($h)) {
+            $sb = New-Object Text.StringBuilder 512
+            [WinSide]::GetWindowText($h, $sb, 512) | Out-Null
+            $titleNorm = Normalize-Title -Text $sb.ToString()
+            $titleKey = Normalize-TitleKey -Text $sb.ToString()
+            if ($titleNorm.Length -gt 0) {
+                if ($titleNorm -eq $needleNorm) {
+                    $found.Add([pscustomobject]@{ H = $h; Kind = 'exact'; Len = $titleNorm.Length }) | Out-Null
+                } elseif ($titleNorm.StartsWith($needleNorm) -or $needleNorm.StartsWith($titleNorm)) {
+                    $found.Add([pscustomobject]@{ H = $h; Kind = 'prefix'; Len = $titleNorm.Length }) | Out-Null
+                } elseif ($needleKey.Length -gt 0 -and $titleKey.Length -gt 0 -and ($titleKey.StartsWith($needleKey) -or $needleKey.StartsWith($titleKey))) {
+                    $found.Add([pscustomobject]@{ H = $h; Kind = 'fuzzy-prefix'; Len = $titleKey.Length }) | Out-Null
+                }
+            }
+        }
+        return $true
+    }
+    [WinSide]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
+    $exact = $found | Where-Object { $_.Kind -eq 'exact' } | Select-Object -First 1
+    if ($null -ne $exact) { return $exact }
+    return $found | Sort-Object Len -Descending | Select-Object -First 1
+}
+
+function Do-SetForegroundByTitle64 {
+    param([string]$Title64)
+    $needle = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Title64))
+    $match = Find-WindowByTitle -Needle $needle
+    if ($null -eq $match) { return "ERR no-hwnd winMs=$(Get-UtcMs)" }
+    $hwnd = $match.H.ToInt64()
+    $resp = Do-SetForeground -HwndInt $hwnd
+    $ok = if ($resp -match '^OK\s+(\d+)') { $Matches[1] } else { '0' }
+    return "OK $ok $hwnd $($match.Kind) winMs=$(Get-UtcMs)"
 }
 
 function List-Windows {
@@ -2154,23 +2547,25 @@ while (-not $shouldExit) {
             if ($cmd -eq '') { continue }
             try {
                 if ($cmd -eq 'PING') {
-                    $writer.WriteLine('PONG')
+                    $writer.WriteLine("PONG winMs=$(Get-UtcMs)")
                 } elseif ($cmd -eq 'FG') {
                     $writer.WriteLine((Get-FG-Line))
                 } elseif ($cmd -match '^SET\s+(\d+)$') {
                     $writer.WriteLine((Do-SetForeground -HwndInt ([Int64]$Matches[1])))
+                } elseif ($cmd -match '^SETTITLE64\s+(.+)$') {
+                    $writer.WriteLine((Do-SetForegroundByTitle64 -Title64 $Matches[1]))
                 } elseif ($cmd -eq 'LIST') {
                     foreach ($l in (List-Windows)) { $writer.WriteLine($l) }
                     $writer.WriteLine('END')
                 } elseif ($cmd -eq 'EXIT') {
-                    $writer.WriteLine('OK BYE')
+                    $writer.WriteLine("OK BYE winMs=$(Get-UtcMs)")
                     $shouldExit = $true
                     break
                 } else {
-                    $writer.WriteLine("ERR unknown: $cmd")
+                    $writer.WriteLine("ERR unknown winMs=$(Get-UtcMs): $cmd")
                 }
             } catch {
-                try { $writer.WriteLine("ERR exception: $($_.Exception.Message)") } catch {}
+                try { $writer.WriteLine("ERR exception winMs=$(Get-UtcMs): $($_.Exception.Message)") } catch {}
             }
         }
         try { $client.Close() } catch {}

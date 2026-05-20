@@ -6,6 +6,7 @@ class CursorEvents {
     private static var shouldBeEnabled: Bool!
     private static var mouseDownTarget: AnyObject?
     private static var mouseDownInsideSearchField = false
+    private static var outsideMouseDownPassedThroughButton: String?
     static var deadZoneInitialPosition: CGPoint?
     static var isAllowedToMouseHover = true
 
@@ -78,6 +79,7 @@ class CursorEvents {
     }
 
     private static func handleLeftMouseDown(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
+        outsideMouseDownPassedThroughButton = nil
         if TilesView.hasMarkedText() || ContextMenuEvents.isMenuOpen {
             logTapDecision("left", "down", cgEvent, absorbed: false, reason: "markedText/menuOpen")
             return Unmanaged.passUnretained(cgEvent)
@@ -97,6 +99,7 @@ class CursorEvents {
     }
 
     private static func handleLeftMouseUp(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
+        if let pass = handleOutsideUiMouseUpIfNeeded("left", cgEvent) { return pass }
         if TilesView.hasMarkedText() || ContextMenuEvents.isMenuOpen {
             logTapDecision("left", "up", cgEvent, absorbed: false, reason: "markedText/menuOpen")
             return Unmanaged.passUnretained(cgEvent)
@@ -129,6 +132,7 @@ class CursorEvents {
     }
 
     private static func handleRightMouseDown(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
+        outsideMouseDownPassedThroughButton = nil
         if ContextMenuEvents.isMenuOpen || isPointerInsideUi() {
             logTapDecision("right", "down", cgEvent, absorbed: false, reason: "menuOpen/insideUi")
             return Unmanaged.passUnretained(cgEvent)
@@ -137,6 +141,7 @@ class CursorEvents {
     }
 
     private static func handleRightMouseUp(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
+        if let pass = handleOutsideUiMouseUpIfNeeded("right", cgEvent) { return pass }
         if ContextMenuEvents.isMenuOpen || isPointerInsideUi() {
             logTapDecision("right", "up", cgEvent, absorbed: false, reason: "menuOpen/insideUi")
             return Unmanaged.passUnretained(cgEvent)
@@ -146,6 +151,7 @@ class CursorEvents {
     }
 
     private static func handleOtherMouseDown(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
+        outsideMouseDownPassedThroughButton = nil
         if ContextMenuEvents.isMenuOpen || isPointerInsideUi() {
             logTapDecision("other", "down", cgEvent, absorbed: false, reason: "menuOpen/insideUi")
             return Unmanaged.passUnretained(cgEvent)
@@ -154,6 +160,7 @@ class CursorEvents {
     }
 
     private static func handleOtherMouseUp(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
+        if let pass = handleOutsideUiMouseUpIfNeeded("other", cgEvent) { return pass }
         if ContextMenuEvents.isMenuOpen {
             logTapDecision("other", "up", cgEvent, absorbed: false, reason: "menuOpen")
             return Unmanaged.passUnretained(cgEvent)
@@ -170,6 +177,9 @@ class CursorEvents {
 
     private static func handleMouseMoved(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
         if isAllowedToReactToPointerMovement(cgEvent.location) {
+            if isPointerInsideUi() {
+                App.noteInputCaptureActivity("mouse-move")
+            }
             TilesView.thumbnailOverView.updateHover()
         }
         return Unmanaged.passUnretained(cgEvent)
@@ -180,8 +190,18 @@ class CursorEvents {
         logTapDecision(button, "down", cgEvent, absorbed: !passThrough, reason: passThrough ? "outsideUi-stale→hideUi-pass" : "outsideUi→hideUi")
         mouseDownTarget = nil
         mouseDownInsideSearchField = false
+        outsideMouseDownPassedThroughButton = passThrough ? button : nil
         App.hideUi()
         return passThrough ? Unmanaged.passUnretained(cgEvent) : nil
+    }
+
+    private static func handleOutsideUiMouseUpIfNeeded(_ button: String, _ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
+        guard outsideMouseDownPassedThroughButton == button else { return nil }
+        outsideMouseDownPassedThroughButton = nil
+        mouseDownTarget = nil
+        mouseDownInsideSearchField = false
+        logTapDecision(button, "up", cgEvent, absorbed: false, reason: "outsideUi-after-pass")
+        return Unmanaged.passUnretained(cgEvent)
     }
 
     static func resetDeadzone() {

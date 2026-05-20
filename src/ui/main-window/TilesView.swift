@@ -22,6 +22,7 @@ class TilesView {
     private(set) static var searchMode: SearchMode = .off
     static var rows = [[TileView]]()
     private static var lastRowSignature = [Int]()
+    private static var lastVisibleThumbnailRefreshAt: CFAbsoluteTime = 0
     static var recycledViews = [TileView]()
     static var thumbnailsWidth = CGFloat(0.0)
     static var thumbnailsHeight = CGFloat(0.0)
@@ -596,6 +597,44 @@ class TilesView {
         }
     }
 
+    static func visibleWindowsForThumbnailRefresh(limit: Int = 48) -> [Window] {
+        var result = [Window]()
+        var seen = Set<CGWindowID>()
+        func append(_ window: Window?) {
+            guard let window,
+                  !window.isWindowlessApp,
+                  let wid = window.cgWindowId,
+                  !seen.contains(wid),
+                  Windows.shouldDisplay(window) else { return }
+            seen.insert(wid)
+            result.append(window)
+        }
+        append(Windows.selectedWindow())
+        let visibleRect = scrollView.contentView.bounds.insetBy(dx: 0, dy: -max(80, TileView.height(layoutCache.labelHeight)))
+        for view in recycledViews where view.frame.intersects(visibleRect) {
+            append(view.window_)
+            if result.count >= limit { return result }
+        }
+        if result.isEmpty {
+            for window in Windows.list {
+                append(window)
+                if result.count >= limit { break }
+            }
+        }
+        return result
+    }
+
+    static func refreshVisibleThumbnailsIfNeeded(_ reason: String, force: Bool = false) {
+        guard App.appIsBeingUsed else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        guard force || now - lastVisibleThumbnailRefreshAt > 0.35 else { return }
+        lastVisibleThumbnailRefreshAt = now
+        let windows = visibleWindowsForThumbnailRefresh()
+        guard !windows.isEmpty else { return }
+        Diagnostics.log("CAPTURE", "visible thumbnail refresh reason=\(reason) count=\(windows.count)")
+        Windows.refreshThumbnailsAsync(windows, .refreshOnlyThumbnailsAfterShowUi)
+    }
+
     struct LayoutCache {
         var labelHeight = CGFloat(0)
         var iconWidth = CGFloat(0)
@@ -631,12 +670,21 @@ class ScrollView: NSScrollView {
         NotificationCenter.default.addObserver(self, selector: #selector(scrollingEnded), name: NSScrollView.didEndLiveScrollNotification, object: nil)
     }
 
-    @objc private func scrollingStarted() { isCurrentlyScrolling = true }
-    @objc private func scrollingEnded() { isCurrentlyScrolling = false }
+    @objc private func scrollingStarted() {
+        isCurrentlyScrolling = true
+        App.noteInputCaptureActivity("scroll-start")
+    }
+
+    @objc private func scrollingEnded() {
+        isCurrentlyScrolling = false
+        App.noteInputCaptureActivity("scroll-end")
+        TilesView.refreshVisibleThumbnailsIfNeeded("scroll-end", force: true)
+    }
 
     /// holding shift and using the scrolling wheel will generate a horizontal movement
     /// shift can be part of shortcuts so we force shift scrolls to be vertical
     override func scrollWheel(with event: NSEvent) {
+        App.noteInputCaptureActivity("scroll-wheel")
         if event.modifierFlags.contains(.shift) && event.scrollingDeltaY == 0 {
             let cgEvent = event.cgEvent!
             cgEvent.setDoubleValueField(.scrollWheelEventDeltaAxis1, value: cgEvent.getDoubleValueField(.scrollWheelEventDeltaAxis2))
@@ -644,6 +692,9 @@ class ScrollView: NSScrollView {
             super.scrollWheel(with: NSEvent(cgEvent: cgEvent)!)
         } else {
             super.scrollWheel(with: event)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(60)) {
+            TilesView.refreshVisibleThumbnailsIfNeeded("scroll-wheel")
         }
     }
 }

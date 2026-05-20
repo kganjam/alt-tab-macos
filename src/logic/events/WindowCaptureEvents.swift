@@ -15,10 +15,11 @@ class WindowCaptureScreenshots {
     }
 
     static func oneTimeScreenshots(_ windowsToScreenshot: [Window], _ source: RefreshCausedBy) {
-        guard RuntimeFlags.thumbnailCaptureEnabled else { return }
+        guard RuntimeFlags.thumbnailCaptureEnabled, App.thumbnailCaptureAllowed(source) else { return }
         let windows = windowsToScreenshot.compactMap { $0.cgWindowId }
         guard !windows.isEmpty else { return }
         BackgroundWork.screenshotsQueue.addOperation {
+            guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
             guard source != .refreshOnlyThumbnailsAfterShowUi || App.appIsBeingUsed else { return }
             let (cachedWindows, notCachedWindows) = sortCachedAndNotCached(windows)
             Logger.debug { "cached:\(cachedWindows.map { $0.windowID }) notCached:\(notCachedWindows)" }
@@ -37,10 +38,12 @@ class WindowCaptureScreenshots {
     private static func handleNotCachedWindows(_ notCachedWindows: [CGWindowID], _ source: RefreshCausedBy) {
         guard !notCachedWindows.isEmpty else { return }
         SCShareableContent.getExcludingDesktopWindows(true, onScreenWindowsOnly: false) { shareableContent, error in
+            guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
             guard let shareableContent, error == nil else { Logger.error { "\(shareableContent == nil) \(error)" }; return }
             guard source != .refreshOnlyThumbnailsAfterShowUi || App.appIsBeingUsed else { return }
             // this callback is executed on an undetermined queue; we move execution to main-thread
             BackgroundWork.screenshotsQueue.addOperation {
+                guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
                 cachedSCWindows = shareableContent.windows
                 guard source != .refreshOnlyThumbnailsAfterShowUi || App.appIsBeingUsed else { return }
                 for notCachedWindow in notCachedWindows {
@@ -68,12 +71,14 @@ class WindowCaptureScreenshots {
     }
 
     private static func oneTimeCapture(_ scWindow: SCWindow, _ source: RefreshCausedBy) {
+        guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
         guard !App.isTerminating, let window = (Windows.list.first { $0.cgWindowId == scWindow.windowID }), window.size != nil else { return }
         let config = SCStreamConfiguration.forWindow(scWindow, window, false)
         let filter = SCContentFilter(desktopIndependentWindow: scWindow)
         ActiveWindowCaptures.increment()
         SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { sampleBuffer, error in
             ActiveWindowCaptures.decrement()
+            guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
             guard let sampleBuffer, error == nil else {
                 Logger.error { "\(window.debugId) \(sampleBuffer == nil) \(error)" }
                 BackgroundWork.screenshotsQueue.addOperation {
@@ -86,6 +91,7 @@ class WindowCaptureScreenshots {
             let pixelBuffer: CVPixelBuffer? = sampleBuffer.pixelBuffer() ?? sampleBuffer.imageBuffer
             guard let pixelBuffer else { Logger.error { "\(window.debugId) no pixelBuffer" }; return }
             DispatchQueue.main.async {
+                guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
                 guard source != .refreshOnlyThumbnailsAfterShowUi || App.appIsBeingUsed else { return }
                 if let window = (Windows.list.first { $0.cgWindowId == scWindow.windowID }) {
                     window.refreshThumbnail(.pixelBuffer(pixelBuffer))
@@ -97,13 +103,16 @@ class WindowCaptureScreenshots {
 
 class WindowCaptureScreenshotsPrivateApi {
     static func oneTimeScreenshots(_ eligibleWindows: [Window], _ source: RefreshCausedBy) {
-        guard RuntimeFlags.thumbnailCaptureEnabled else { return }
+        guard RuntimeFlags.thumbnailCaptureEnabled, App.thumbnailCaptureAllowed(source) else { return }
         for window in eligibleWindows {
             BackgroundWork.screenshotsQueue.addOperation { [weak window] in
+                guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
                 guard source != .refreshOnlyThumbnailsAfterShowUi || App.appIsBeingUsed else { return }
-                guard let wid = window?.cgWindowId, let cgImage = oneTimeCapture(wid) else { return }
+                guard let wid = window?.cgWindowId, let cgImage = oneTimeCapture(wid, source) else { return }
+                guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
                 guard source != .refreshOnlyThumbnailsAfterShowUi || App.appIsBeingUsed else { return }
                 DispatchQueue.main.async { [weak window] in
+                    guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
                     guard source != .refreshOnlyThumbnailsAfterShowUi || App.appIsBeingUsed else { return }
                     window?.refreshThumbnail(.cgImage(cgImage))
                 }
@@ -111,7 +120,8 @@ class WindowCaptureScreenshotsPrivateApi {
         }
     }
 
-    private static func oneTimeCapture(_ wid: CGWindowID) -> CGImage? {
+    private static func oneTimeCapture(_ wid: CGWindowID, _ source: RefreshCausedBy) -> CGImage? {
+        guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return nil }
         guard !App.isTerminating else { return nil }
         // we use CGSHWCaptureWindowList because it can screenshot minimized windows, which CGWindowListCreateImage can't
         var windowId_ = wid

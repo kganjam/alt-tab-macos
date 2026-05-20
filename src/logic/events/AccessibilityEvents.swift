@@ -49,8 +49,12 @@ class AccessibilityEvents {
                     guard let app = Applications.findOrCreate(pid, false) else { return }
                     Logger.info { "\(type) app:\(app.debugId)" }
                     if type == kAXWindowCreatedNotification {
+                        if !app.isParallelsCoherence {
+                            Windows.releaseZOrderEnforcementForCreatedWindow(pid: pid, label: "app-created-window")
+                        }
                         Applications.manuallyUpdateWindows(app)
                         Windows.requestZOrderReview(afterWindowLifecycleEvent: "created-app", wid: 0)
+                        syncFrontmostAfterWindowCreationIfNeeded(app)
                     } else {
                         applicationHiddenOrShown(app, pid, type)
                     }
@@ -84,6 +88,8 @@ class AccessibilityEvents {
 
     private static func applicationActivated(_ app: Application, _ pid: pid_t, _ type: String, _ appFocusedWindow: AXUIElement?, _ wid: CGWindowID?) {
         Diagnostics.log("AXEVENT", "applicationActivated pid=\(pid) app=\(app.bundleIdentifier ?? "?") guardActive=\(CFAbsoluteTimeGetCurrent() < Windows.altTabFocusTargetUntil) target=\(Windows.altTabFocusTarget?.debugId ?? "nil")")
+        if Windows.shouldCounterPostAltTabParallelsActivation(for: app, wid: wid, reason: type) { return }
+        if App.shouldSuppressPostAltTabFocusEvent(wid: wid, pid: pid, reason: type) { return }
         Windows.requestZOrderReview(reason: "app-activated", wid: wid ?? 0, fullDelayMs: 500)
         diagnoseCrossProcessActivation(activatedApp: app, activatedPid: pid)
         if Windows.shouldSuppressApplicationActivation(for: app) { return }
@@ -140,9 +146,14 @@ class AccessibilityEvents {
 
     private static func applicationFocusedOrMainWindowChanged(_ app: Application, _ pid: pid_t, _ type: String, _ appFocusedWindow: AXUIElement?, _ appFocusedWid: CGWindowID?, _ appMainWindow: AXUIElement?, _ appMainWid: CGWindowID?) {
         guard app.runningApplication.isActive else { return }
-        Applications.frontmostPid = pid
         let axWindow = appFocusedWindow ?? appMainWindow
         let wid = appFocusedWid ?? appMainWid
+        if Windows.releaseZOrderEnforcementForRecentExternalActivation(pid: pid, label: type) {
+            Windows.requestZOrderTopReview(reason: type, wid: wid ?? 0)
+        }
+        if Windows.shouldCounterPostAltTabParallelsActivation(for: app, wid: wid, reason: type) { return }
+        if App.shouldSuppressPostAltTabFocusEvent(wid: wid, pid: pid, reason: type) { return }
+        Applications.frontmostPid = pid
         guard let axWindow, let wid else {
             app.focusedWindow = nil
             return
@@ -194,7 +205,9 @@ class AccessibilityEvents {
                     App.refreshOpenUiAfterExternalEvent([window])
                 }
                 if findOrCreate.1 {
+                    Windows.releaseZOrderEnforcementForCreatedWindow(window)
                     Windows.requestZOrderReview(afterWindowLifecycleEvent: "created-window", wid: wid)
+                    syncFrontmostAfterWindowCreationIfNeeded(app)
                 }
                 if type == kAXMainWindowChangedNotification || type == kAXFocusedWindowChangedNotification {
                     focusedWindowChanged(window)
@@ -206,6 +219,14 @@ class AccessibilityEvents {
                     App.refreshOpenUiAfterExternalEvent([window])
                 }
             }
+        }
+    }
+
+    private static func syncFrontmostAfterWindowCreationIfNeeded(_ app: Application) {
+        guard app.runningApplication.isActive else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(250)) {
+            guard app.runningApplication.isActive else { return }
+            _ = Windows.syncFocusOrderWithLiveFrontmostWindow()
         }
     }
 
@@ -230,6 +251,10 @@ class AccessibilityEvents {
         // photoshop will focus a window *after* you focus another app
         // we check that a focused window happens within an active app
         guard window.application.runningApplication.isActive else { return }
+        if Windows.releaseZOrderEnforcementForRecentExternalActivation(pid: window.application.pid, label: "focusedWindowChanged") {
+            Windows.requestZOrderTopReview(reason: "focusedWindowChanged", wid: window.cgWindowId ?? 0)
+        }
+        if App.shouldSuppressPostAltTabFocusEvent(wid: window.cgWindowId, pid: window.application.pid, reason: "focusedWindowChanged") { return }
         Windows.requestZOrderReview(reason: "focused-window", wid: window.cgWindowId ?? 0, fullDelayMs: 500)
         // if the window is shown by alt-tab, we mark it as focused for this app
         // this avoids issues with dialogs, quicklook, etc (see scenarios from #1044 and #2003)
@@ -248,8 +273,9 @@ class AccessibilityEvents {
     }
 
     private static func windowResizedOrMoved(_ window: Window) {
-        Windows.requestZOrderReview(reason: "window-moved-resized", wid: window.cgWindowId ?? 0, fullDelayMs: 700)
+        if Windows.deferZOrderReviewIfDragging(wid: window.cgWindowId ?? 0) { return }
         window.updateSpacesAndScreen()
+        Windows.requestWindowMovedResizedZOrderReview(wid: window.cgWindowId ?? 0)
         App.refreshOpenUiAfterExternalEvent([window])
     }
 

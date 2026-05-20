@@ -42,6 +42,21 @@ Use `bash ai/build.sh {compile|dev|install}`. Three modes, one script:
 - `experiments/notebook.md` is the chronological experiment notebook.
   Use it for long-form run history, profiler summaries, and design notes.
   Keep the hypothesis page concise; put verbose run narratives here.
+- `experiments/release-issue-monitor.md` is the release-gate checklist of
+  every observed focus, z-order, performance, display, input, thumbnail,
+  permission, and eval-harness regression class. Before claiming a build is
+  good or releasable, check coverage against this file and update the
+  current-build audit if new failures or gaps are found.
+- `experiments/release-risk-code-review.md` maps release issues to risky
+  code areas. Update it when code review finds a new hotspot or when a
+  hotspot is fixed, tested, or intentionally left as a residual risk.
+- Before passing a build, review recent `git log`, current diffs, local
+  experiment docs, and bounded `/tmp/alttab-run.log` regions for bug classes
+  not yet represented in `experiments/release-issue-monitor.md`. Add new
+  `REL-*` entries first; do not rely on memory or a single clean eval.
+- Missing-window checks must compare WindowServer-visible windows against
+  AltTab `--detailed-list` displayability. Include Parallels Desktop console
+  windows as well as Coherence apps, Teams/Meet/OBS meeting windows.
 - `ai/build.sh` is the only supported build/install/dev loop. Use
   `compile` after edits, `dev` for TCC-safe runtime tests, and `install`
   only for rare full bundle/signing changes.
@@ -53,14 +68,65 @@ Use `bash ai/build.sh {compile|dev|install}`. Three modes, one script:
   a routine troubleshooting step.
 - `/tmp/alttab-run.log` is the main runtime diagnostic stream. Use
   `diagnosticsLevel` defaults (`perf`, `trace`, etc.) to control detail.
-  When adding timing logs, include millisecond-or-better timestamps and
-  account for logging overhead if it affects the claim.
+  When adding timing logs, include millisecond-or-better comparable UTC
+  epoch timestamps: Mac diagnostics should include `utcMs=...`, Windows/
+  Winside helper responses should include `winMs=...`. Account for logging
+  overhead if it affects the claim.
 - For UI/focus/z-order validation, run each check at least 3 times before
   trusting it. The user may still be active during unattended runs; real
   clicks, typing, display changes, or app activity can interfere with
   measurements. Treat any run with user activity or unexpected external
   events as contaminated, note it, and rerun rather than optimizing around
-  a single sample.
+  a single sample. UI-driving evals must run `ai/eval-user-idle-guard.sh`
+  first unless explicitly overridden with `ALLOW_ACTIVE_USER_EVALS=1`.
+- UI-driving experiments must snapshot the starting top-level app/window and
+  return AltTab/the desktop to that state before exiting. If the user
+  intervenes and changes the top-level window during the run, stop restoring,
+  mark the run contaminated, and leave the user's chosen state alone.
+- After any change to focus, z-order, recency, input capture, thumbnails,
+  Parallels Coherence, or display-transition behavior, run the durable
+  regression checks before claiming success:
+  - Every `bash ai/build.sh dev`/`install` run performs a bounded
+    `ai/monitor-runtime-anomalies.py` pass after launch unless
+    `ALTTAB_POST_BUILD_MONITOR_SECONDS=0`. Treat any `[DIAG ANOMALY]`,
+    front-restore, click-misroute, guest-focus error, permission prompt, or
+    popup-storm match as a failed build that must be explained or fixed.
+  - `bash ai/eval-popup-storm-guard.sh <context>` before and between UI
+    evals. If it exits `86`, stop testing immediately; the desktop is
+    contaminated by a UserNotificationCenter popup storm.
+  - `bash ai/eval-focus-regression-suite.sh` for the full panel/z-order,
+    copy, Parallels, rapid-overlap, and log-anomaly matrix.
+  - `SIMULATE_EXTERNAL_KEY=1 FAIL_KEY_EVENTS=0 SOURCE_APP=Terminal TARGET_OWNER="Outlook (classic)" LAUNCH_COMMAND="/Users/kganjam/bin/focus-parallels-outlook" bash ai/eval-external-launch-transition.sh`
+    for the Karabiner `fn+o` → Parallels Outlook Classic external-focus path.
+    The no-key control should still reproduce stale restore if the external
+    keyboard-release path is not exercised; use it only as a negative control.
+  - `bash ai/eval-rapid-overlap-transition.sh` when iterating specifically
+    on stale activation, rapid Alt-Tab, or Coherence handoff issues.
+  - `python3 ai/eval-log-anomalies.py --marker <MARKER> --end-marker "=== EVAL END MARKER: <MARKER> ===" --strict` on the bounded log region for any custom/manual experiment.
+- For every focus/z-order change, also check
+  `experiments/release-issue-monitor.md` and explicitly account for all
+  `FAIL`, `PARTIAL`, and `Gap` rows relevant to the change. A change that
+  fixes latency but causes app-wide activation or same-app sibling raising
+  is a regression and must not be accepted.
+- Per-window focus is a hard gate: standard AltTab switching must not bring
+  every window of the selected app forward. Same-app evals must verify the
+  selected target is z0 and non-target siblings are not promoted above
+  unrelated apps after the target reaches z0.
+- Treat log anomalies as test failures unless you can explain them with
+  evidence. Important anomaly classes include stale `app-activated` or
+  `focused-window` events after a newer target, `parHideNow` timeout or
+  `ready=false`, slow `updatesBeforeShowing`/`show prep`, `[DIAG SAMEAPP]`,
+  input-capture watchdogs, missing end markers, app restarts after a marker,
+  mouse contamination, popup-storm guard aborts, transient UserNotificationCenter
+  frontmost restores, stuck permission-popup flushing, and any unsafe native
+  focus experiment path (`native level pin`, `nativeMultiWindowRepoke`,
+  `z0ActivationClick`).
+- For non-brittle qualitative review, generate a prompt with
+  `bash ai/eval-prompt-review.sh <MARKER> [artifacts...]` and have Codex
+  or a subagent review the logs/artifacts against
+  `ai/prompts/focus-log-review.md`. Include `*.zscan.txt`, `*.logscan.txt`,
+  and summary artifacts. This is required for focus/z-order changes that
+  pass mechanical checks but still look or feel wrong.
 - Do not run synthetic global-hotkey tests against the user's live
   Terminal/session. They can route keystrokes to the active shell when a
   switch lands in Terminal. Use exact-focus probes first; only run
@@ -69,6 +135,10 @@ Use `bash ai/build.sh {compile|dev|install}`. Three modes, one script:
 - To verify keyboard focus without typing into the target, post Shift
   down/up only. It exercises focus delivery without inserting text or
   sending Enter/Tab into the user's active Terminal.
+- Do not re-enable automatic stuck-permission-popup flushing casually.
+  `flushStuckAuthPopupsThreshold=0` is the safe default; enabling it can
+  create repeated UserNotificationCenter/usernotificationsd kill loops if
+  TCC is unstable.
 
 # Bundle architecture
 

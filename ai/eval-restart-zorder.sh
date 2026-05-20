@@ -6,6 +6,16 @@ APP=${ALTTAB_APP:-/Applications/AltTab.app/Contents/MacOS/AltTab}
 if [ -z "${ALTTAB_DYLIB_OVERRIDE:-}" ] && [ -f "$(pwd)/dev/AltTabCore.dylib" ]; then
   export ALTTAB_DYLIB_OVERRIDE="$(pwd)/dev/AltTabCore.dylib"
 fi
+
+alttab() {
+  local out status
+  set +e
+  out=$("$APP" "$@" 2>&1)
+  status=$?
+  set -e
+  printf '%s\n' "$out" | sed -n '/^[[:space:]]*[{[]/,$p'
+  return "$status"
+}
 SAMPLER=${SAMPLER:-/tmp/alttab-z-order-sampler}
 OUT=${OUT:-/tmp/alttab-restart-zorder-$(date +%Y%m%d-%H%M%S).jsonl}
 DEV_DYLIB=${ALTTAB_DYLIB_OVERRIDE:-$(pwd)/dev/AltTabCore.dylib}
@@ -14,7 +24,7 @@ if [ ! -x "$SAMPLER" ] || [ ai/z-order-sampler.swift -nt "$SAMPLER" ]; then
   swiftc ai/z-order-sampler.swift -o "$SAMPLER"
 fi
 
-target_json=$("$APP" --detailed-list | jq -c --arg app "$WATCH_APP" 'first(.windows[] | select(.appName | test($app; "i")))')
+target_json=$(alttab --detailed-list | jq -c --arg app "$WATCH_APP" 'first(.windows[] | select(.appName | test($app; "i")))')
 if [ -z "$target_json" ] || [ "$target_json" = "null" ]; then
   echo "No watch window matching app pattern: $WATCH_APP" >&2
   exit 2

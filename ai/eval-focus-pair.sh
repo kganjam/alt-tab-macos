@@ -5,6 +5,16 @@ APP=${ALTTAB_APP:-/Applications/AltTab.app/Contents/MacOS/AltTab}
 if [ -z "${ALTTAB_DYLIB_OVERRIDE:-}" ] && [ -f "$(pwd)/dev/AltTabCore.dylib" ]; then
   export ALTTAB_DYLIB_OVERRIDE="$(pwd)/dev/AltTabCore.dylib"
 fi
+
+alttab() {
+  local out status
+  set +e
+  out=$("$APP" "$@" 2>&1)
+  status=$?
+  set -e
+  printf '%s\n' "$out" | sed -n '/^[[:space:]]*[{[]/,$p'
+  return "$status"
+}
 SOURCE_APP=${1:-Terminal}
 TARGET_APP=${2:-Safari}
 SOURCE_INDEX=${SOURCE_INDEX:-0}
@@ -16,7 +26,7 @@ INTERVAL_MS=${INTERVAL_MS:-5}
 pick_window() {
   local app=$1
   local index=$2
-  "$APP" --detailed-list | jq -c --arg app "$app" --argjson index "$index" '[.windows[] | select((.appName | test($app; "i")) and (.isMinimized | not))][$index]'
+  alttab --detailed-list | jq -c --arg app "$app" --argjson index "$index" '[.windows[] | select((.appName | test($app; "i")) and (.isMinimized | not))][$index]'
 }
 
 source_json=$(pick_window "$SOURCE_APP" "$SOURCE_INDEX")
@@ -32,7 +42,7 @@ fi
 
 source_wid=$(jq -r '.id' <<<"$source_json")
 target_wid=$(jq -r '.id' <<<"$target_json")
-"$APP" --focus="$source_wid" >/dev/null
+alttab --focus="$source_wid" >/dev/null
 sleep "$(python3 - <<PY
 print($SETTLE_MS / 1000)
 PY

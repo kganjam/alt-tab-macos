@@ -5,6 +5,16 @@ APP=${ALTTAB_APP:-/Applications/AltTab.app/Contents/MacOS/AltTab}
 if [ -z "${ALTTAB_DYLIB_OVERRIDE:-}" ] && [ -f "$(pwd)/dev/AltTabCore.dylib" ]; then
   export ALTTAB_DYLIB_OVERRIDE="$(pwd)/dev/AltTabCore.dylib"
 fi
+
+alttab() {
+  local out status
+  set +e
+  out=$("$APP" "$@" 2>&1)
+  status=$?
+  set -e
+  printf '%s\n' "$out" | sed -n '/^[[:space:]]*[{[]/,$p'
+  return "$status"
+}
 SOURCE_APP=${1:-Terminal}
 TARGET_APP=${2:-Safari}
 SOURCE_WID=${SOURCE_WID:-}
@@ -33,7 +43,7 @@ fi
 pick_window() {
   local app=$1
   local index=$2
-  "$APP" --detailed-list | jq -c --arg app "$app" --argjson index "$index" '[.windows[] | select((.appName | test($app; "i")) and (.isMinimized | not))][$index]'
+  alttab --detailed-list | jq -c --arg app "$app" --argjson index "$index" '[.windows[] | select((.appName | test($app; "i")) and (.isMinimized | not))][$index]'
 }
 
 sleep_ms() {
@@ -44,21 +54,21 @@ PY
 }
 
 selection_state_after_show() {
-  "$APP" --show=0 >/dev/null
+  alttab --show=0 >/dev/null
   sleep "$(sleep_ms "$PREFLIGHT_SHOW_MS")"
   local state
-  state=$("$APP" --selection-state)
-  "$APP" --hide >/dev/null || true
+  state=$(alttab --selection-state)
+  alttab --hide >/dev/null || true
   printf '%s\n' "$state"
 }
 
 if [ -n "$SOURCE_WID" ]; then
-  source_json=$("$APP" --detailed-list | jq -c --argjson wid "$SOURCE_WID" 'first(.windows[] | select(.id == $wid))')
+  source_json=$(alttab --detailed-list | jq -c --argjson wid "$SOURCE_WID" 'first(.windows[] | select(.id == $wid))')
 else
   source_json=$(pick_window "$SOURCE_APP" "$SOURCE_INDEX")
 fi
 if [ -n "$TARGET_WID" ]; then
-  target_json=$("$APP" --detailed-list | jq -c --argjson wid "$TARGET_WID" 'first(.windows[] | select(.id == $wid))')
+  target_json=$(alttab --detailed-list | jq -c --argjson wid "$TARGET_WID" 'first(.windows[] | select(.id == $wid))')
 else
   target_json=$(pick_window "$TARGET_APP" "$TARGET_INDEX")
 fi
@@ -72,14 +82,16 @@ if [ -z "$target_json" ] || [ "$target_json" = "null" ]; then
 fi
 
 source_wid=$(jq -r '.id' <<<"$source_json")
+source_pid=$(jq -r '.pid // 0' <<<"$source_json")
 target_wid=$(jq -r '.id' <<<"$target_json")
 target_pid=$(jq -r '.pid // 0' <<<"$target_json")
+target_bundle=$(jq -r '.appBundleId // ""' <<<"$target_json")
 source_title=$(jq -r '.title // ""' <<<"$source_json")
 target_title=$(jq -r '.title // ""' <<<"$target_json")
 
-"$APP" --focus="$target_wid" >/dev/null
+alttab --focus="$target_wid" >/dev/null
 sleep "$(sleep_ms "$SETTLE_MS")"
-"$APP" --focus="$source_wid" >/dev/null
+alttab --focus="$source_wid" >/dev/null
 sleep "$(sleep_ms "$SETTLE_MS")"
 state_after_source=$(selection_state_after_show)
 selected_wid=$(jq -r '.selectedWindow.id // 0' <<<"$state_after_source")
@@ -93,9 +105,9 @@ fi
 "$SAMPLER" --target-wid "$target_wid" --target-pid "$target_pid" --duration-ms "$DURATION_MS" --interval-ms "$INTERVAL_MS" > "$OUT" &
 sampler_pid=$!
 sleep "$(sleep_ms "$PRE_MS")"
-"$APP" --show=0 >/dev/null
+alttab --show=0 >/dev/null
 sleep "$(sleep_ms "$SHOW_TO_FOCUS_MS")"
-"$APP" --focus-target >/dev/null
+alttab --focus-target >/dev/null
 if [ "$SHIFT_PROBE" = "1" ]; then
   sleep "$(sleep_ms "$PROBE_DELAY_MS")"
   "$PROBER" >/dev/null
@@ -103,11 +115,12 @@ fi
 wait "$sampler_pid"
 final_front=$(osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null || true)
 
-python3 - "$OUT" "$PRE_MS" "$source_wid" "$target_wid" "$target_pid" "$SOURCE_APP" "$TARGET_APP" "$source_title" "$target_title" "$final_front" "$selected_index" "$selected_wid" "$selected_app" "$SHOW_TO_FOCUS_MS" "$SHIFT_PROBE" <<'PY'
+python3 - "$OUT" "$PRE_MS" "$source_wid" "$source_pid" "$target_wid" "$target_pid" "$target_bundle" "$SOURCE_APP" "$TARGET_APP" "$source_title" "$target_title" "$final_front" "$selected_index" "$selected_wid" "$selected_app" "$SHOW_TO_FOCUS_MS" "$SHIFT_PROBE" <<'PY'
 import json, sys
-path, pre_ms, source_wid, target_wid, target_pid = sys.argv[1], float(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
-source_app, target_app, source_title, target_title, final_front = sys.argv[6:11]
-selected_index, selected_wid, selected_app, show_to_focus_ms, shift_probe = sys.argv[11], int(sys.argv[12]), sys.argv[13], sys.argv[14], sys.argv[15]
+path, pre_ms, source_wid, source_pid, target_wid, target_pid = sys.argv[1], float(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
+target_bundle = sys.argv[7]
+source_app, target_app, source_title, target_title, final_front = sys.argv[8:13]
+selected_index, selected_wid, selected_app, show_to_focus_ms, shift_probe = sys.argv[13], int(sys.argv[14]), sys.argv[15], sys.argv[16], sys.argv[17]
 rows = []
 with open(path) as f:
     for line in f:
@@ -124,8 +137,20 @@ post_z0 = [r for r in after if first_z0 is not None and r["t_ms"] - pre_ms >= fi
 flickers = [r for r in post_z0 if r.get("target_z") != 0]
 source_after_z0 = [r for r in post_z0 if r.get("top_wid") == source_wid]
 missing = sum(1 for r in after if r.get("target_z") is None)
+ax_mismatches = [
+    r for r in post_z0
+    if r.get("front_pid") == target_pid
+    and r.get("ax_focused_wid") not in (None, 0, target_wid)
+]
 same_above_max = max((r.get("same_app_above") or 0 for r in after), default=0)
 same_above_after_z0 = max((r.get("same_app_above") or 0 for r in post_z0), default=0)
+same_top8_after_z0 = max((r.get("same_app_top8") or 0 for r in post_z0), default=0)
+strict_top8 = False
+strict_env = __import__("os").environ.get("STRICT_TOP8_SAME_APP", "auto").lower()
+if strict_env in ("1", "true", "yes"):
+    strict_top8 = True
+elif strict_env == "auto":
+    strict_top8 = source_pid != target_pid and "parallels" not in target_bundle.lower()
 pre_top = list(zip(baseline.get("top_wids", []), baseline.get("top_pids", []), baseline.get("top_owners", [])))
 pre_rank = {int(w): i for i, (w, _, _) in enumerate(pre_top)}
 divider = next(((int(w), int(p), o, i) for i, (w, p, o) in enumerate(pre_top) if int(w) not in (source_wid, target_wid) and int(p) != target_pid), None)
@@ -167,13 +192,15 @@ print(f"pre_top8={[(w, o) for w, _, o in pre_top[:8]]}")
 print(f"final_top8={final_top8}")
 print(f"first_target_z0_ms={first_z0 if first_z0 is not None else 'never'} first_front_pid_ms={first_front if first_front is not None else 'never'}")
 print(f"flicker_after_z0_samples={len(flickers)} source_reappears_after_z0_samples={len(source_after_z0)} target_missing_samples={missing}")
+print(f"ax_focus_mismatch_after_z0_samples={len(ax_mismatches)} first={((ax_mismatches[0]['t_ms'] - pre_ms, ax_mismatches[0].get('ax_focused_wid')) if ax_mismatches else 'none')}")
 print(f"same_app_above_max={same_above_max} same_app_above_after_z0_max={same_above_after_z0}")
+print(f"same_app_top8_after_z0_max={same_top8_after_z0} strict_top8={strict_top8} target_bundle={target_bundle!r}")
 print(f"sibling_intrusions_after_z0_max={sibling_intrusion_max} first={sibling_intrusion_first if sibling_intrusion_first else 'none'}")
 print("app_top_changes_ms=(top_wid,top_owner,target_z,same_app_above)")
 for item in top_changes[:24]:
     print(f"  {item[0]} {item[1]}")
 if len(top_changes) > 24:
     print(f"  ... {len(top_changes) - 24} more")
-failed = first_z0 is None or final_row.get("top_wid") != target_wid or len(flickers) > 0 or sibling_intrusion_max > 0
+failed = first_z0 is None or final_row.get("top_wid") != target_wid or len(flickers) > 0 or len(ax_mismatches) > 0 or sibling_intrusion_max > 0 or (strict_top8 and same_top8_after_z0 > 1)
 sys.exit(1 if failed else 0)
 PY

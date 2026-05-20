@@ -19,6 +19,7 @@ class BackgroundWork {
     static var permissionsCheckOnTimerQueue: LabeledOperationQueue!
     static var permissionsSystemCallsQueue: LabeledOperationQueue!
     static var zOrderCacheQueue: LabeledOperationQueue!
+    static var fastZOrderQueue: LabeledOperationQueue!
 
     private static var debugMenu: DebugMenu!
     private static var totalPotentialThreadCount = 0
@@ -49,6 +50,7 @@ class BackgroundWork {
         // we listen to CLI commands (CFMessagePort events)
         cliEventsThread = BackgroundThreadWithRunLoop("cliMessages", .userInteractive)
         zOrderCacheQueue = LabeledOperationQueue("zOrderCache", .userInteractive, 1)
+        fastZOrderQueue = LabeledOperationQueue("fastZOrder", .userInteractive, 1)
        // logThreadsAndQueuesOnRepeat()
     }
 

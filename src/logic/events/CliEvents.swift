@@ -58,11 +58,7 @@ class CliServer {
             )
         }
         if rawValue == "--selection-state" {
-            return JsonSelectionState(
-                appIsBeingUsed: App.appIsBeingUsed,
-                selectedIndex: Windows.selectedWindowIndex,
-                selectedWindow: Windows.selectedWindow().map { jsonWindowFull($0) },
-                windows: Windows.list.filter { !$0.isWindowlessApp }.map { jsonWindowFull($0) })
+            return selectionState()
         }
         if rawValue == "--hide" {
             App.hideUi(true)
@@ -70,6 +66,25 @@ class CliServer {
         }
         if rawValue == "--focus-target" {
             App.focusTarget()
+            return noOutput
+        }
+        if rawValue.hasPrefix("--select="),
+           let id = CGWindowID(rawValue.dropFirst("--select=".count)),
+           let index = Windows.list.firstIndex(where: { $0.cgWindowId == id }) {
+            Windows.updateSelectedAndHoveredWindowIndex(index)
+            return noOutput
+        }
+        if rawValue.hasPrefix("--select-and-focus="),
+           let id = CGWindowID(rawValue.dropFirst("--select-and-focus=".count)),
+           let index = Windows.list.firstIndex(where: { $0.cgWindowId == id }) {
+            Windows.updateSelectedAndHoveredWindowIndex(index)
+            let selected = Windows.selectedWindow()
+            App.focusSelectedWindow(selected)
+            return selectionState(selected)
+        }
+        if rawValue.hasPrefix("--select-index="),
+           let index = Int(rawValue.dropFirst("--select-index=".count)) {
+            Windows.updateSelectedAndHoveredWindowIndex(index)
             return noOutput
         }
         if rawValue.hasPrefix("--focus="),
@@ -90,6 +105,15 @@ class CliServer {
             return noOutput
         }
         return error
+    }
+
+    private static func selectionState(_ selectedWindow: Window? = Windows.selectedWindow()) -> JsonSelectionState {
+        JsonSelectionState(
+            appIsBeingUsed: App.appIsBeingUsed,
+            selectedIndex: Windows.selectedWindowIndex,
+            selectedWindow: selectedWindow.map { jsonWindowFull($0) },
+            visibleThumbnailWindowIds: App.appIsBeingUsed ? TilesView.visibleWindowsForThumbnailRefresh().compactMap { $0.cgWindowId } : [],
+            windows: Windows.list.filter { !$0.isWindowlessApp }.map { jsonWindowFull($0) })
     }
 
     private static func jsonWindowFull(_ window: Window) -> JsonWindowFull {
@@ -113,7 +137,10 @@ class CliServer {
             size: window.size,
             hasThumbnail: window.thumbnail != nil,
             thumbnailAgeMs: thumbnailAgeMs,
-            thumbnailUpdateCount: window.thumbnailUpdateCount
+            thumbnailUpdateCount: window.thumbnailUpdateCount,
+            shouldShowTheUser: window.shouldShowTheUser,
+            displayHideReasons: Windows.displayHideReasons(window),
+            isDisplayable: Windows.isDisplayableForCurrentUi(window)
         )
     }
 
@@ -134,6 +161,7 @@ class CliServer {
         var appIsBeingUsed: Bool
         var selectedIndex: Int
         var selectedWindow: JsonWindowFull?
+        var visibleThumbnailWindowIds: [CGWindowID]
         var windows: [JsonWindowFull]
     }
 
@@ -157,6 +185,9 @@ class CliServer {
         var hasThumbnail: Bool
         var thumbnailAgeMs: Double?
         var thumbnailUpdateCount: Int
+        var shouldShowTheUser: Bool
+        var displayHideReasons: [String]
+        var isDisplayable: Bool
     }
 }
 
@@ -164,7 +195,7 @@ class CliClient {
     static func detectCommand() -> String? {
         let args = CommandLine.arguments
         if args.count == 2 && !args[1].starts(with: "--logs=") {
-            if args[1] == "--list" || args[1] == "--detailed-list" || args[1] == "--selection-state" || args[1] == "--hide" || args[1] == "--focus-target" || args[1].hasPrefix("--focus=") || args[1].hasPrefix("--focusUsingLastFocusOrder=") || args[1].hasPrefix("--show=") {
+            if args[1] == "--list" || args[1] == "--detailed-list" || args[1] == "--selection-state" || args[1] == "--hide" || args[1] == "--focus-target" || args[1].hasPrefix("--select=") || args[1].hasPrefix("--select-index=") || args[1].hasPrefix("--select-and-focus=") || args[1].hasPrefix("--focus=") || args[1].hasPrefix("--focusUsingLastFocusOrder=") || args[1].hasPrefix("--show=") {
                 return args[1]
             }
         }

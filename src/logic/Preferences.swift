@@ -25,7 +25,8 @@ class Preferences {
             "showTabsAsWindows": "false",
             "hideColoredCircles": "false",
             "windowDisplayDelay": "100",
-            "coherenceDisplayDelay": "500",
+            "coherenceDisplayDelay": "300",
+            "parSameBoundaryDisplayDelayMs": "150",
             "appearanceStyle": AppearanceStylePreference.thumbnails.indexAsString,
             "appearanceSize": AppearanceSizePreference.auto.indexAsString,
             "appearanceTheme": AppearanceThemePreference.system.indexAsString,
@@ -51,11 +52,32 @@ class Preferences {
             "previewFocusedWindow": "false",
             "captureWindowsInBackground": "true",
             "thumbnailCaptureEnabled": "true",
+            "thumbnailCaptureSettleGateEnabled": "true",
+            "thumbnailUseScreenCaptureKit": "false",
             "focusOverlayCaptureEnabled": "true",
             "zOrderCacheEnabled": "true",
             "zOrderFixesEnabled": "true",
+            "fastZOrderMonitorEnabled": "true",
+            "fastZOrderNativeMonitorEnabled": "false",
+            "fastZOrderMonitorIntervalMs": "25",
+            "fastZOrderRepairFocusEnabled": "false",
+            "fastZOrderRepairThrottleMs": "75",
+            "fastZOrderSyntheticClickEnabled": "false",
+            "parallelsTargetUserGeneratedFocusEnabled": "true",
+            "parSameBoundaryTargetUserGeneratedFocusEnabled": "true",
+            "parTargetAxFrontmostEnabled": "false",
+            "parGuestPrefocusEnabled": "true",
+            "parGuestForegroundDiagnosticsEnabled": "true",
+            "skipCoherenceThumbnailsDuringPanel": "true",
+            "parGuestPrefocusHostDelayMs": "20",
+            "parGuestPrefocusMaxAgeMs": "350",
+            "nativeNoWindowsFocusEnabled": "false",
+            "nativeExperimentalFocusModesEnabled": "false",
+            "zOrderEnforcementMs": "2500",
             "diagnosticsBasicPerfOnly": "false",
-            "nativeFocusMode": "skyLightEventFocus",
+            "syncRefreshCoherenceTitlesBeforeShowing": "false",
+            "coherenceTitleAxTimeoutMs": "60",
+            "nativeFocusMode": "original",
             "nativeFocusClickFallbackEnabled": "false",
             "nativeFocusClickFallbackDelayMs": "60",
             "inputCaptureWatchdogMs": "15000",
@@ -65,7 +87,20 @@ class Preferences {
             "parHideMaxDelayMs": "1200",
             "parHidePollIntervalMs": "25",
             "parHideStableMs": "250",
+            "parSameBoundaryHideStableMs": "700",
+            "parSameBoundaryStackStableMs": "700",
+            "parSameBoundaryStackStableWindowCount": "8",
             "parHideRequiresFrontmost": "true",
+            "parTargetReassertDelayMs": "350",
+            "parSameBoundaryReassertDelayMs": "120",
+            "parTargetHardMaxDelayMs": "1600",
+            "parTargetVisualReassertDelayMs": "1100",
+            "parTargetVisualReassertIntervalMs": "450",
+            "parTargetVisualReassertMaxCount": "4",
+            "parTargetAbsoluteMaxDelayMs": "3200",
+            "parToMacSyntheticClickEnabled": "true",
+            "postAltTabFocusSuppressionMs": "2500",
+            "protectNativeCommandBacktickShortcut": "false",
             "screenRecordingPermissionSkipped": "false",
             "trackpadHapticFeedbackEnabled": "true",
             "settingsWindowShownOnFirstLaunch": "false",
@@ -411,9 +446,30 @@ class CachedUserDefaults {
 enum RuntimeFlags {
     static var diagnosticsBasicPerfOnly: Bool { bool("diagnosticsBasicPerfOnly", default: false) }
     static var thumbnailCaptureEnabled: Bool { bool("thumbnailCaptureEnabled", default: true) }
+    static var thumbnailCaptureSettleGateEnabled: Bool { bool("thumbnailCaptureSettleGateEnabled", default: true) }
+    static var thumbnailUseScreenCaptureKit: Bool { bool("thumbnailUseScreenCaptureKit", default: false) }
     static var focusOverlayCaptureEnabled: Bool { bool("focusOverlayCaptureEnabled", default: true) }
     static var zOrderCacheEnabled: Bool { bool("zOrderCacheEnabled", default: true) }
     static var zOrderFixesEnabled: Bool { bool("zOrderFixesEnabled", default: true) }
+    static var fastZOrderMonitorEnabled: Bool { bool("fastZOrderMonitorEnabled", default: true) }
+    static var fastZOrderNativeMonitorEnabled: Bool { bool("fastZOrderNativeMonitorEnabled", default: false) }
+    static var fastZOrderMonitorIntervalMs: Int { int("fastZOrderMonitorIntervalMs", default: 25) }
+    static var fastZOrderRepairFocusEnabled: Bool { bool("fastZOrderRepairFocusEnabled", default: false) }
+    static var fastZOrderRepairThrottleMs: Int { int("fastZOrderRepairThrottleMs", default: 75) }
+    static var fastZOrderSyntheticClickEnabled: Bool { bool("fastZOrderSyntheticClickEnabled", default: false) }
+    static var parallelsTargetUserGeneratedFocusEnabled: Bool { bool("parallelsTargetUserGeneratedFocusEnabled", default: true) }
+    static var parSameBoundaryTargetUserGeneratedFocusEnabled: Bool { bool("parSameBoundaryTargetUserGeneratedFocusEnabled", default: true) }
+    static var parTargetAxFrontmostEnabled: Bool { bool("parTargetAxFrontmostEnabled", default: false) }
+    static var parGuestPrefocusEnabled: Bool { bool("parGuestPrefocusEnabled", default: true) }
+    static var parGuestForegroundDiagnosticsEnabled: Bool { bool("parGuestForegroundDiagnosticsEnabled", default: true) }
+    static var skipCoherenceThumbnailsDuringPanel: Bool { bool("skipCoherenceThumbnailsDuringPanel", default: true) }
+    static var parGuestPrefocusHostDelayMs: Int { int("parGuestPrefocusHostDelayMs", default: 20) }
+    static var parGuestPrefocusMaxAgeMs: Int { int("parGuestPrefocusMaxAgeMs", default: 350) }
+    static var nativeNoWindowsFocusEnabled: Bool { bool("nativeNoWindowsFocusEnabled", default: false) }
+    static var nativeExperimentalFocusModesEnabled: Bool { bool("nativeExperimentalFocusModesEnabled", default: false) }
+    static var zOrderEnforcementMs: Int { int("zOrderEnforcementMs", default: 2500) }
+    static var syncRefreshCoherenceTitlesBeforeShowing: Bool { bool("syncRefreshCoherenceTitlesBeforeShowing", default: false) }
+    static var coherenceTitleAxTimeoutMs: Int { int("coherenceTitleAxTimeoutMs", default: 60) }
     static var nativeFocusClickFallbackEnabled: Bool { bool("nativeFocusClickFallbackEnabled", default: false) }
     static var nativeFocusClickFallbackDelayMs: Int { int("nativeFocusClickFallbackDelayMs", default: 60) }
     static var inputCaptureWatchdogMs: Int { int("inputCaptureWatchdogMs", default: 15000) }
@@ -423,7 +479,21 @@ enum RuntimeFlags {
     static var parHideMaxDelayMs: Int { int("parHideMaxDelayMs", default: 1200) }
     static var parHidePollIntervalMs: Int { int("parHidePollIntervalMs", default: 25) }
     static var parHideStableMs: Int { int("parHideStableMs", default: 250) }
+    static var parSameBoundaryDisplayDelayMs: Int { int("parSameBoundaryDisplayDelayMs", default: 150) }
+    static var parSameBoundaryHideStableMs: Int { int("parSameBoundaryHideStableMs", default: 700) }
+    static var parSameBoundaryStackStableMs: Int { int("parSameBoundaryStackStableMs", default: 700) }
+    static var parSameBoundaryStackStableWindowCount: Int { int("parSameBoundaryStackStableWindowCount", default: 8) }
     static var parHideRequiresFrontmost: Bool { bool("parHideRequiresFrontmost", default: true) }
+    static var parTargetReassertDelayMs: Int { int("parTargetReassertDelayMs", default: 350) }
+    static var parSameBoundaryReassertDelayMs: Int { int("parSameBoundaryReassertDelayMs", default: 120) }
+    static var parTargetHardMaxDelayMs: Int { int("parTargetHardMaxDelayMs", default: 1600) }
+    static var parTargetVisualReassertDelayMs: Int { int("parTargetVisualReassertDelayMs", default: 1100) }
+    static var parTargetVisualReassertIntervalMs: Int { int("parTargetVisualReassertIntervalMs", default: 450) }
+    static var parTargetVisualReassertMaxCount: Int { int("parTargetVisualReassertMaxCount", default: 4) }
+    static var parTargetAbsoluteMaxDelayMs: Int { int("parTargetAbsoluteMaxDelayMs", default: 3200) }
+    static var parToMacSyntheticClickEnabled: Bool { bool("parToMacSyntheticClickEnabled", default: true) }
+    static var postAltTabFocusSuppressionMs: Int { int("postAltTabFocusSuppressionMs", default: 2500) }
+    static var protectNativeCommandBacktickShortcut: Bool { bool("protectNativeCommandBacktickShortcut", default: false) }
 
     private static func bool(_ key: String, default defaultValue: Bool) -> Bool {
         guard let value = UserDefaults.standard.object(forKey: key) else { return defaultValue }

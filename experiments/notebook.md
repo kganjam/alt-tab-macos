@@ -539,3 +539,268 @@ corrections below the visible-fold reflect the user's expected order.
   - remaining visible handoff time is not AltTab CPU-bound in this profile,
   - UI layout/render cost remains worth optimizing for show latency, but it is separate from the observed WindowServer/app z0 handoff delay.
 - Attempted an all-process Time Profiler run to include WindowServer/Safari/Terminal. It exceeded the requested 14s limit and had to be killed. Treat all-process Instruments as manually supervised only; do not use it in unattended test loops.
+
+## 2026-05-19 — rollback of unsafe native focus experiments and final validation
+
+- Starting state: an experimental dev build with native level pinning, dense Terminal repokes, and z0 activation click fallback left the desktop in split-brain z-order: Safari was the front process, but Terminal windows were visually top. Stopped AltTab, reset window levels, and activated Safari to recover normal visual layering.
+- Reverted unsafe app behavior:
+  - removed native target level pinning and delayed restore bookkeeping,
+  - removed dense `nativeMultiWindowRepoke` timers,
+  - removed z0 activation click fallback,
+  - restored `nativeFocusClickFallbackEnabled=false`,
+  - kept the previously validated Terminal/iTerm target-only focus path.
+- Kept/fixed safer pieces:
+  - Carbon front-process sampling in `ai/z-order-sampler.swift`,
+  - exact `--select`/`--select-index` CLI support for panel-driven evaluators,
+  - post-AltTab stale source-event suppression, tightened so target-pid events are not suppressed,
+  - evaluator wrapper that strips shim banner text before piping CLI JSON to `jq`.
+- Found a false-negative source in validation: Safari exposed `wid=141927`, a `1451x20` empty layer-0 helper strip, above the selected document window. It was not a real app window, but the sampler and repair logic counted it. Updated filters to ignore windows with either dimension <40.
+- Build/runtime:
+  - `bash ai/build.sh compile` succeeded after code edits,
+  - `bash ai/build.sh dev` produced `dev/AltTabCore.dylib` cdhash `425ceaeaa660c3cdf62af5be9bb8204f76bd6429`,
+  - the build-script background launch exited on this machine; direct launch stayed running: `ALTTAB_DYLIB_OVERRIDE=dev/AltTabCore.dylib /Applications/AltTab.app/Contents/MacOS/AltTab --logs=perf`.
+- Validation files and results:
+  - Terminal→Safari: `/tmp/alttab-select-zorder-20260519-022143.jsonl`, `...022148.jsonl`, `...022153.jsonl`; all pass, z0 1214.9/817.7/1570.0ms, no flicker/source reappear/sibling intrusion.
+  - Safari→Terminal: `/tmp/alttab-select-zorder-20260519-022157.jsonl`, `...022202.jsonl`, `...022207.jsonl`; all pass, z0 535.5/706.3/646.4ms, no flicker/source reappear/sibling intrusion.
+  - OneNote→Safari: `/tmp/alttab-select-zorder-20260519-022227.jsonl`, `...022233.jsonl`, `...022239.jsonl`; all pass, z0 400.2/1299.3/702.8ms, no flicker/source reappear/sibling intrusion.
+  - Safari→OneNote: `/tmp/alttab-select-zorder-20260519-022245.jsonl`, `...022250.jsonl`, `...022256.jsonl`; all pass, z0 494.6/473.2/431.8ms, no flicker/source reappear/sibling intrusion.
+  - Safari copy regression: `DELAY=1.2 bash ai/eval-copy-after-focus.sh Safari` passed 3/3 with pasteboard bytes matching the expected URL each time.
+- Interpretation:
+  - The recent flicker/regression risk came from the attempted native compositor interventions, not from the validated target-only path.
+  - Current correctness looks good across native↔native and Parallels↔native panel-driven paths.
+  - Terminal→Safari can still take more than a second for visual z0, but AltTab’s logged focus calls complete in tens of milliseconds and the target does not oscillate after it reaches z0.
+
+## 2026-05-19 — evaluator hardening after missed rapid-overlap failure
+
+- Found why a visible issue was not caught:
+  - rapid run `rapid-overlap-20260519-025812-10827` wrote its marker, then the logged AltTab process restarted later; the old log scanner selected the wrong/empty region and printed `lines=0 failures=0`,
+  - the z-order sampler did catch the real failure: final front process was Terminal while the visual top window stayed OneNote and the target Terminal window never reached z0,
+  - the marked log region also contained repeated `stuck-popup detection` lines and real mouse events, so the run was contaminated and should never have been accepted as clean evidence.
+- Hardened evaluators:
+  - `ai/eval-log-anomalies.py` now supports `--end-marker`, fails restarts after markers, fails missing focus-path logs when an expected final window is supplied, fails stuck-popup flushing, and can fail mouse/key contamination,
+  - `ai/eval-select-transition.sh` and `ai/eval-rapid-overlap-transition.sh` now write bounded start/end markers, persist `*.zscan.txt` and `*.logscan.txt`, assert final visual top window and front-process agreement, and run stale-event scans per rep,
+  - `ai/eval-focus-regression-suite.sh` now runs all reps even after failures, stores child artifacts under the suite directory, generates a prompt review with the actual z/log scan files, and exits nonzero if any rep or scan fails.
+- Safety fix:
+  - live AltTab PID 11168 was stopped after it killed UserNotificationCenter/usernotificationsd every 10s due the stuck-popup watcher,
+  - changed `flushStuckAuthPopupsThreshold` default to `0` and set the local default to `0`; automatic popup flushing is now opt-in only.
+
+## 2026-05-19 — native slow-path cleanup and final validation
+
+- Cleaned lingering native focus experiments before final validation:
+  - reset local defaults to `nativeFocusMode=original`, `diagnosticsLevel=perf`, and deleted persisted `nativeExperimentalFocusModesEnabled`, `nativeNoWindowsFocusEnabled`, `fastZOrderNativeMonitorEnabled`, and `fastZOrderSyntheticClickEnabled`,
+  - made `nativeExperimentalFocusModesEnabled=false` the code default so persisted `nativeFocusMode=skyLightEventFocus` cannot silently keep the app on a slow experimental path,
+  - made `nativeNoWindowsFocusEnabled=false` the code default so Terminal/iTerm do not use the no-windows experiment unless explicitly enabled.
+- Native Safari↔Terminal evidence:
+  - `CGSOrderWindow(target, above, 0)` repeatedly returned `err=1000`; direct z-order correction is rejected by WindowServer for these windows,
+  - background native fast z-monitor fired and queued repairs, but repeated `CGWindowListCopyWindowInfo` scans were sometimes 25-300ms and did not reduce visible z0 enough to justify default native monitoring,
+  - `hidTitlebarClick` no-cursor experiment failed source-readiness checks by leaving visual top and front-process signals split; not safe as default,
+  - skipping `refreshOpenUiAfterExternalEvent()` while AltTab is actively focusing removed redundant panel rebuilds from the focus path.
+- Current running build:
+  - `bash ai/build.sh compile` passed,
+  - `bash ai/build.sh dev` launched PID 87707 through the installed shim with `ALTTAB_DYLIB_OVERRIDE=dev/AltTabCore.dylib`,
+  - dev dylib cdhash `45b874e45b0c27718484b44e2c30b288dd91ade6`.
+- Final artifacts: `/tmp/alttab-final-20260519-051754`.
+  - Safari→Terminal: pass, z0 1315.7ms for a deep target and 444.0ms for immediate previous target; zero flicker-after-z0/source-reappear/sibling-intrusion samples.
+  - Terminal→Safari: pass, z0 1453.6ms; zero flicker-after-z0/source-reappear/sibling-intrusion samples.
+  - Rapid Safari→OneNote→Terminal: pass, final Terminal z0, no source/first-target reappear after z0, zero log failures.
+- Operational note: the repeated unified-exec warning is not correlated with live eval/profiling processes after subagents were closed; `pgrep` showed one AltTab instance and no active eval jobs. Continue avoiding long-lived shell sessions.
+
+## 2026-05-19 — Karabiner `fn+o` / Parallels Outlook Classic stale restore
+
+- Correction from user: `fn+o` is a Karabiner hotkey for Parallels Outlook Classic, not Mac Outlook. The active Karabiner config runs `/Users/kganjam/bin/focus-parallels-outlook`, which opens `/Users/kganjam/Applications (Parallels)/.../Outlook (classic).app` and raises the `Outlook (classic)` Explorer window via AX.
+- Root cause reproduced with corrected target:
+  - pre-fix corrected eval marker `external-launch-20260519-111750-75265` showed AltTab `FRONT_MISMATCH` restoring the previous Terminal target after Outlook Classic became frontmost,
+  - the stale target was Terminal `wid=130253`/`wid=118671`; frontmost was Outlook Classic `pid=96043`; AltTab re-issued `SLPS(userGenerated)+AX` to Terminal,
+  - this explains “Outlook never came to front”: Karabiner did focus Outlook, then AltTab’s stale z-order enforcement fought the external focus and put Terminal back.
+- Fix implemented:
+  - track non-AltTab keyboard activity as external user intent,
+  - release stale `recentZOrderIntents`, `altTabFocusTarget`, and z-order timers when external keyboard activity arrives after an AltTab focus intent,
+  - also release on a subsequent external app activation/front-mismatch if it follows that keyboard activity,
+  - log the release at default `GUARD` level so it is visible without trace logs.
+- Evaluator hardening:
+  - added `ai/eval-external-launch-transition.sh` for external app/hotkey paths that must not call AltTab focus,
+  - added `ai/post-modifier.swift` so the eval can post Shift down/up as a harmless external-key signal before launching the Karabiner target,
+  - added `--fail-front-restore` to `ai/eval-log-anomalies.py`, and the external eval now fails if any `FRONT_MISMATCH` restore fires.
+- Validation:
+  - negative control without simulated external key still reproduced the stale restore: `/tmp/alttab-karabiner-outlook-nosim-20260519-113232`, `eval_rc=1`, repeated `FRONT_MISMATCH ... restoring` Terminal over Outlook Classic,
+  - final keyed run passed: `/tmp/alttab-karabiner-outlook-final-20260519-113457`, `eval_rc=0`, Outlook Classic first z0 at `589.836ms`, zero post-z0 flicker samples, final visual top and focused app both Outlook Classic, and bounded log scan failures/warnings were zero,
+  - final run logged `released stale z-order enforcement by external keyboard ... target=#130231 age=1189ms`, and no `FRONT_MISMATCH` restore fired after the marker.
+- Testing lesson: generic `TARGET_OWNER=Outlook` is ambiguous on this machine. Always use `TARGET_OWNER="Outlook (classic)"` plus `LAUNCH_COMMAND=/Users/kganjam/bin/focus-parallels-outlook` for the Karabiner `fn+o` path.
+
+## 2026-05-19 — drag jitter and external-key guard regression
+
+- User-visible regression:
+  - Teams/Parallels window dragging became jittery after z-order review changes,
+  - logs during the drag showed repeated main-thread `z-order review reason=window-moved-resized` entries every ~200ms while the mouse was down,
+  - those reviews scheduled immediate top refreshes plus delayed full z scans, competing with Parallels/WindowServer during live resize/move.
+- Fix:
+  - record global mouse button down/up,
+  - while any mouse button is down, skip `window.updateSpacesAndScreen()`, thumbnail refresh, and z-order review for `windowResizedOrMoved`,
+  - remember one pending moved window and run the spaces/thumb/z-order refresh once after mouse-up,
+  - change mouse-down from full z review to top-only review to avoid heavy work at drag start.
+- Related regression:
+  - the first external-keyboard fix fired for normal AltTab modifier events because the modifier event arrived before the global hotkey event,
+  - logs showed `released stale z-order enforcement by external keyboard` during ordinary AltTab sequences,
+  - fixed by timestamping AltTab shortcut events and delaying external-key release long enough to reject events adjacent to AltTab hotkeys.
+- Dev-launch lesson:
+  - direct `ai/build.sh dev` background exec launched AltTab but the process exited after the wrapper returned,
+  - switched dev launch back to LaunchServices with `launchctl setenv ALTTAB_DYLIB_OVERRIDE` plus `open -na`, preserving TCC and keeping PPID 1 ownership.
+- Current state after patch:
+  - `bash ai/build.sh compile` passed,
+  - `bash ai/build.sh dev` launched PID 96887 through `/Applications/AltTab.app/Contents/MacOS/AltTab`,
+  - dev dylib cdhash `482c3b77ccc4f18fd35c38fb7ab5657108e49616`,
+  - process stayed alive with PPID 1 and low idle CPU after startup.
+
+## 2026-05-19 — Parallels Desktop coverage and SkyLight native default
+
+- A prior release-gate gap let slow Terminal→Safari runs pass even though the z-sampler recorded first target z0 over one second. `ai/eval-select-transition.sh` now has `MAX_Z0_MS` and fails when `first_target_z0_ms` exceeds the threshold.
+- A/B evidence:
+  - `original` native mode measured Terminal→Safari at `1293ms`, `1277ms`, and `1464ms`,
+  - `hidTitlebarClick` failed source-readiness checks and left Safari top/focused while the evaluator was trying to establish Terminal as the source,
+  - `skyLightEventFocus` measured Terminal→Safari at `910ms`, `519ms`, and `444ms` in the A/B run, with no sibling intrusion.
+- Current candidate after manual dev relaunch:
+  - PID `11575`, dev dylib cdhash `e9773c026c081dc687d5dd5b3ea1c56a6c0f6c34`,
+  - `nativeFocusMode=skyLightEventFocus` is now the default after deleting the local override,
+  - `focusSelectedWindow` now refuses to arm focus/z-order intent when selection has no `cgWindowId`.
+- Targeted validation:
+  - `/tmp/alttab-post-skylight-post-skylight-20260519-130227`: Terminal→Safari first z0 `497ms`, `544ms`, `542ms`; Safari→Terminal `472ms`, `348ms`, `530ms`; Terminal↔Parallels Desktop all under `570ms`; bounded log scan had zero failures/warnings.
+  - `/tmp/alttab-sameapp-copy-sameapp-copy-20260519-130359`: Terminal→Terminal and Safari→Safari passed 3/3 with zero post-z0 same-app sibling intrusion; Safari toolbar copy passed 3/3.
+  - `ai/eval-window-coverage.sh` found the visible Parallels Desktop `Windows 11` console window in AltTab `--detailed-list` and displayable.
+- Interpretation:
+  - the latest targeted subset is no longer showing nil-target focus, input-capture watchdogs, or all-siblings-up behavior,
+  - this is not a release pass; Coherence app matrix, display topology, thumbnail-click/freshness, Spaces, Hammerspoon, drag jitter, and deep/timing matrices remain release blockers in `experiments/release-issue-monitor.md`.
+
+## 2026-05-19 — release monitor expansion from history/code/log review
+
+- Reviewed recent commit history, current diffs, `AGENTS.md`, experiment docs, risky code callsites, and the latest `/tmp/alttab-run.log` tail.
+- History added concrete release gates that were not explicit enough:
+  - multiple AltTab instances or wrong bundle path from DerivedData/TCC attribution issues,
+  - restart/PermissionsWindow cascades from event-tap/TCC failures,
+  - stale experimental defaults silently changing runtime behavior,
+  - modal/dialog/popup z-order handling from the restored dialog-detection fix,
+  - hidden/bugged app windows from upstream hidden-window handling,
+  - sleep/wake event-tap recovery,
+  - search/filter selection and panel geometry,
+  - windowless/app-only `activateAllWindows` boundaries,
+  - stuck modifiers and duplicate shortcut fires,
+  - compositor pause/overlay-level regressions,
+  - capture/pre-capture WindowServer stalls and crash-prone preview paths,
+  - eval helper app-launch/app-quit contamination,
+  - high-window-count latency,
+  - AX observer coverage gaps,
+  - private SkyLight/API compatibility,
+  - native Command-Tab restoration.
+- Recent log tail showed many `app-launched`/`app-quit` z-order review events from helper activity plus one `window-moved-resized-postdrag` review. These did not by themselves prove a current product bug, but they justify explicit eval-contamination and drag-review gates.
+- Recent local Codex session logs for 2026-05-19 were narrowly parsed after an overly broad grep hit unrelated repos. The relevant AltTab sessions emphasized rapid-overlap stale events and false passes from missing/restarted bounded markers; those are already represented by REL-008 and REL-050, so no additional row was needed from session review.
+- Updated `experiments/release-issue-monitor.md` with REL-054 through REL-071, expanded preflight/build/native/window-lifecycle/keyboard/perf checklists, and added a mandatory history/code-review section.
+
+## 2026-05-19 — release-risk code review and scoped repair hardening
+
+- Created `experiments/release-risk-code-review.md` as the separate code-area risk list mapping release issues to hotspots, risk rationale, validation requirements, and current mitigation status.
+- Code review identified the highest-risk implementation issue as broad z-order/AX recovery:
+  - full-stack expected z-order restore could move unrelated windows based on a stale preZ snapshot,
+  - generic native AX raise fallback could reintroduce same-app sibling promotion,
+  - unused native sibling repair helpers were still present even though they were intentionally no longer called.
+- Fixes:
+  - removed unused native sibling-repair and AX helper functions from `Windows.swift`,
+  - narrowed `restoreExpectedZOrder` to only demote same-pid siblings promoted above the first unrelated divider,
+  - skipped generic native `kAXRaiseAction` in fast z repair and enforcement; retained AX raise only for Parallels Coherence recovery.
+- Added `ai/eval-release-risk-static.sh` to enforce the code-review constraints: no dead sibling repair helpers, no full-stack restore text/path, Parallels-gated AX repair, constrained `activateAllWindows`, doc linkage, and sequential release issue IDs.
+
+## 2026-05-19 — popup-storm regression detection
+
+- Latest broad suite `/tmp/alttab-focus-suite-release-risk-20260519-141048` showed repeated `UserNotificationCenter` frontmost mismatches and stale restores; that run is contaminated and not release evidence.
+- Added `ai/eval-popup-storm-guard.sh` backed by a Swift CGWindow query. It counts visible `UserNotificationCenter` windows and exits `86` when the threshold is exceeded.
+- Wired the guard into the full focus suite and the direct select/copy/rapid/external eval scripts before risky phases and after samplers, so testing stops immediately when a storm is detected.
+- Added log-anomaly failures for popup guard aborts, top-8 `UserNotificationCenter` storm signatures, and frontmost restores against transient `UserNotificationCenter`.
+- Product-side guard now ignores transient system frontmost apps in `FRONT_MISMATCH` repair and click-after diagnostics, preventing stale restore attempts against permission/notification UI.
+
+## 2026-05-19 — current popup spam cleared
+
+- User reported visible popup spam. Live guard initially saw no counted `UserNotificationCenter` windows, but `UserNotificationCenter` was frontmost and logs showed `Screen-recording permission call timed out after 6s` every ~7 seconds from AltTab PID 33157.
+- Stopped AltTab and killed `UserNotificationCenter`, `usernotificationsd`, `usernoted`, `CoreServicesUIAgent`, and `LocalAuthenticationRemoteService` to clear the visible storm. Guard then reported `ok`, Safari was frontmost, and AltTab stayed stopped.
+- Root cause was the Screen Recording permission timer repeatedly invoking the prompt-capable ScreenCaptureKit probe after timeouts. `CGPreflightScreenCaptureAccess()` reported granted, so the prompt-capable probe was unnecessary.
+- Fixed `ScreenRecordingPermission.detect()` to use non-prompting `CGPreflightScreenCaptureAccess()` first, delay the initial prompt-capable probe by 5 minutes, throttle normal prompt-capable probes to 5 minutes, and back off 15 minutes after a timeout.
+- Validation: `bash ai/build.sh compile` passed; `bash ai/build.sh dev` relaunched AltTab PID 36051 with dev dylib `b757bfb67dd29c8435b038c2193116eb7af14a91`; popup guard stayed `ok` and a 25-second bounded log watch produced no new permission/popup lines.
+
+## 2026-05-19 — panel scrolling resets input-capture watchdog
+
+- User reported the thumbnail viewer disappearing while actively scrolling through pages.
+- Recent logs showed the panel disappeared from `[DIAG CAPTURE] watchdog hiding stuck input capture after 15000ms`, not from a normal focus action. The watchdog was armed once at panel open and did not reset on scroll/navigation activity.
+- Fix: `App.noteInputCaptureActivity` re-arms the watchdog generation on throttled in-panel activity. It is called from the thumbnail `ScrollView.scrollWheel`, live-scroll start/end, continuous scrollwheel tap, trackpad navigation while the panel is open, handled keyboard/search shortcuts, selection cycling, and mouse movement over the panel.
+- Kept the watchdog intact for true idle capture, outside clicks, and stale input passthrough. Mouse movement only resets it when the pointer is over the panel, so ambient pointer drift outside AltTab should not keep capture alive forever.
+- Validation: `bash ai/build.sh compile` passed; `bash ai/build.sh dev` relaunched AltTab PID 39967 with dev dylib `b6b37c37c8bb66f9984b2ff96cb3fa80f84b89f8`; popup guard is `ok`.
+
+## 2026-05-19 — outside-click passthrough after panel activity
+
+- User reported clicks on windows like Chrome failing to reach Chrome after the scroll-watchdog fix.
+- Root cause: `noteInputCaptureActivity()` rearmed the watchdog by calling `startInputCaptureWatchdog()`, which also reset `inputCaptureStartedAt`. That timestamp is reused by `CursorEvents.handleOutsideUiMouseDown()` to decide whether outside clicks should pass through after `inputCapturePassthroughMs`.
+- Fix: split watchdog generation from passthrough age. New panel sessions reset `inputCaptureStartedAt`; scroll/cycle/mouse activity only re-arms the watchdog token and does not make outside clicks “fresh” again.
+- Added REL-073 to the release issue monitor. Before release, explicitly open the panel, wait past `inputCapturePassthroughMs`, actively scroll/cycle, then click Chrome/Safari/Terminal and verify `outsideUi-stale→hideUi-pass` plus target-app down/up delivery.
+- Validation so far: `bash ai/build.sh compile` passed; `bash ai/build.sh dev` relaunched AltTab PID 42204 with dev dylib `059ab11951a5c4ecd2649858dcd491458fc20235`; popup guard is `ok`. Manual 3x outside-click validation still required.
+
+## 2026-05-19 — thumbnail-click latency, Cmd+` collision, ghost cycling, minimized focus
+
+- User reported thumbnail-click focus was very slow. Recent logs showed mouse-click selection itself was immediate, but `Window.focus()` spent 0.6-1.7s in the synthetic `skyLightClickFocus` path for several native targets. The live default had become `nativeFocusMode=skyLightEventFocus`; reverting the default to `original` removes that synthetic click from normal Mac↔Mac/thumbnail focus.
+- User reported Chrome-front Cmd+` brought Edge Beta/another app. Recent logs showed `nextWindowShortcut2` global hotkey events during Cmd+` usage. This is a real shortcut collision: the second AltTab shortcut was Command+key-above-Tab, which steals the native macOS per-app window cycle. Added REL-074 and protected Command+grave / Command+Shift+grave registration by default.
+- Correction: the user's actual shortcut preferences intentionally assign Cmd as the hold modifier and key-above-tab as the second AltTab next-window key. Default-on protection suppresses that configured shortcut and prevents the thumbnail gallery from opening. REL-078 tracks this; `protectNativeCommandBacktickShortcut` must be opt-in only, and release validation must test both modes instead of assuming native Cmd+` always wins.
+- `ai/eval-cmd-backtick-gallery.sh` initially found 1/3 passes. Logs showed `nextWindowShortcut2 down/up` was registered, but `focusTarget` sometimes fired on the key-above-tab up before Cmd was released and before `showPanel`. Cause: `ATShortcut.redundantSafetyMeasures()` trusted `NSEvent.modifierFlags` at the global hotkey-up boundary; for Cmd+` it can read as released even though recent `flagsChanged` showed Cmd still down. Fix: cache recent modifier flags in `KeyboardEventsTestable` and suppress redundant hold-release while the hold modifier is observed down.
+- User reported the thumbnail viewer can rapidly cycle while only Cmd is held. Logs showed repeated `nextWindowShortcut down/up` pairs while the panel remained open. Artificial repeat should only be needed for modifier-only shortcuts; for real key-coded Tab/` shortcuts the OS key repeat already provides repeats. Disabled `KeyRepeatTimer.startRepeatingKeyNextWindow()` for key-coded shortcuts and added REL-075.
+- User reported minimized Messages did not foreground from AltTab. Added pre-focus deminimize handling for minimized windows and refreshes a missing `cgWindowId` from AX before the nil-target guard. Added REL-076 for minimized hotkey and thumbnail-click validation.
+- Validation so far: `bash ai/build.sh compile` passed after these code changes. A dev relaunch and 3x live checks are still required.
+
+## 2026-05-19 — gallery icon-only thumbnails
+
+- User reported the gallery sometimes shows only app icons and thumbnails stay icons without refreshing.
+- Existing `--selection-state` / `--detailed-list` already expose `hasThumbnail`, `thumbnailAgeMs`, and `thumbnailUpdateCount`, so the right regression check is to open the gallery, wait for capture, query selection state, and fail on displayable non-minimized windows that remain missing/stale.
+- Added REL-077 and `ai/eval-thumbnail-coverage.sh`. This checks normal thumbnail coverage and prints missing/stale rows; it does not yet prove content-change freshness, which remains under REL-020.
+- Thumbnail eval first checked the top list slice and failed on stale deeper Safari windows while the live UI had scrolled to a different visible page. That was a test bug and a product observability gap. `--selection-state` now includes `visibleThumbnailWindowIds`, and `ai/eval-thumbnail-coverage.sh` validates the actual visible UI slice by default.
+- User reported that clicks on one screen do not reach apps when a window exists on another screen. Current `CursorEvents` passed stale outside mouse-down through but always swallowed the matching outside mouse-up. On some apps/monitor transitions, a down-only click is not enough to activate/focus. REL-080 tracks multi-monitor outside-click routing. Fix: remember when stale outside mouse-down was passed and pass the matching outside mouse-up as `outsideUi-after-pass`.
+- `ai/eval-multiscreen-click-routing.sh` confirms this machine has two screens (`2304x1296` and `2056x1329` with negative-y origin). After the pass-through patch, it still needs a deliberate cross-screen outside click to produce the expected CTAP log pair; absence of that log is now a failing, not passing, condition.
+- Window coverage false failure: WindowServer reported two `Parallels Desktop / Windows 11` windows (`148779`, `143505`) while AltTab correctly marked one older/off-Space VM proxy as `notInVisibleSpace` and the visible console window title had changed to `"Windows 11" Configuration`. `ai/eval-window-coverage.sh` now filters candidate WindowServer rows through AltTab `isDisplayable` by default so it catches missing displayable windows instead of intentionally hidden off-Space proxies.
+
+## 2026-05-19 — thumbnail capture route and latest bounded validation
+
+- Root cause for the icon-only gallery state was not just stale cache selection. Recent logs had repeated ScreenCaptureKit one-time capture failures: `SCStreamErrorDomain Code=-3802 "Stream failed to start"`. On this OS/build, SCK is not a reliable default capture path for gallery thumbnails.
+- Fix: `thumbnailUseScreenCaptureKit` now defaults false and `Windows.refreshThumbnailsAsync` routes native windows through the private WindowServer capture path unless SCK is explicitly enabled. Parallels Coherence remains private capture regardless because SCK cannot see guest-composited pixels.
+- `ai/eval-thumbnail-coverage.sh` now writes its own eval marker and runs `ai/eval-log-anomalies.py` over that marked window. Any `SCStreamErrorDomain` or `Code=-3802` inside the thumbnail eval fails the run instead of being found only by manual log review.
+- Validation on dev dylib `a7eb5d82e1c21cd9748b7c04305116469d1ff675`, AltTab PID `62367`: `bash ai/build.sh compile` passed; `bash ai/build.sh dev` restarted cleanly; `ai/eval-thumbnail-coverage.sh` passed with `visible_ids=37`, `fresh=37`, `ratio=1.00`, and marked log scan `failures=0 warnings=0`; `ai/eval-window-coverage.sh` passed for the Parallels Desktop `Windows 11` displayable window; `ALLOW_SYNTHETIC_HOTKEY_TESTS=1 ai/eval-cmd-backtick-gallery.sh` passed; popup storm guard was `ok`.
+- Remaining gap: `ai/eval-multiscreen-click-routing.sh` correctly detects two screens but still needs a deliberate stale outside cross-screen click to produce and validate the `outsideUi-stale→hideUi-pass` / `outsideUi-after-pass` CTAP pair.
+
+## 2026-05-19 — Cmd+N new Terminal window behind current window
+
+- User reported `Cmd+N` in Terminal created a new Terminal window behind the current Terminal window.
+- Recent logs showed the relevant pattern: AltTab had a stale same-pid z-order intent for an older Terminal target, then Terminal emitted `created-window wid=149690` without a matching immediate focus update. This allowed stale enforcement/recency state to fight or mis-rank the newly-created same-app window.
+- Added REL-082 to the release monitor. The release check must distinguish app window-creation latency from AltTab z-order correctness: once WindowServer first reports the new window, it should already be visual z0 and remain there.
+- Fix: on both app-level and window-level `kAXWindowCreatedNotification`, release stale z-order enforcement when the created window belongs to the same pid as the last AltTab z-order intent but has a different wid. Also schedule a short live-frontmost sync after active-app creation so AltTab recency catches the new window even when AX focused-window notification is missing/late.
+- Added `ai/eval-created-window-front.sh`, which focuses a source window, posts `Cmd+N`, samples high-resolution z-order, detects the new wid, validates it reaches z0 immediately after first appearance, scans the marked log window, and optionally closes the test window.
+- Validation on dev dylib `34cec3a218a2b3e4b3fc9aa246c934ac471e98ef`, AltTab PID `95157`: `bash ai/build.sh compile` passed; `bash ai/build.sh dev` restarted cleanly; `CLOSE_NEW=1 APP_REGEX=Terminal bash ai/eval-created-window-front.sh` passed 3/3. New Terminal windows first appeared at 1223ms/678ms/1061ms and were z0 immediately on first appearance (`z0_after_seen_ms=0.0` each), stayed top, and had zero marked log failures. Thumbnail coverage and Parallels window coverage smoke checks also passed after the change.
+
+## 2026-05-19 — delayed OneNote flash after switching to Terminal
+
+- User reported OneNote flashed unnecessarily about 1-2 seconds after switching to Terminal.
+- Log evidence showed a Parallels→Terminal switch followed by stale guard release from a modifier-only event: `released stale z-order enforcement by external activation ... pid=96334 target=#123883 key=modifiers=256 keyAge=29ms`. That event is just the AltTab/Cmd modifier boundary, not affirmative user intent to abandon the Terminal target.
+- A second broad path released z-order enforcement on app-level `kAXWindowCreatedNotification` for Parallels pids without a concrete new window id. Parallels Coherence emits app-created lifecycle noise during normal focus settling, so treating that as a real new window can prematurely drop the target guard.
+- Fix: external keyboard input now records whether it is allowed to release z-order. Modifier-only events that are just configured AltTab shortcut/hold modifiers update the timestamp/label but cannot clear the guard; modifier-only events with other modifiers remain available for external focus workflows. Parallels app-level created-window notifications no longer release z-order enforcement unless a concrete window-level creation path identifies a new wid.
+- Added REL-083. Required validation is Parallels→Mac 3x with bounded log scan proving no AltTab-shortcut `key=modifiers=` guard release, no post-z0 source reappear, and a non-AltTab external-hotkey rerun proving intentional external activation still cancels stale guards.
+- Validation on live dev dylib `a036c2662b421dd1545a07ccb784737c049a62ef`: one clean OneNote→Terminal rep reached target z0 at `448.2ms`, had zero post-z0 source reappears/flicker/sibling intrusions, and the bounded log scan had no failures. Attempts to continue 3x validation stopped because `ai/eval-user-idle-guard.sh` detected active user input, preventing another contaminated pass.
+- Added `ai/eval-user-idle-guard.sh` and wired it into UI-driving evals. This addresses the immediate testing failure where a real mouse drag/click during the bounded run made the z-sampler evidence good but the log scan correctly failed for mouse contamination.
+
+## 2026-05-19 — Parallels OneNote thumbnail-click handoff and Karabiner readiness
+
+- User report: AltTab thumbnail click to Parallels OneNote, then `fn+e`, did not open OneNote search until manually clicking the OneNote window. The same path also felt very slow.
+- Evidence from `/tmp/alttab-run.log`:
+  - `18:53:49.224` and `18:54:56.538` selected OneNote `wid=149427` via `[mouseClick]` and entered `atomicallyPinAndActivate`.
+  - Immediate macOS-side calls completed in `47-131ms`, and async AX focus finished in about `62ms`, but `parHideNow` fired after `1203-1360ms` with `ready=false`, `front=true`, and `top` still Safari/Terminal.
+  - Several seconds later `FRONT_MISMATCH` restored OneNote via `SLPS(noWin)+makeKey`; after a manual OneNote click the Karabiner `fn+e` mapping worked.
+  - The log also captured `CLICKMISROUTE` / `CLICKAFTER` against Safari while AltTab still believed OneNote owned keyboard focus, confirming split visual/frontmost state after the panel hid.
+- Cause: for Parallels targets, `frontPid == targetPid` is not enough. Hiding the AltTab panel on the max-delay timeout exposes a stale visual top window and leaves Parallels guest keyboard readiness unsettled. The later z-order repair is too late for immediate Karabiner hotkeys.
+- Fix candidate: `scheduleParHideUi` now gives Parallels targets a hard safety max, but starts bounded `PARHIDE` reassertions after `parTargetReassertDelayMs` while the panel is still up. The panel hides only when the target is visual z0, stable, and frontmost, or at the hard max. The default reassert delay is `350ms`, hard max `3000ms`.
+- Release tracking: added `REL-084` for Parallels target visual/keyboard readiness after AltTab and thumbnail clicks.
+
+## 2026-05-19 — Safari same-app sibling block after native focus
+
+- User reported Safari windows were again all at the front of z-order. I immediately stopped the live AltTab dev process to prevent more focus/z mutation.
+- Current z-sampler after stopping AltTab showed Terminal at z0, followed by a large contiguous Safari block. Logs around `19:01-19:02` showed Safari window focus and same-app cycling while the native focus path used `SLPS(userGenerated)+makeKeyWindow`, which is exactly the path known to promote sibling windows in multi-window apps when not repaired.
+- Code review found the likely regression: earlier direct native sibling repair hooks had been removed and replaced by delayed enforcement. That delayed path depends on cached/stale `preZ` and can miss the exact pre-focus order; if it misses, it cannot demote Safari siblings back under the prior foreground window.
+- Fix candidate: native focus now captures a fresh live pre-focus z snapshot at focus time instead of falling back to a stale full cache, and `armNativeFocusZOrderIntent` immediately schedules bounded expected-z-order repairs at `0/80/180/360/700ms`. The repair remains narrow: it only demotes same-pid siblings that were promoted above the first expected non-target divider; it does not use app-level activation or broad full-stack AX raises.

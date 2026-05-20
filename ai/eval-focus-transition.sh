@@ -5,6 +5,16 @@ APP=${ALTTAB_APP:-/Applications/AltTab.app/Contents/MacOS/AltTab}
 if [ -z "${ALTTAB_DYLIB_OVERRIDE:-}" ] && [ -f "$(pwd)/dev/AltTabCore.dylib" ]; then
   export ALTTAB_DYLIB_OVERRIDE="$(pwd)/dev/AltTabCore.dylib"
 fi
+
+alttab() {
+  local out status
+  set +e
+  out=$("$APP" "$@" 2>&1)
+  status=$?
+  set -e
+  printf '%s\n' "$out" | sed -n '/^[[:space:]]*[{[]/,$p'
+  return "$status"
+}
 TARGET_APP=${1:-Safari}
 TARGET_WID=${TARGET_WID:-}
 TARGET_INDEX=${TARGET_INDEX:-0}
@@ -25,9 +35,9 @@ if [ "$SHIFT_PROBE" = "1" ] && { [ ! -x "$PROBER" ] || [ ai/post-shift-probe.swi
 fi
 
 if [ -n "$TARGET_WID" ]; then
-  target_json=$("$APP" --detailed-list | jq -c --argjson wid "$TARGET_WID" 'first(.windows[] | select(.id == $wid))')
+  target_json=$(alttab --detailed-list | jq -c --argjson wid "$TARGET_WID" 'first(.windows[] | select(.id == $wid))')
 else
-  target_json=$("$APP" --detailed-list | jq -c --arg app "$TARGET_APP" --argjson index "$TARGET_INDEX" '[.windows[] | select(.appName | test($app; "i"))][$index]')
+  target_json=$(alttab --detailed-list | jq -c --arg app "$TARGET_APP" --argjson index "$TARGET_INDEX" '[.windows[] | select(.appName | test($app; "i"))][$index]')
 fi
 if [ -z "$target_json" ] || [ "$target_json" = "null" ]; then
   echo "No target window matching app pattern: $TARGET_APP" >&2
@@ -49,7 +59,7 @@ import time
 print(time.monotonic_ns())
 PY
 )
-"$APP" --focus="$wid" >/dev/null
+alttab --focus="$wid" >/dev/null
 if [ "$SHIFT_PROBE" = "1" ]; then
   sleep "$(python3 - <<PY
 print($PROBE_DELAY_MS / 1000)

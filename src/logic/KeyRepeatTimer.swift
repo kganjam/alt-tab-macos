@@ -18,6 +18,7 @@ class KeyRepeatTimer {
 
     static func startRepeatingKeyNextWindow() {
         if let shortcut = ControlsTab.shortcuts[Preferences.indexToName("nextWindowShortcut", App.shortcutIndex)] {
+            guard shortcut.shortcut.keyCode == .none else { return }
             startTimerForRepeatingKey(shortcut) {
                 ControlsTab.executeAction(Preferences.indexToName("nextWindowShortcut", App.shortcutIndex))
             }
@@ -59,13 +60,8 @@ class KeyRepeatTimer {
     /// Poll hardware modifier state to detect key release even when the event-based state update is delayed
     /// (e.g. when main thread is busy under CPU stress). Mirrors ATShortcut.redundantSafetyMeasures()
     private static func holdModifierIsReleased() -> Bool {
-        guard App.appIsBeingUsed,
-              let holdShortcut = ControlsTab.shortcuts[Preferences.indexToName("holdShortcut", App.shortcutIndex)] else {
-            return true
-        }
-        let currentModifiers = cocoaToCarbonFlags(ModifierFlags.current).cleaned()
-        let holdModifiers = holdShortcut.shortcut.carbonModifierFlags.cleaned()
-        return currentModifiers & holdModifiers != holdModifiers
+        guard App.appIsBeingUsed else { return true }
+        return !KeyboardEventsTestable.activeHoldModifierIsDown()
     }
 
     // NSEvent.keyRepeatInterval exists, but it doesn't seem to update when System Settings are updated, or when the user runs `defaults write -g KeyRepeat X`

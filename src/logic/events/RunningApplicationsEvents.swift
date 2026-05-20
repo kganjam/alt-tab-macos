@@ -30,6 +30,18 @@ class RunningApplicationsEvents {
     @objc private static func handleWorkspaceAppEvent(_ notification: Notification) {
         let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
         let pid = app?.processIdentifier ?? 0
+        if notification.name == NSWorkspace.didActivateApplicationNotification,
+           let trackedApp = Applications.findOrCreate(pid, false) {
+            if Windows.releaseZOrderEnforcementForRecentExternalActivation(pid: trackedApp.pid, label: notification.name.rawValue) {
+                Windows.requestZOrderTopReview(reason: notification.name.rawValue, wid: 0)
+                Logger.debug { "\(notification.name.rawValue) pid:\(pid) app:\(app?.debugId() ?? "?") released stale z-enforcement" }
+                return
+            }
+            if Windows.shouldCounterPostAltTabParallelsActivation(for: trackedApp, wid: nil, reason: notification.name.rawValue) {
+                Logger.debug { "\(notification.name.rawValue) pid:\(pid) app:\(app?.debugId() ?? "?") suppressed" }
+                return
+            }
+        }
         Windows.requestZOrderTopReview(reason: notification.name.rawValue, wid: 0)
         Logger.debug { "\(notification.name.rawValue) pid:\(pid) app:\(app?.debugId() ?? "?")" }
     }

@@ -46,6 +46,9 @@ if [ "$MODE" = "compile" ]; then
         -scheme Debug \
         -configuration Debug \
         -derivedDataPath DerivedData \
+        CODE_SIGNING_ALLOWED=NO \
+        CODE_SIGNING_REQUIRED=NO \
+        CODE_SIGN_IDENTITY="" \
         2>&1 | tail -30 | grep -E "(error:|warning:|BUILD SUCCEEDED|BUILD FAILED)" | tail -10
     rc=${PIPESTATUS[0]}
     DEBUG_APP="DerivedData/Build/Products/Debug/AltTab.app"
@@ -112,17 +115,26 @@ if [ "$MODE" = "dev" ]; then
     mv "$APP_DIR/Contents/MacOS/AltTab" "$DEV_DYLIB"
     codesign --force --sign "$SIGN_ID" --options runtime --timestamp=none "$DEV_DYLIB"
     echo "  dev dylib cdhash: $(codesign -dvvv "$DEV_DYLIB" 2>&1 | awk -F= '/^CDHash=/{print $2; exit}')"
-    # Direct exec (not `open`) so env vars propagate. The dev dylib still
-    # links to @rpath frameworks resolved from the installed bundle's
-    # Frameworks/ — this works as long as Pods/framework deps haven't changed
-    # (which would require a full `install`).
+    # LaunchServices owns the long-running process. A direct background exec
+    # from this script can receive SIGHUP/terminate when the wrapper exits,
+    # leaving AltTab dead after a successful dev build. Use launchctl to pass
+    # the override env through LaunchServices without modifying the installed
+    # bundle, preserving TCC grants.
     echo "=== DEV BUILD: $BUILD_DATE — dylib=$DEV_DYLIB ===" >> /tmp/alttab-run.log
-    ALTTAB_DYLIB_OVERRIDE="$DEV_DYLIB" \
-        "$DEST/Contents/MacOS/AltTab" </dev/null >>/tmp/alttab-run.log 2>&1 &
-    sleep 2
+    launchctl setenv ALTTAB_DYLIB_OVERRIDE "$DEV_DYLIB"
+    open -na "$DEST" --stdout /tmp/alttab-run.log --stderr /tmp/alttab-run.log
+    sleep 3
     PID=$(pgrep -f 'AltTab\.app/Contents/MacOS/AltTab' | head -1)
     echo "Dev AltTab pid $PID, dylib: $DEV_DYLIB"
-    echo "  tail -F /tmp/alttab-run.log | grep DIAG"
+    MONITOR_SECONDS="${ALTTAB_POST_BUILD_MONITOR_SECONDS:-5}"
+    if [ "$MONITOR_SECONDS" != "0" ]; then
+        echo "=== monitoring runtime anomalies for ${MONITOR_SECONDS}s ==="
+        if ! python3 ai/monitor-runtime-anomalies.py --duration "$MONITOR_SECONDS"; then
+            echo "POST-BUILD RUNTIME ANOMALIES DETECTED — inspect /tmp/alttab-run.log" >&2
+            exit 86
+        fi
+    fi
+    echo "  python3 ai/monitor-runtime-anomalies.py --duration 60"
     exit 0
 fi
 
@@ -210,5 +222,13 @@ case "$RUNNING_PATH" in
     /Applications/AltTab.app/*) ;;
     *) echo "WARNING: AltTab is running from an unexpected path. Permissions may not apply." ;;
 esac
-echo "  tail -F /tmp/alttab-run.log | grep DIAG"
+MONITOR_SECONDS="${ALTTAB_POST_BUILD_MONITOR_SECONDS:-5}"
+if [ "$MONITOR_SECONDS" != "0" ]; then
+    echo "=== monitoring runtime anomalies for ${MONITOR_SECONDS}s ==="
+    if ! python3 ai/monitor-runtime-anomalies.py --duration "$MONITOR_SECONDS"; then
+        echo "POST-BUILD RUNTIME ANOMALIES DETECTED — inspect /tmp/alttab-run.log" >&2
+        exit 86
+    fi
+fi
+echo "  python3 ai/monitor-runtime-anomalies.py --duration 60"
 echo "Next iterations: bash ai/build.sh dev    # no install, no TCC churn"

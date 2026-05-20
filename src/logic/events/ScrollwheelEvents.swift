@@ -41,6 +41,9 @@ class ScrollwheelEvents {
     }
 
     private static let handleEvent: CGEventTapCallBack = { _, type, cgEvent, _ in
+        if type.rawValue == NSEvent.EventType.scrollWheel.rawValue {
+            App.noteInputCaptureActivity("scrollwheel-tap")
+        }
         if type.rawValue == NSEvent.EventType.scrollWheel.rawValue,
            cgEvent.getIntegerValueField(.scrollWheelEventIsContinuous) != 0 {
             // block continuous (trackpad) scrolling; let discrete (mouse) scrolling through

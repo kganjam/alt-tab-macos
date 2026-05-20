@@ -5,6 +5,16 @@ APP=${ALTTAB_APP:-/Applications/AltTab.app/Contents/MacOS/AltTab}
 if [ -z "${ALTTAB_DYLIB_OVERRIDE:-}" ] && [ -f "$(pwd)/dev/AltTabCore.dylib" ]; then
   export ALTTAB_DYLIB_OVERRIDE="$(pwd)/dev/AltTabCore.dylib"
 fi
+
+alttab() {
+  local out status
+  set +e
+  out=$("$APP" "$@" 2>&1)
+  status=$?
+  set -e
+  printf '%s\n' "$out" | sed -n '/^[[:space:]]*[{[]/,$p'
+  return "$status"
+}
 SOURCE_APP=${1:-Terminal}
 TARGET_APP=${2:-Safari}
 SOURCE_INDEX=${SOURCE_INDEX:-0}
@@ -57,18 +67,18 @@ fi
 pick_window() {
   local app=$1
   local index=$2
-  "$APP" --detailed-list | jq -c --arg app "$app" --argjson index "$index" '[.windows | sort_by(.lastFocusOrder)[] | select((.appName | test($app; "i")) and (.isMinimized | not))][$index]'
+  alttab --detailed-list | jq -c --arg app "$app" --argjson index "$index" '[.windows | sort_by(.lastFocusOrder)[] | select((.appName | test($app; "i")) and (.isMinimized | not))][$index]'
 }
 
 selection_state_after_show() {
-  "$APP" --show=0 >/dev/null
+  alttab --show=0 >/dev/null
   sleep "$(python3 - <<PY
 print($PREFLIGHT_SHOW_MS / 1000)
 PY
 )"
   local state
-  state=$("$APP" --selection-state)
-  "$APP" --hide >/dev/null || true
+  state=$(alttab --selection-state)
+  alttab --hide >/dev/null || true
   printf '%s\n' "$state"
 }
 
@@ -90,12 +100,12 @@ source_title=$(jq -r '.title // ""' <<<"$source_json")
 target_title=$(jq -r '.title // ""' <<<"$target_json")
 
 for attempt in 1 2 3; do
-  "$APP" --focus="$target_wid" >/dev/null
+  alttab --focus="$target_wid" >/dev/null
   sleep "$(python3 - <<PY
 print($SETTLE_MS / 1000)
 PY
 )"
-  "$APP" --focus="$source_wid" >/dev/null
+  alttab --focus="$source_wid" >/dev/null
   sleep "$(python3 - <<PY
 print($SETTLE_MS / 1000)
 PY

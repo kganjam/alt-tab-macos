@@ -99,8 +99,7 @@ class ATShortcut {
         if App.appIsBeingUsed && !App.forceDoNothingOnRelease && Preferences.shortcutStyle == .focusOnRelease {
             if let currentHoldShortcut = ControlsTab.shortcuts[Preferences.indexToName("holdShortcut", App.shortcutIndex)],
                id == currentHoldShortcut.id {
-                let currentModifiers = cocoaToCarbonFlags(ModifierFlags.current)
-                if currentModifiers != (currentModifiers | (currentHoldShortcut.shortcut.carbonModifierFlags)) {
+                if !KeyboardEventsTestable.activeHoldModifierIsDown() {
                     if !ATShortcut.didTriggerHoldShortcutRelease {
                         currentHoldShortcut.state = .up
                         currentHoldShortcut.executeAction(false)

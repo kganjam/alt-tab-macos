@@ -5,15 +5,33 @@ APP=${ALTTAB_APP:-/Applications/AltTab.app/Contents/MacOS/AltTab}
 if [ -z "${ALTTAB_DYLIB_OVERRIDE:-}" ] && [ -f "$(pwd)/dev/AltTabCore.dylib" ]; then
   export ALTTAB_DYLIB_OVERRIDE="$(pwd)/dev/AltTabCore.dylib"
 fi
+
+alttab() {
+  local out status
+  set +e
+  out=$("$APP" "$@" 2>&1)
+  status=$?
+  set -e
+  printf '%s\n' "$out" | sed -n '/^[[:space:]]*[{[]/,$p'
+  return "$status"
+}
 TARGET_APP=${1:-Safari}
 DELAY=${DELAY:-1.0}
 POSTER=${POSTER:-/tmp/alttab-post-key-combo}
+MARKER=${MARKER:-copy-after-focus-$(date +%Y%m%d-%H%M%S)-$$}
+
+bash ai/eval-user-idle-guard.sh "copy-after-focus-$TARGET_APP"
+
+popup_guard() {
+  MARKER="$MARKER" POPUP_STORM_CONTEXT="$1" bash ai/eval-popup-storm-guard.sh
+}
+popup_guard "copy-preflight-$TARGET_APP"
 
 if [ ! -x "$POSTER" ] || [ ai/post-key-combo.swift -nt "$POSTER" ]; then
   swiftc ai/post-key-combo.swift -o "$POSTER"
 fi
 
-target_json=$("$APP" --detailed-list | jq -c --arg app "$TARGET_APP" 'first(.windows[] | select(.appName | test($app; "i")))')
+target_json=$(alttab --detailed-list | jq -c --arg app "$TARGET_APP" 'first(.windows[] | select(.appName | test($app; "i")))')
 if [ -z "$target_json" ]; then
   echo "No target window matching app pattern: $TARGET_APP" >&2
   exit 2
@@ -21,8 +39,10 @@ fi
 
 wid=$(jq -r '.id' <<<"$target_json")
 "$POSTER" >/dev/null
-"$APP" --focus="$wid" >/dev/null
+popup_guard "copy-before-focus-$TARGET_APP"
+alttab --focus="$wid" >/dev/null
 sleep "$DELAY"
+popup_guard "copy-after-focus-$TARGET_APP"
 front=$(osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null || true)
 expected=""
 if [ "$front" = "Safari" ]; then
@@ -33,6 +53,7 @@ printf 'ALT_TAB_COPY_SENTINEL' | pbcopy
 sleep 0.4
 actual=$(pbpaste)
 "$POSTER" >/dev/null
+popup_guard "copy-after-key-$TARGET_APP"
 match=no
 [ -n "$expected" ] && [ "$expected" = "$actual" ] && match=yes
 if [ "$match" = no ] && [ -n "$expected" ] && [ "${expected%/}" = "$actual" ]; then
