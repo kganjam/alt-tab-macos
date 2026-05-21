@@ -258,6 +258,12 @@ class Windows {
     private static var zOrderCacheFullUpdatedAt: CFAbsoluteTime = 0
     private static var zOrderCacheGeneration: UInt64 = 0
     private static var zOrderLifecycleGeneration: Int64 = 0
+    private static var zOrderTopReviewPending = false
+    private static var zOrderTopReviewPendingReason = ""
+    private static var zOrderTopReviewPendingWid: CGWindowID = 0
+    private static var zOrderTopReviewPendingSecondDelayMs = 0
+    private static var zOrderTopReviewPendingCount = 0
+    private static var zOrderTopReviewLastFlushAt: CFAbsoluteTime = 0
     private static var zOrderFocusGeneration: Int64 = 0
     private static var zOrderFocusQuietUntilNs: Int64 = 0
     private static var zOrderEnforcementTimer: DispatchSourceTimer?
@@ -430,12 +436,47 @@ class Windows {
 
     static func requestZOrderTopReview(reason: String, wid: CGWindowID = 0, invalidate: Bool = false, secondDelayMs: Int = 120) {
         guard RuntimeFlags.zOrderCacheEnabled else { return }
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async {
+                requestZOrderTopReview(reason: reason, wid: wid, invalidate: invalidate, secondDelayMs: secondDelayMs)
+            }
+            return
+        }
         if invalidate {
             invalidateZOrderCacheEntry(wid)
         }
         Diagnostics.log("REFRESH", "z-order top review reason=\(reason) wid=\(wid) invalidate=\(invalidate)")
+        zOrderTopReviewPendingReason = reason
+        if wid != 0 {
+            zOrderTopReviewPendingWid = wid
+        }
+        zOrderTopReviewPendingSecondDelayMs = max(zOrderTopReviewPendingSecondDelayMs, secondDelayMs)
+        zOrderTopReviewPendingCount += 1
+        guard !zOrderTopReviewPending else { return }
+        zOrderTopReviewPending = true
+        let now = CFAbsoluteTimeGetCurrent()
+        let delayMs = max(0, Int((0.06 - (now - zOrderTopReviewLastFlushAt)) * 1000))
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) {
+            flushZOrderTopReview()
+        }
+    }
+
+    private static func flushZOrderTopReview() {
+        guard zOrderTopReviewPending else { return }
+        zOrderTopReviewPending = false
+        let reason = zOrderTopReviewPendingCount > 1 ? "\(zOrderTopReviewPendingReason)+\(zOrderTopReviewPendingCount - 1)" : zOrderTopReviewPendingReason
+        let wid = zOrderTopReviewPendingWid
+        let secondDelayMs = zOrderTopReviewPendingSecondDelayMs
+        zOrderTopReviewPendingReason = ""
+        zOrderTopReviewPendingWid = 0
+        zOrderTopReviewPendingSecondDelayMs = 0
+        zOrderTopReviewPendingCount = 0
+        zOrderTopReviewLastFlushAt = CFAbsoluteTimeGetCurrent()
+        Diagnostics.log("REFRESH", "z-order top review flush reason=\(reason) wid=\(wid) second=\(secondDelayMs)")
         requestZOrderCacheRefresh(full: false, delayMs: 0, topOnly: true)
-        requestZOrderCacheRefresh(full: false, delayMs: secondDelayMs, topOnly: true)
+        if secondDelayMs > 0 {
+            requestZOrderCacheRefresh(full: false, delayMs: secondDelayMs, topOnly: true)
+        }
     }
 
     static func requestZOrderReview(afterWindowLifecycleEvent reason: String, wid: CGWindowID) {

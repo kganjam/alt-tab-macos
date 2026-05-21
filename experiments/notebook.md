@@ -843,3 +843,15 @@ corrections below the visible-fold reflect the user's expected order.
   - `RunningApplicationsEvents` now derives actual KVO launch/quit deltas using `kind`/`indexes` or pid diff, and uses top-only z review for non-regular process churn.
 - Validation signal:
   - After an `fn+l`/`fn+o` run, logs should show no stale target `app-activated wid=<previous AltTab target>` updating recency after external ownership, fewer full `z-order review reason=app-activated/focused-window` lines during external hotkey alternation, no `FRONT_MISMATCH`, no `COUNTER`, and no `ANOMALY`.
+
+## 2026-05-20 — 1.2.1 residual fn+l/fn+o flicker/racing
+
+- Evidence after `1.2.0` looked materially better: no `FRONT_MISMATCH`, no `COUNTER`, no `ANOMALY`, and stale target events were gone.
+- Remaining visible flicker correlated with dense event churn during rapid Parallels OneNote/Outlook hotkeys:
+  - every hotkey produced `NSWorkspaceDidActivateApplicationNotification`, `app-activated`, `focused-window`, and often `app-launched`/`app-quit` top z reviews;
+  - a few Parallels transient window-created events still triggered full `z-order review reason=created-app` scans during the burst.
+- Fix candidate for `1.2.1`:
+  - coalesce top-only z reviews on the main thread with a short 60ms flush window, keeping only the latest wid/reason and one delayed top refresh;
+  - keep normal full reviews for AltTab focus intents and non-Parallels real lifecycle events;
+  - downgrade Parallels `kAXWindowCreatedNotification` review work to top-only (`created-app-parallels`) because those events are often transient Coherence helper/window churn during guest foreground changes.
+- Validation signal: `fn+l`/`fn+o` bursts should show `z-order top review flush` lines instead of dozens of immediate top cache refreshes, no full `created-app` reviews for Parallels, and still no focus/z anomaly markers.

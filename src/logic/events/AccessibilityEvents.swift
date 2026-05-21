@@ -53,7 +53,11 @@ class AccessibilityEvents {
                             Windows.releaseZOrderEnforcementForCreatedWindow(pid: pid, label: "app-created-window")
                         }
                         Applications.manuallyUpdateWindows(app)
-                        Windows.requestZOrderReview(afterWindowLifecycleEvent: "created-app", wid: 0)
+                        if app.isParallelsCoherence {
+                            Windows.requestZOrderTopReview(reason: "created-app-parallels", wid: 0)
+                        } else {
+                            Windows.requestZOrderReview(afterWindowLifecycleEvent: "created-app", wid: 0)
+                        }
                         syncFrontmostAfterWindowCreationIfNeeded(app)
                     } else {
                         applicationHiddenOrShown(app, pid, type)
