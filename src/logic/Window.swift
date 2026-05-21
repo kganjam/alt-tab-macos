@@ -1278,6 +1278,10 @@ class Window {
                 Diagnostics.log("FRONTMOSTSET", "+\(delayMs)ms repoke skipped stale generation pid=\(targetPid) wid=\(targetWid)")
                 return
             }
+            guard !Windows.recentExternalKeyboardInputFollowsAltTabTarget() else {
+                Diagnostics.log("FRONTMOSTSET", "+\(delayMs)ms repoke skipped after keyboard input pid=\(targetPid) wid=\(targetWid)")
+                return
+            }
             guard Windows.captureTopZRanking(maxCount: 1).first?.wid == targetWid else {
                 Diagnostics.log("FRONTMOSTSET", "+\(delayMs)ms repoke skipped target not z0 pid=\(targetPid) wid=\(targetWid)")
                 return

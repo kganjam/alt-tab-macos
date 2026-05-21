@@ -172,6 +172,7 @@ class Windows {
         let wid: CGWindowID
         let pid: pid_t
         let timestamp: CFAbsoluteTime
+        let sourceWid: CGWindowID?
         weak var window: Window?
         var raiseAttempts: Int = 0
         var wasEverAtZ0: Bool = false
@@ -197,6 +198,14 @@ class Windows {
         var rank: Int = Int.max
         var lastSeenAt: CFAbsoluteTime = 0
         var lastRankChangedAt: CFAbsoluteTime = 0
+    }
+
+    private struct WindowBirth {
+        let wid: CGWindowID
+        let pid: pid_t
+        let owner: String
+        let createdAt: CFAbsoluteTime
+        let source: String
     }
 
     /// Capture visible app-level windows in current z-order.
@@ -232,10 +241,15 @@ class Windows {
             out.append(PreZEntry(wid: CGWindowID(wid), pid: pid, owner: owner, rank: out.count, lastSeenAt: timestamp, lastRankChangedAt: timestamp))
             if out.count >= maxCount { break }
         }
+        noteZOrderSnapshotObserved(out, timestamp: timestamp, source: "cgwindow")
         return out
     }
     static var recentZOrderIntents = [ZOrderIntent]()
     private static let zOrderCacheLock = NSLock()
+    private static let windowBirthLock = NSLock()
+    private static var knownWindowWids = Set<CGWindowID>()
+    private static var windowBirthsByWid = [CGWindowID: WindowBirth]()
+    private static var windowBirthRegistrySeeded = false
     private static var zOrderCacheTimer: DispatchSourceTimer?
     private static var zOrderCacheByWid = [CGWindowID: PreZEntry]()
     private static var zOrderCacheTopSnapshot = [PreZEntry]()
@@ -256,7 +270,8 @@ class Windows {
     private static var syntheticFocusClickTimestamp: TimeInterval = 0
     private static var lastExternalKeyboardInputAt: CFAbsoluteTime = 0
     private static var lastExternalKeyboardInputLabel = ""
-    private static var lastExternalKeyboardInputCanReleaseZOrder = false
+    private static var lastReleasableExternalKeyboardInputAt: CFAbsoluteTime = 0
+    private static var lastReleasableExternalKeyboardInputLabel = ""
     private static var lastAltTabShortcutInputAt: CFAbsoluteTime = 0
     private static var externalKeyboardReleaseGeneration: UInt64 = 0
     private static let transientFrontmostBundleIdentifiers: Set<String> = [
@@ -264,6 +279,102 @@ class Windows {
         "com.apple.notificationcenterui",
         "com.apple.screencaptureui",
     ]
+
+    static func noteWindowCreated(_ window: Window, source: String) {
+        guard let wid = window.cgWindowId else { return }
+        noteWindowCreated(wid: wid, pid: window.application.pid, owner: window.application.localizedName ?? "?", source: source)
+    }
+
+    static func noteWindowCreated(wid: CGWindowID, pid: pid_t, owner: String, source: String, at: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()) {
+        guard wid != 0 else { return }
+        var shouldLog = false
+        windowBirthLock.lock()
+        pruneWindowBirths(now: at)
+        knownWindowWids.insert(wid)
+        if windowBirthsByWid[wid] == nil || source.hasPrefix("ax") || source.hasPrefix("manual") {
+            windowBirthsByWid[wid] = WindowBirth(wid: wid, pid: pid, owner: owner, createdAt: at, source: source)
+            shouldLog = true
+        }
+        windowBirthLock.unlock()
+        if shouldLog {
+            Diagnostics.log("WINDOWNEW", "created source=\(source) wid=#\(wid) pid=\(pid) owner=\(owner)")
+        }
+    }
+
+    static func noteZOrderWindowObserved(wid: CGWindowID, pid: pid_t, owner: String, source: String, at: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()) {
+        guard wid != 0 else { return }
+        var birth: WindowBirth?
+        windowBirthLock.lock()
+        pruneWindowBirths(now: at)
+        if !windowBirthRegistrySeeded {
+            knownWindowWids.insert(wid)
+        } else if !knownWindowWids.contains(wid) {
+            knownWindowWids.insert(wid)
+            birth = WindowBirth(wid: wid, pid: pid, owner: owner, createdAt: at, source: source)
+            windowBirthsByWid[wid] = birth
+        }
+        windowBirthLock.unlock()
+        if let birth {
+            Diagnostics.log("WINDOWNEW", "observed source=\(birth.source) wid=#\(birth.wid) pid=\(birth.pid) owner=\(birth.owner)")
+        }
+    }
+
+    private static func noteZOrderSnapshotObserved(_ entries: [PreZEntry], timestamp: CFAbsoluteTime, source: String) {
+        guard !entries.isEmpty else { return }
+        var births = [WindowBirth]()
+        windowBirthLock.lock()
+        pruneWindowBirths(now: timestamp)
+        if !windowBirthRegistrySeeded {
+            entries.forEach { knownWindowWids.insert($0.wid) }
+            windowBirthRegistrySeeded = true
+        } else {
+            for entry in entries where !knownWindowWids.contains(entry.wid) {
+                knownWindowWids.insert(entry.wid)
+                let birth = WindowBirth(wid: entry.wid, pid: entry.pid, owner: entry.owner, createdAt: timestamp, source: source)
+                windowBirthsByWid[entry.wid] = birth
+                births.append(birth)
+            }
+        }
+        windowBirthLock.unlock()
+        for birth in births.prefix(8) {
+            Diagnostics.log("WINDOWNEW", "observed source=\(birth.source) wid=#\(birth.wid) pid=\(birth.pid) owner=\(birth.owner)")
+        }
+    }
+
+    private static func pruneWindowBirths(now: CFAbsoluteTime) {
+        windowBirthsByWid = windowBirthsByWid.filter { now - $0.value.createdAt < 30 }
+    }
+
+    private static func windowBirth(wid: CGWindowID) -> WindowBirth? {
+        windowBirthLock.lock()
+        let birth = windowBirthsByWid[wid]
+        windowBirthLock.unlock()
+        return birth
+    }
+
+    @discardableResult
+    static func releaseZOrderEnforcementForNewerForegroundWindow(wid: CGWindowID, pid: pid_t, owner: String, label: String) -> Bool {
+        guard let current = recentZOrderIntents.last, current.wid != wid else { return false }
+        guard let birth = windowBirth(wid: wid), birth.createdAt > current.timestamp + 0.02 else { return false }
+        let targetWid = current.wid
+        let targetPid = current.pid
+        let sourceWid = current.sourceWid
+        let timestamp = current.timestamp
+        let ageMs = Int((birth.createdAt - timestamp) * 1000)
+        let release = {
+            guard let latest = recentZOrderIntents.last,
+                  latest.wid == targetWid,
+                  latest.timestamp == timestamp else { return }
+            Diagnostics.log("GUARD", "released stale target restore by newer foreground window label=\(label) source=#\(sourceWid ?? 0) target=#\(targetWid) targetPid=\(targetPid) new=#\(wid) pid=\(pid) owner=\(owner) newAge=\(ageMs)ms createdBy=\(birth.source)")
+            releaseZOrderEnforcement(clearGuard: true)
+        }
+        if Thread.isMainThread {
+            release()
+        } else {
+            DispatchQueue.main.async(execute: release)
+        }
+        return true
+    }
 
     static func startZOrderCache() {
         guard RuntimeFlags.zOrderCacheEnabled else {
@@ -584,6 +695,10 @@ class Windows {
                 return
             }
             let top = actual.first.map { "#\($0.wid) \($0.owner)" } ?? "nil"
+            if let blocker = actual.first,
+               releaseZOrderEnforcementForNewerForegroundWindow(wid: blocker.wid, pid: blocker.pid, owner: blocker.owner, label: "native-target-retry") {
+                return
+            }
             if let blockerWid = actual.first?.wid {
                 let pairErr = CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, blockerWid)
                 if pairErr == .success {
@@ -688,7 +803,7 @@ class Windows {
             recentZOrderIntents.removeAll { $0.wid == wid }
             recentZOrderIntents.append(ZOrderIntent(
                 wid: wid, pid: target.application.pid,
-                timestamp: now, window: target,
+                timestamp: now, sourceWid: App.lastAltTabFocusSourceWid, window: target,
                 isParallelsInvolved: parInvolved, preZRanking: preZ))
             guard !(App.appIsBeingUsed && parInvolved) else {
                 Diagnostics.log("ZENFORCE", "defer generic z enforcement during active Parallels panel handoff target=#\(wid)")
@@ -703,7 +818,7 @@ class Windows {
         let now = CFAbsoluteTimeGetCurrent()
         let parInvolved = isParallelsInvolved(target)
         recentZOrderIntents.removeAll { now - $0.timestamp > 3.0 || $0.wid == wid }
-        recentZOrderIntents.append(ZOrderIntent(wid: wid, pid: target.application.pid, timestamp: now, window: target, isParallelsInvolved: parInvolved, preZRanking: preZ))
+        recentZOrderIntents.append(ZOrderIntent(wid: wid, pid: target.application.pid, timestamp: now, sourceWid: App.lastAltTabFocusSourceWid, window: target, isParallelsInvolved: parInvolved, preZRanking: preZ))
         Diagnostics.log("ZENFORCE", "native intent target=#\(wid) preZ=\(preZ.count) parInvolved=\(parInvolved)")
         restoreExpectedZOrderForFocus(targetWid: wid, targetPid: target.application.pid, preZ: preZ)
         startZOrderEnforcement()
@@ -759,7 +874,10 @@ class Windows {
         let observedAt = CFAbsoluteTimeGetCurrent()
         lastExternalKeyboardInputAt = observedAt
         lastExternalKeyboardInputLabel = label
-        lastExternalKeyboardInputCanReleaseZOrder = canReleaseZOrder
+        if canReleaseZOrder {
+            lastReleasableExternalKeyboardInputAt = observedAt
+            lastReleasableExternalKeyboardInputLabel = label
+        }
         guard canReleaseZOrder else { return }
         guard let current = recentZOrderIntents.last else { return }
         let targetWid = current.wid
@@ -769,7 +887,7 @@ class Windows {
             guard isCurrentExternalKeyboardReleaseGeneration(generation) else { return }
             guard !App.appIsBeingUsed else { return }
             guard let current = recentZOrderIntents.last, current.wid == targetWid, current.timestamp == targetTimestamp else { return }
-            guard !externalKeyboardInputLooksLikeAltTabShortcut(now: CFAbsoluteTimeGetCurrent()) else { return }
+            guard !externalKeyboardInputLooksLikeAltTabShortcut(now: CFAbsoluteTimeGetCurrent(), inputAt: observedAt) else { return }
             let age = observedAt - current.timestamp
             guard age > 0.35 else { return }
             let frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
@@ -789,19 +907,20 @@ class Windows {
         generation == externalKeyboardReleaseGeneration
     }
 
-    private static func externalKeyboardInputLooksLikeAltTabShortcut(now: CFAbsoluteTime) -> Bool {
-        let deltaFromShortcut = lastExternalKeyboardInputAt - lastAltTabShortcutInputAt
+    private static func externalKeyboardInputLooksLikeAltTabShortcut(now: CFAbsoluteTime, inputAt: CFAbsoluteTime) -> Bool {
+        let deltaFromShortcut = inputAt - lastAltTabShortcutInputAt
         if abs(deltaFromShortcut) < 0.25 { return true }
         if now - lastAltTabShortcutInputAt < 0.25 { return true }
         return false
     }
 
-    static func recentExternalKeyboardInputFollowsAltTabTarget() -> Bool {
+    static func recentExternalKeyboardInputFollowsAltTabTarget(requireReleasable: Bool = false) -> Bool {
         let now = CFAbsoluteTimeGetCurrent()
-        guard lastExternalKeyboardInputCanReleaseZOrder else { return false }
-        guard !externalKeyboardInputLooksLikeAltTabShortcut(now: now) else { return false }
-        guard now - lastExternalKeyboardInputAt < 2.0,
-              lastExternalKeyboardInputAt - App.lastAltTabFocusAt > 0.05 else { return false }
+        let inputAt = requireReleasable ? lastReleasableExternalKeyboardInputAt : lastExternalKeyboardInputAt
+        guard inputAt > 0 else { return false }
+        guard !externalKeyboardInputLooksLikeAltTabShortcut(now: now, inputAt: inputAt) else { return false }
+        guard now - inputAt < 2.0,
+              inputAt - App.lastAltTabFocusAt > 0.05 else { return false }
         return true
     }
 
@@ -809,27 +928,63 @@ class Windows {
     static func releaseZOrderEnforcementForSameAppKeyboardFocusMove(wid: CGWindowID, pid: pid_t, label: String) -> Bool {
         guard recentExternalKeyboardInputFollowsAltTabTarget() else { return false }
         guard let current = recentZOrderIntents.last, current.pid == pid, current.wid != wid else { return false }
-        Diagnostics.log("ZENFORCE", "released by same-app keyboard focus move: \(label) focused=#\(wid) target=#\(current.wid) key=\(lastExternalKeyboardInputLabel)")
-        Diagnostics.log("GUARD", "released stale z-order enforcement by same-app keyboard focus move: \(label) focused=#\(wid) target=#\(current.wid) key=\(lastExternalKeyboardInputLabel)")
+        Diagnostics.log("ZENFORCE", "released by same-app keyboard foreground move: \(label) focused=#\(wid) target=#\(current.wid) key=\(lastExternalKeyboardInputLabel)")
+        Diagnostics.log("GUARD", "released stale z-order enforcement by same-app keyboard foreground move: \(label) focused=#\(wid) target=#\(current.wid) key=\(lastExternalKeyboardInputLabel)")
         releaseZOrderEnforcement(clearGuard: true)
         return true
     }
 
     @discardableResult
-    private static func releaseZOrderEnforcementForExternalKeyboardIntent(current: ZOrderIntent, pid: pid_t?, label: String) -> Bool {
+    static func releaseZOrderEnforcementForKeyboardForegroundChange(wid: CGWindowID? = nil, pid: pid_t, label: String) -> Bool {
+        releaseZOrderEnforcementForExternalForegroundOwner(wid: wid, pid: pid, label: label)
+    }
+
+    @discardableResult
+    static func releaseZOrderEnforcementForExternalForegroundOwner(wid: CGWindowID? = nil, pid: pid_t, label: String) -> Bool {
+        guard pid > 0, pid != ProcessInfo.processInfo.processIdentifier else { return false }
+        guard let current = recentZOrderIntents.last else { return false }
+        let sameTargetPid = current.pid == pid
+        let sameTargetWid = wid == nil || wid == current.wid
+        guard !sameTargetPid || !sameTargetWid else { return false }
         let now = CFAbsoluteTimeGetCurrent()
-        guard recentExternalKeyboardInputFollowsAltTabTarget(),
-              lastExternalKeyboardInputAt - current.timestamp > 0.05 else { return false }
-        Diagnostics.log("ZENFORCE", String(format: "released by external activation: %@ pid=%d target=#%u key=%@ keyAge=%.0fms", label, pid ?? -1, current.wid, lastExternalKeyboardInputLabel, (now - lastExternalKeyboardInputAt) * 1000))
-        Diagnostics.log("GUARD", String(format: "released stale z-order enforcement by external activation: %@ pid=%d target=#%u key=%@ keyAge=%.0fms", label, pid ?? -1, current.wid, lastExternalKeyboardInputLabel, (now - lastExternalKeyboardInputAt) * 1000))
-        releaseZOrderEnforcement(clearGuard: true)
+        let evidence = externalForegroundOwnershipEvidence(current: current, pid: pid, wid: wid, now: now)
+        guard !evidence.isEmpty else { return false }
+        releaseZOrderEnforcementForExternalForegroundOwner(current: current, wid: wid, pid: pid, label: label, evidence: evidence, now: now)
         return true
     }
 
-    @discardableResult
-    static func releaseZOrderEnforcementForRecentExternalActivation(pid: pid_t, label: String) -> Bool {
-        guard let current = recentZOrderIntents.last, current.pid != pid else { return false }
-        return releaseZOrderEnforcementForExternalKeyboardIntent(current: current, pid: pid, label: label)
+    private static func externalForegroundOwnershipEvidence(current: ZOrderIntent, pid: pid_t, wid: CGWindowID?, now: CFAbsoluteTime) -> String {
+        if now - lastMouseClickTime < 0.3 { return "mouse" }
+        if current.pid == pid && wid != nil && wid != current.wid && recentExternalKeyboardInputFollowsAltTabTarget() { return "keyboard:\(lastExternalKeyboardInputLabel)" }
+        if current.pid != pid && recentExternalKeyboardInputFollowsAltTabTarget() { return "keyboard:\(lastExternalKeyboardInputLabel)" }
+        if current.wasEverAtZ0 && now - current.timestamp > 0.45 && externalForegroundPidIsNotSource(current: current, pid: pid) { return "settled-foreign-front" }
+        return ""
+    }
+
+    private static func externalForegroundPidIsNotSource(current: ZOrderIntent, pid: pid_t) -> Bool {
+        guard let sourceWid = current.sourceWid,
+              let sourcePid = list.first(where: { $0.cgWindowId == sourceWid })?.application.pid else { return true }
+        return sourcePid != pid
+    }
+
+    private static func releaseZOrderEnforcementForExternalForegroundOwner(current: ZOrderIntent, wid: CGWindowID?, pid: pid_t, label: String, evidence: String, now: CFAbsoluteTime) {
+        let targetWid = current.wid
+        let targetPid = current.pid
+        let sourceWid = current.sourceWid
+        let timestamp = current.timestamp
+        let ageMs = Int((now - timestamp) * 1000)
+        let release = {
+            guard let latest = recentZOrderIntents.last,
+                  latest.wid == targetWid,
+                  latest.timestamp == timestamp else { return }
+            Diagnostics.log("GUARD", "released stale z-order enforcement by external foreground owner: \(label) evidence=\(evidence) source=#\(sourceWid ?? 0) target=#\(targetWid) targetPid=\(targetPid) front=#\(wid ?? 0) frontPid=\(pid) age=\(ageMs)ms")
+            releaseZOrderEnforcement(clearGuard: true)
+        }
+        if Thread.isMainThread {
+            release()
+        } else {
+            DispatchQueue.main.async(execute: release)
+        }
     }
 
     private static func releaseZOrderEnforcement(clearGuard: Bool) {
@@ -929,6 +1084,7 @@ class Windows {
 
     private struct FastZState {
         let topWid: CGWindowID?
+        let topPid: pid_t?
         let topOwner: String
         let targetZ: Int?
     }
@@ -978,6 +1134,21 @@ class Windows {
                 return
             }
             guard let state = fastZState(targetWid: wid), let targetZ = state.targetZ, targetZ > 0 else { return }
+            if let topWid = state.topWid,
+               releaseZOrderEnforcementForNewerForegroundWindow(wid: topWid, pid: state.topPid ?? 0, owner: state.topOwner, label: "fast-z-top") {
+                timer.cancel()
+                return
+            }
+            if let topWid = state.topWid, let topPid = state.topPid, topPid != pid,
+               releaseZOrderEnforcementForExternalForegroundOwner(wid: topWid, pid: topPid, label: "fast-z-top") {
+                timer.cancel()
+                return
+            }
+            if let topWid = state.topWid, state.topPid == pid, topWid != wid,
+               releaseZOrderEnforcementForSameAppKeyboardFocusMove(wid: topWid, pid: pid, label: "fast-z-top") {
+                timer.cancel()
+                return
+            }
             guard now - lastRepairAt > repairThrottleSeconds, repairCount < maxRepairs else { return }
             lastRepairAt = now
             repairCount += 1
@@ -994,6 +1165,7 @@ class Windows {
         guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return nil }
         var pos = 0
         var topWid: CGWindowID?
+        var topPid: pid_t?
         var topOwner = "?"
         var targetZ: Int?
         for row in info {
@@ -1008,8 +1180,11 @@ class Windows {
             let layer = (row[kCGWindowLayer as String] as? Int) ?? 0
             if layer != 0 { continue }
             let wid = CGWindowID((row[kCGWindowNumber as String] as? Int) ?? 0)
+            let pid = pid_t((row[kCGWindowOwnerPID as String] as? Int32) ?? 0)
+            noteZOrderWindowObserved(wid: wid, pid: pid, owner: owner, source: "fast-z", at: startedAt)
             if pos == 0 {
                 topWid = wid
+                topPid = pid
                 topOwner = owner
             }
             if wid == targetWid {
@@ -1019,7 +1194,7 @@ class Windows {
             pos += 1
         }
         logSlowFastZScan(startedAt: startedAt, targetWid: targetWid, targetZ: targetZ, source: "cgwindow")
-        return FastZState(topWid: topWid, topOwner: topOwner, targetZ: targetZ)
+        return FastZState(topWid: topWid, topPid: topPid, topOwner: topOwner, targetZ: targetZ)
     }
 
     private static func logSlowFastZScan(startedAt: CFAbsoluteTime, targetWid: CGWindowID, targetZ: Int?, source: String) {
@@ -1077,6 +1252,18 @@ class Windows {
             guard let state = fastZState(targetWid: targetWid),
                   let targetZ = state.targetZ,
                   targetZ > 0 else { return }
+            if let topWid = state.topWid,
+               releaseZOrderEnforcementForNewerForegroundWindow(wid: topWid, pid: state.topPid ?? 0, owner: state.topOwner, label: label) {
+                return
+            }
+            if let topWid = state.topWid, let topPid = state.topPid, topPid != targetPid,
+               releaseZOrderEnforcementForExternalForegroundOwner(wid: topWid, pid: topPid, label: label) {
+                return
+            }
+            if let topWid = state.topWid, state.topPid == targetPid, topWid != targetWid,
+               releaseZOrderEnforcementForSameAppKeyboardFocusMove(wid: topWid, pid: targetPid, label: label) {
+                return
+            }
             let ax = focusedWindowIdForPid(targetPid)
             if let ax, ax != targetWid {
                 Diagnostics.log("MONITOR", "repair skipped focused sibling/dialog axWid=#\(ax) target=#\(targetWid) failures=\(failures.joined(separator: ","))")
@@ -1151,6 +1338,7 @@ class Windows {
         var sameAppBlockerWid: CGWindowID? = nil
         var sameAppBlockerName: String = ""
         var z0Wid: CGWindowID? = nil
+        var z0Pid: pid_t?
         var z0Owner: String = "?"
         var z0Name: String = ""
         var pos = 0
@@ -1167,8 +1355,10 @@ class Windows {
             if layer > targetLayer { continue } // unreachable overlay
             let wid = (w[kCGWindowNumber as String] as? Int) ?? 0
             let name = (w[kCGWindowName as String] as? String) ?? ""
+            let ownerPid = (w[kCGWindowOwnerPID as String] as? Int32) ?? 0
             if pos == 0 {
                 z0Wid = CGWindowID(wid)
+                z0Pid = pid_t(ownerPid)
                 z0Owner = owner
                 z0Name = name
             }
@@ -1184,7 +1374,6 @@ class Windows {
             // (after target was already at z0 — likely a fresh modal)
             // or pairwise-raise above it (before target ever reached
             // z0 — user explicitly asked for the target).
-            let ownerPid = (w[kCGWindowOwnerPID as String] as? Int32) ?? 0
             let aboveWid = CGWindowID(wid)
             if ownerPid == mostRecent.pid {
                 let isTracked = list.contains { $0.cgWindowId == aboveWid }
@@ -1204,6 +1393,18 @@ class Windows {
         // interventions are actually correcting the state.
         logZAlignment(target: mostRecent.wid, z0Wid: z0Wid, z0Label: "\(z0Owner):\(z0Name.prefix(20))")
         diagnoseFrontmostMismatch(targetWid: mostRecent.wid, targetPid: mostRecent.pid, atZ0: targetZPos == 0)
+        if targetZPos > 0, let z0Wid,
+           releaseZOrderEnforcementForNewerForegroundWindow(wid: z0Wid, pid: z0Pid ?? 0, owner: z0Owner, label: "z-enforce-top") {
+            return
+        }
+        if targetZPos > 0, let z0Wid, let z0Pid, z0Pid != mostRecent.pid,
+           releaseZOrderEnforcementForExternalForegroundOwner(wid: z0Wid, pid: z0Pid, label: "z-enforce-top") {
+            return
+        }
+        if targetZPos > 0, let z0Wid, z0Pid == mostRecent.pid, z0Wid != mostRecent.wid,
+           releaseZOrderEnforcementForSameAppKeyboardFocusMove(wid: z0Wid, pid: mostRecent.pid, label: "z-enforce-top") {
+            return
+        }
         if targetZPos == 0 {
             if !mostRecent.wasEverAtZ0 {
                 let intentIndex = recentZOrderIntents.count - 1
@@ -1461,7 +1662,7 @@ class Windows {
             return
         }
         let frontBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
-        if releaseZOrderEnforcementForRecentExternalActivation(pid: frontPid, label: "front-mismatch \(frontBundle.suffix(40))") {
+        if releaseZOrderEnforcementForExternalForegroundOwner(pid: frontPid, label: "front-mismatch \(frontBundle.suffix(40))") {
             lastFrontMismatchLogged = nil
             return
         }
@@ -2378,6 +2579,16 @@ class Windows {
             .dropFirst()
             .prefix(limit)
             .forEach { $0.prewarmNativeFocusAxElementIfNeeded() }
+    }
+
+    static func moveWindowToEndOfFocusOrder(_ window: Window, reason: String) {
+        let oldOrder = window.lastFocusOrder
+        guard let maxOrder = list.map(\.lastFocusOrder).max(), oldOrder < maxOrder else { return }
+        for candidate in list where candidate !== window && candidate.lastFocusOrder > oldOrder {
+            candidate.lastFocusOrder -= 1
+        }
+        window.lastFocusOrder = maxOrder
+        Diagnostics.log("RECENCY", "moved window to end reason=\(reason) wid=#\(window.cgWindowId ?? 0) old=\(oldOrder) new=\(maxOrder)")
     }
 
     static func findOrCreate(_ windowAxUiElement: AXUIElement, _ wid: CGWindowID, _ app: Application, _ level: CGWindowLevel, _ title: String?, _ subrole: String?, _ role: String?, _ size: CGSize?, _ position: CGPoint?, _ isFullscreen: Bool?, _ isMinimized: Bool?) -> (Window?, Bool) {

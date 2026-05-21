@@ -436,6 +436,24 @@ class Diagnostics {
         let top = rows.first
         let ax = focusedAxSignals()
         let panelActive = App.appIsBeingUsed
+        if let top, top.wid != targetWid,
+           Windows.releaseZOrderEnforcementForNewerForegroundWindow(wid: top.wid, pid: top.pid, owner: top.owner, label: label) {
+            log("MONITOR", "\(label): newer foreground window owns z0 target=#\(targetWid) top=#\(top.wid) \(top.owner); not restoring target")
+            return
+        }
+        if let top, top.wid != targetWid, top.pid != targetPid,
+           Windows.releaseZOrderEnforcementForKeyboardForegroundChange(wid: top.wid, pid: top.pid, label: label) {
+            log("MONITOR", "\(label): keyboard foreground change owns z0 target=#\(targetWid) top=#\(top.wid) \(top.owner); not restoring target")
+            return
+        }
+        if let top, top.pid == targetPid, top.wid != targetWid, Windows.recentExternalKeyboardInputFollowsAltTabTarget() {
+            log("MONITOR", "\(label): same-app window surfaced after keyboard input target=#\(targetWid) top=#\(top.wid); not repairing stale AltTab target")
+            DispatchQueue.main.async {
+                _ = Windows.releaseZOrderEnforcementForSameAppKeyboardFocusMove(wid: top.wid, pid: targetPid, label: label)
+                App.noteObservedFocusedWindow(top.wid)
+            }
+            return
+        }
         if let axWid = ax.wid, ax.pid == targetPid, axWid != targetWid, Windows.recentExternalKeyboardInputFollowsAltTabTarget() {
             log("MONITOR", "\(label): same-app focus moved after keyboard input target=#\(targetWid) axWid=#\(axWid); not repairing stale AltTab target")
             DispatchQueue.main.async {
@@ -477,6 +495,7 @@ class Diagnostics {
                   bounds.width >= 40, bounds.height >= 40 else { continue }
             let wid = CGWindowID((row[kCGWindowNumber as String] as? Int) ?? 0)
             let pid = pid_t((row[kCGWindowOwnerPID as String] as? Int32) ?? 0)
+            Windows.noteZOrderWindowObserved(wid: wid, pid: pid, owner: owner, source: "focus-invariant")
             rows.append(ZRow(wid: wid, pid: pid, owner: owner))
             if rows.count >= limit { break }
         }

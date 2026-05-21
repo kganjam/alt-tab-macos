@@ -91,7 +91,13 @@ class App: AppCenterApplication {
     }
 
     static func noteDirectFocusOutsideAltTab(_ wid: CGWindowID?) {
-        guard !appIsBeingUsed else { return }
+        if appIsBeingUsed {
+            Diagnostics.log("PANEL", "external/direct focus canceled active AltTab handoff wid=#\(wid ?? 0)")
+            cancelPendingParHide()
+            hideUi(true)
+        } else {
+            cancelPendingParHide()
+        }
         altTabFocusSourceInvalidated = true
         Diagnostics.log("RECENCY", "external/direct focus invalidated AltTab pair wid=#\(wid ?? 0)")
     }
@@ -100,6 +106,22 @@ class App: AppCenterApplication {
         guard let wid, let targetWid = lastAltTabFocusTargetWid, wid != targetWid else { return }
         altTabFocusSourceInvalidated = true
         Diagnostics.log("RECENCY", "observed non-target focus invalidated AltTab pair wid=#\(wid) target=#\(targetWid)")
+    }
+
+    static func shouldSuppressStaleAltTabTargetEvent(wid: CGWindowID?, pid: pid_t?, reason: String) -> Bool {
+        let now = CFAbsoluteTimeGetCurrent()
+        guard altTabFocusSourceInvalidated,
+              let wid,
+              let pid,
+              let targetWid = lastAltTabFocusTargetWid,
+              wid == targetWid,
+              now - lastAltTabFocusAt < Double(RuntimeFlags.postAltTabFocusSuppressionMs) / 1000,
+              Windows.recentExternalKeyboardInputFollowsAltTabTarget() else { return false }
+        let frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let topWid = Windows.captureTopZRanking(maxCount: 1).first?.wid
+        guard frontPid != pid || topWid != wid else { return false }
+        Diagnostics.log("RECENCY", "suppress stale target focus event after external ownership reason=\(reason) wid=#\(wid) pid=\(pid) frontPid=\(frontPid ?? 0) top=#\(topWid ?? 0)")
+        return true
     }
 
     @discardableResult

@@ -804,3 +804,42 @@ corrections below the visible-fold reflect the user's expected order.
 - Current z-sampler after stopping AltTab showed Terminal at z0, followed by a large contiguous Safari block. Logs around `19:01-19:02` showed Safari window focus and same-app cycling while the native focus path used `SLPS(userGenerated)+makeKeyWindow`, which is exactly the path known to promote sibling windows in multi-window apps when not repaired.
 - Code review found the likely regression: earlier direct native sibling repair hooks had been removed and replaced by delayed enforcement. That delayed path depends on cached/stale `preZ` and can miss the exact pre-focus order; if it misses, it cannot demote Safari siblings back under the prior foreground window.
 - Fix candidate: native focus now captures a fresh live pre-focus z snapshot at focus time instead of falling back to a stale full cache, and `armNativeFocusZOrderIntent` immediately schedules bounded expected-z-order repairs at `0/80/180/360/700ms`. The repair remains narrow: it only demotes same-pid siblings that were promoted above the first expected non-target divider; it does not use app-level activation or broad full-stack AX raises.
+
+## 2026-05-20 — external foreground ownership after AltTab
+
+- User reproduced a stale restore by using a Karabiner hotkey to bring Parallels OneNote forward after an AltTab switch. Recent logs showed AltTab still had a prior target intent and restored the old target on `FRONT_MISMATCH`.
+- Root cause: the guard release logic was keyboard/activation-specific instead of foreground-owner-specific. External focus can arrive through Karabiner, manual activation, AX focused-window/main-window notifications, NSWorkspace activation, or simply as a settled foreign z0/front app.
+- Fix: added `releaseZOrderEnforcementForExternalForegroundOwner`, used by AX app activation, AX focused/main-window changes, NSWorkspace activation, focus invariant repair, fast z monitor, and frontmost mismatch repair. It releases stale AltTab intent on credible external ownership evidence before any restore/counter-raise.
+- Release coverage: updated REL-088 and release-risk notes. Required proof is 3x Karabiner/manual external focus inside the post-AltTab guard window, plus a no-key negative control and bounded log scan for no `FRONT_MISMATCH ... restoring` after the external owner appears.
+- Validation so far: `bash ai/build.sh compile` passed. Dev relaunch and live REL-088 eval remain required after this patch.
+
+## 2026-05-20 — minimized windows default to end for all shortcut profiles
+
+- User reported minimized windows were still not at the end and specifically called out Alt+`.
+- Existing product setting is `Show minimized windows` with values `Show`, `Hide`, and `Show at the end`. The primary profile already had the persisted value `2`, but `showMinimizedWindows2` was unset, so the second shortcut profile inherited the old code default `Show` and could intermix minimized windows.
+- Fix: changed the default for `showMinimizedWindows*` to `showAtTheEnd` for every shortcut/gesture profile. This makes normal Alt-Tab and Alt+` share the same minimized-window suffix behavior unless the user explicitly changes the setting.
+- Added `ai/eval-minimized-order.sh` to open profiles `0` and `1`, query `--selection-state`, and fail if any displayable minimized window appears before a displayable non-minimized window.
+
+## 2026-05-20 — fn+l OneNote source-window reactivation flicker
+
+- User reported flashing when using Karabiner `fn+l` to bring Parallels OneNote forward.
+- Logs at `2026-05-20 17:30:30-17:30:32` showed AltTab had just switched from OneNote `#149427` to Terminal `#130253`. `fn+l` generated modifier-only events, OneNote became frontmost/z0, then AltTab treated this as stale source reactivation and restored Terminal (`FRONT_MISMATCH ... restoring`), followed by invariant repair. That restore caused the visible flash.
+- Cause: external foreground-owner release required a “releasable” keyboard event for cross-pid foreground changes, and excluded settled source reappearance. Karabiner can consume the actual key and leave AltTab seeing only fn/hyper modifier transitions, so the external intent was real but not classified as releasable.
+- Fix: once another pid becomes foreground after an AltTab target and the keyboard event is not temporally AltTab's own shortcut, any recent external keyboard event is enough foreground-ownership evidence. This applies even when the new owner is the previous source window.
+
+## 2026-05-20 — fn+l/fn+o OneNote↔Outlook flicker after AltTab handoff
+
+- Evidence from `/tmp/alttab-run.log` around `17:35:14-17:35:29`:
+  - AltTab switched `OneNote #149427` / `Outlook #149437` to Terminal `#130253`, then external Karabiner-style modifier-only hotkeys (`modifiers=8388864`, `524576`, `131330`, then `256`) alternated OneNote/Outlook.
+  - A stale AltTab target event arrived after external ownership: `app-activated wid=130253` at `17:35:15.297`, after OneNote had already been reactivated by keyboard input.
+  - External hotkey transitions also produced repeated `app-activated` + `focused-window` full z-order reviews and `app-launched`/`app-quit` lifecycle reviews roughly 400-650ms after each Parallels foreground change.
+- Causal model:
+  - When a non-AltTab focus mechanism takes over soon after an AltTab Parallels handoff, AltTab must cancel its active handoff state, invalidate the AltTab source/target pair even if the panel is still active, and ignore stale target AX events unless the target is still truly frontmost/z0.
+  - External app focus should update only the top z cache immediately; full z refreshes during rapid OneNote↔Outlook hotkey alternation add avoidable WindowServer/AX churn and make log causality harder to read.
+- Fix candidate:
+  - `App.noteDirectFocusOutsideAltTab` now cancels pending Parallels hide/capture state and hides any active panel before invalidating the AltTab pair.
+  - `App.shouldSuppressStaleAltTabTargetEvent` drops delayed AX target events after external keyboard ownership when the target is no longer frontmost or z0.
+  - `AccessibilityEvents` uses top-only z reviews for external focus events outside an active/recent non-invalidated AltTab handoff.
+  - `RunningApplicationsEvents` now derives actual KVO launch/quit deltas using `kind`/`indexes` or pid diff, and uses top-only z review for non-regular process churn.
+- Validation signal:
+  - After an `fn+l`/`fn+o` run, logs should show no stale target `app-activated wid=<previous AltTab target>` updating recency after external ownership, fewer full `z-order review reason=app-activated/focused-window` lines during external hotkey alternation, no `FRONT_MISMATCH`, no `COUNTER`, and no `ANOMALY`.

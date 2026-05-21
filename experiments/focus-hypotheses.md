@@ -364,6 +364,14 @@ Supersession note from later 2026-05-19 testing: this section's `nativeFocusMode
 - Current decision: keep stale z-enforcement release on non-AltTab keyboard input and recent external activation. Keep this scoped to external input after an existing intent; do not globally disable z-enforcement, because Parallels self-activation still needs counter-raise during actual AltTab transitions.
 - Regression test: run `SIMULATE_EXTERNAL_KEY=1 FAIL_KEY_EVENTS=0 SOURCE_APP=Terminal TARGET_OWNER="Outlook (classic)" LAUNCH_COMMAND="/Users/kganjam/bin/focus-parallels-outlook" bash ai/eval-external-launch-transition.sh`. The no-key control should still fail with a restore and is useful only to verify the test remains sensitive.
 
+### 2026-05-20 17:20 update — external foreground ownership is broader than Karabiner
+
+- Evidence: after an AltTab focus to Terminal, the user used a Karabiner hotkey to bring OneNote forward. Logs showed the old AltTab target stayed z0 briefly while `frontmostApplication` moved to OneNote, then AltTab treated that as a `FRONT_MISMATCH` and restored Terminal. This was not a "new window" case; it was a later non-AltTab foreground owner.
+- Cause: release logic was tied too closely to keyboard-specific evidence and explicit AX activation release. It missed paths where the external intent appears as NSWorkspace activation, focused-window change, or a settled foreign z0/front app after the AltTab target had already been valid.
+- Decision: stale AltTab z-enforcement must be ownership-based, not Karabiner-specific. If a post-switch mouse click, external keyboard event, AX/NSWorkspace activation, or settled non-source foreground window credibly owns the foreground, release the old AltTab intent before any restore/counter-raise.
+- Constraint: do not disable z enforcement globally. Real AltTab transitions still need bounded repair while settling; only release once there is evidence that a newer external foreground owner exists.
+- Regression test: repeat REL-088 with Karabiner Outlook/OneNote, manual app activation, and a no-key negative control. Passing logs must show `released stale z-order enforcement by external foreground owner` before any `FRONT_MISMATCH ... restoring`.
+
 ### 2026-05-20 — Stale focus enforcement must be short and target-scoped
 
 - Evidence: after an AltTab focus to Teams, logs at `2026-05-20 10:21:32` showed the target visually z0 while `frontmostApplication` had changed to OneNote. The stale guard restored Teams instead of treating the later modifier activity/external launch as user intent. Separately, a temporary non-target cluster repair tried to demote unrelated app clusters such as Outlook/OBS, which made visual flashing and races worse.

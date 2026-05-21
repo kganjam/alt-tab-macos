@@ -113,7 +113,7 @@ class Preferences {
             values[indexToName("appsToShow", index)] = index == 1 ? AppsToShowPreference.active.indexAsString : (index == 2 ? AppsToShowPreference.nonActive.indexAsString : AppsToShowPreference.all.indexAsString)
             values[indexToName("spacesToShow", index)] = SpacesToShowPreference.all.indexAsString
             values[indexToName("screensToShow", index)] = ScreensToShowPreference.all.indexAsString
-            values[indexToName("showMinimizedWindows", index)] = ShowHowPreference.show.indexAsString
+            values[indexToName("showMinimizedWindows", index)] = ShowHowPreference.showAtTheEnd.indexAsString
             values[indexToName("showHiddenWindows", index)] = ShowHowPreference.show.indexAsString
             values[indexToName("showFullscreenWindows", index)] = ShowHowPreference.show.indexAsString
             values[indexToName("showWindowlessApps", index)] = ShowHowPreference.showAtTheEnd.indexAsString

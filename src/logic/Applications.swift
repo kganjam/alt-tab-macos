@@ -82,7 +82,10 @@ class Applications {
                         tabStateChanged = TabGroup.updateState(window, tabSiblingTitles)
                     }
                     if findOrCreate.1 || (tabStateChanged && App.appIsBeingUsed) {
-                        if findOrCreate.1 { Logger.info { "manuallyUpdateWindows found a new window:\(window.debugId)" } }
+                        if findOrCreate.1 {
+                            Windows.noteWindowCreated(window, source: "manual-update")
+                            Logger.info { "manuallyUpdateWindows found a new window:\(window.debugId)" }
+                        }
                         App.refreshOpenUiAfterExternalEvent([window])
                     }
                 }
