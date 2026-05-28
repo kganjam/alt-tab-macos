@@ -23,6 +23,7 @@ class TilesView {
     static var rows = [[TileView]]()
     private static var lastRowSignature = [Int]()
     private static var lastVisibleThumbnailRefreshAt: CFAbsoluteTime = 0
+    private static var visibleThumbnailRefreshTimer: Timer?
     static var recycledViews = [TileView]()
     static var thumbnailsWidth = CGFloat(0.0)
     static var thumbnailsHeight = CGFloat(0.0)
@@ -632,7 +633,20 @@ class TilesView {
         let windows = visibleWindowsForThumbnailRefresh()
         guard !windows.isEmpty else { return }
         Diagnostics.log("CAPTURE", "visible thumbnail refresh reason=\(reason) count=\(windows.count)")
-        Windows.refreshThumbnailsAsync(windows, .refreshOnlyThumbnailsAfterShowUi)
+        Windows.refreshThumbnailsAsync(windows, .refreshVisibleThumbnailsAfterShowUi)
+    }
+
+    static func startVisibleThumbnailRefreshTimer() {
+        stopVisibleThumbnailRefreshTimer()
+        let interval = TimeInterval(max(500, RuntimeFlags.visibleThumbnailRefreshIntervalMs)) / 1000
+        let timer = Timer(timeInterval: interval, repeats: true) { _ in refreshVisibleThumbnailsIfNeeded("timer") }
+        visibleThumbnailRefreshTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    static func stopVisibleThumbnailRefreshTimer() {
+        visibleThumbnailRefreshTimer?.invalidate()
+        visibleThumbnailRefreshTimer = nil
     }
 
     struct LayoutCache {

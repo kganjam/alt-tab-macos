@@ -65,6 +65,7 @@ class CliServer {
             return noOutput
         }
         if rawValue == "--focus-target" {
+            Diagnostics.startSwitchTiming("cli-focus-target")
             App.focusTarget()
             return noOutput
         }
@@ -79,6 +80,7 @@ class CliServer {
            let index = Windows.list.firstIndex(where: { $0.cgWindowId == id }) {
             Windows.updateSelectedAndHoveredWindowIndex(index)
             let selected = Windows.selectedWindow()
+            Diagnostics.startSwitchTiming("cli-select-and-focus")
             App.focusSelectedWindow(selected)
             return selectionState(selected)
         }
@@ -89,12 +91,14 @@ class CliServer {
         }
         if rawValue.hasPrefix("--focus="),
            let id = CGWindowID(rawValue.dropFirst("--focus=".count)), let window = (Windows.list.first { $0.cgWindowId == id }) {
+            Diagnostics.startSwitchTiming("cli-focus")
             App.hideUi(true)
             window.focus()
             return noOutput
         }
         if rawValue.hasPrefix("--focusUsingLastFocusOrder="),
            let lastFocusOrder = Int(rawValue.dropFirst("--focusUsingLastFocusOrder=".count)), let window = (Windows.list.first { $0.lastFocusOrder == lastFocusOrder }) {
+            Diagnostics.startSwitchTiming("cli-focus-last-order")
             App.hideUi(true)
             window.focus()
             return noOutput

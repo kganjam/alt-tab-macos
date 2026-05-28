@@ -79,6 +79,11 @@ class KeyboardEvents {
                 Diagnostics.log("KEYEVENT", "not registering \(controlId): reserved native Cmd+`/Cmd+Shift+`")
                 return
             }
+            if shouldProtectNativeCommandNumber(controlId, shortcut) {
+                unregisterHotKeyIfNeeded(controlId, shortcut)
+                Diagnostics.log("KEYEVENT", "not registering \(controlId): reserved native Cmd+number")
+                return
+            }
             guard let id = KeyboardEventsTestable.globalShortcutsIds[controlId] else { return }
             let hotkeyId = EventHotKeyID(signature: signature, id: UInt32(id))
             let key = shortcut.carbonKeyCode
@@ -96,6 +101,10 @@ class KeyboardEvents {
         let hasCommand = modifiers & UInt32(cmdKey) == UInt32(cmdKey)
         let hasUnsupportedModifier = modifiers & (UInt32(optionKey) | UInt32(controlKey) | UInt32(alphaLock)) != 0
         return shortcut.carbonKeyCode == UInt32(kVK_ANSI_Grave) && hasCommand && !hasUnsupportedModifier
+    }
+
+    private static func shouldProtectNativeCommandNumber(_ controlId: String, _ shortcut: Shortcut) -> Bool {
+        RuntimeFlags.protectNativeCommandNumberShortcuts && KeyboardEventsTestable.isNativeCommandNumberShortcut(controlId, shortcut)
     }
 
     // TODO: handle this on a background thread?

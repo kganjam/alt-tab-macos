@@ -1,6 +1,17 @@
 import XCTest
+import ShortcutRecorder
 
 final class KeyboardEventsUtilsTests: XCTestCase {
+    func testNativeCommandNumberShortcutsAreReservedForApplications() throws {
+        XCTAssertTrue(KeyboardEventsTestable.isNativeCommandNumberShortcut("nextWindowShortcut", Shortcut(keyEquivalent: "⌘1")!))
+        XCTAssertTrue(KeyboardEventsTestable.isNativeCommandNumberShortcut("nextWindowShortcut", Shortcut(keyEquivalent: "⌘7")!))
+        XCTAssertTrue(KeyboardEventsTestable.isNativeCommandNumberShortcut("nextWindowShortcut", Shortcut(keyEquivalent: "⌘8")!))
+        XCTAssertTrue(KeyboardEventsTestable.isNativeCommandNumberShortcut("nextWindowShortcut9", Shortcut(keyEquivalent: "⌘9")!))
+        XCTAssertFalse(KeyboardEventsTestable.isNativeCommandNumberShortcut("holdShortcut", Shortcut(keyEquivalent: "⌘1")!))
+        XCTAssertFalse(KeyboardEventsTestable.isNativeCommandNumberShortcut("nextWindowShortcut", Shortcut(keyEquivalent: "⌘⇧1")!))
+        XCTAssertFalse(KeyboardEventsTestable.isNativeCommandNumberShortcut("nextWindowShortcut", Shortcut(keyEquivalent: "⌘⇥")!))
+    }
+
     // alt-down > tab-down > tab-up > alt-up
     func testMostCommonSequence() throws {
         resetState()
@@ -160,12 +171,28 @@ final class KeyboardEventsUtilsTests: XCTestCase {
         XCTAssertEqual(ControlsTab.shortcutsActionsTriggered, ["nextWindowShortcut", "nextWindowShortcut2", "holdShortcut2"])
     }
 
+    func testShortcutModifierOnlyDoesNotReleaseZOrder() throws {
+        resetState()
+        XCTAssertFalse(KeyboardEventsTestable.modifierOnlyEventCanReleaseZOrder([.option]))
+        handleKeyboardEvent(nil, nil, nil, [.option], false)
+        XCTAssertEqual(Windows.releaseKeyboardInputs.count, 1)
+        XCTAssertFalse(Windows.releaseKeyboardInputs[0].canReleaseZOrder)
+    }
+
+    func testNonShortcutModifierOnlyCanReleaseZOrder() throws {
+        resetState()
+        XCTAssertTrue(KeyboardEventsTestable.modifierOnlyEventCanReleaseZOrder([.command, .control, .option, .shift]))
+    }
+
     private func resetState() {
         App.app.appIsBeingUsed = false
         App.app.shortcutIndex = 0
         Preferences.shortcutStyle = .focusOnRelease
         ControlsTab.shortcuts.values.forEach { $0.state = .up }
         ControlsTab.shortcutsActionsTriggered = []
+        Windows.reset()
+        KeyboardEventsTestable.resetForTests()
+        ATShortcut.resetForTests()
     }
 
     private let keycodeMap: [Character: UInt32] = [

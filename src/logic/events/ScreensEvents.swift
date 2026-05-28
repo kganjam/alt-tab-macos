@@ -32,12 +32,15 @@ class ScreensEvents {
 
     private static func prepareThumbnailsForDisplayChange() {
         refreshGeneration += 1
-        if App.appIsBeingUsed {
-            Diagnostics.log("CAPTURE", "screen change while panel open: preserving current thumbnails")
-        } else {
-            Windows.invalidateThumbnails()
-        }
+        // Don't blank thumbnails on screen change. Stale is much better
+        // than empty: the user might never alt-tab again before the
+        // BackgroundThumbnailRefresher catches up (~10s), and screen
+        // reconfigs already saturate WindowServer — a simultaneous
+        // panic-rerender of every thumbnail makes it worse.
+        Diagnostics.log("CAPTURE", "screen change: preserving current thumbnails (panel=\(App.appIsBeingUsed))")
         if #available(macOS 14.0, *) {
+            // Only the SCWindow lookup list needs invalidating (cheap to
+            // rebuild and necessary since window IDs/geometry change).
             WindowCaptureScreenshots.invalidateCache()
         }
     }
@@ -51,12 +54,14 @@ class ScreensEvents {
     }
 
     private static func scheduleThumbnailRefreshes() {
+        // Single ~1s reissue handles the immediate post-reconfig
+        // re-screenshot. Anything still stale after that is picked up by
+        // BackgroundThumbnailRefresher's natural 5/10s cadence — no need
+        // for the old [700, 2200, 5000] shotgun.
         let generation = refreshGeneration
-        [700, 2200, 5000].forEach { delayMs in
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) {
-                guard generation == refreshGeneration else { return }
-                App.refreshOpenUiAfterExternalEvent(Windows.list, source: .screenParametersChanged)
-            }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(1000)) {
+            guard generation == refreshGeneration else { return }
+            App.refreshOpenUiAfterExternalEvent(Windows.list, source: .screenParametersChanged)
         }
     }
 }

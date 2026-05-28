@@ -19,8 +19,17 @@ class Window {
     var lastFocusOrder = Int.zero
     var creationOrder = Int.zero
     var title: String!
-    var thumbnail: CALayerContents?
-    var thumbnailUpdatedAt: CFAbsoluteTime = 0
+    /// The thumbnail bitmap. Storage lives in `ThumbnailCache.shared` so
+    /// background captures can write to it without hopping to main. Reads
+    /// here are an O(1) dict lookup + uncontended NSLock (~ns).
+    var thumbnail: CALayerContents? {
+        guard let wid = cgWindowId else { return nil }
+        return ThumbnailCache.shared.read(wid: wid)
+    }
+    var thumbnailUpdatedAt: CFAbsoluteTime {
+        guard let wid = cgWindowId else { return 0 }
+        return ThumbnailCache.shared.lastUpdatedAt(wid: wid)
+    }
     var thumbnailUpdateCount = 0
     var icon: CGImage? { get { application.icon } }
     var shouldShowTheUser = true
@@ -124,8 +133,9 @@ class Window {
     }
 
     func invalidateThumbnail() {
-        thumbnail = nil
-        thumbnailUpdatedAt = 0
+        if let wid = cgWindowId {
+            ThumbnailCache.shared.clearThumbnail(wid: wid)
+        }
         guard App.appIsBeingUsed,
               let view = (TilesView.recycledViews.first { $0.window_?.cgWindowId == cgWindowId }),
               !view.thumbnail.isHidden else { return }
@@ -175,8 +185,9 @@ class Window {
     }
 
     func refreshThumbnail(_ screenshot: CALayerContents) {
-        thumbnail = screenshot
-        thumbnailUpdatedAt = CFAbsoluteTimeGetCurrent()
+        if let wid = cgWindowId {
+            ThumbnailCache.shared.writeCapture(wid: wid, image: screenshot)
+        }
         thumbnailUpdateCount += 1
         if !App.appIsBeingUsed || !shouldShowTheUser { return }
         if let position, let size,
@@ -1118,9 +1129,11 @@ class Window {
         Windows.armAltTabFocusGuard(for: self)
         var psn = ProcessSerialNumber()
         GetProcessForPID(application.pid, &psn)
-        if RuntimeFlags.parToMacSyntheticClickEnabled {
+        if shouldPostParToMacSyntheticClick() {
             let skyLightPosted = postSkyLightFocusClick(targetWid)
             Diagnostics.markSwitchPhase("skyLightClickDone", extra: "parToMac posted=\(skyLightPosted) wid=\(targetWid)")
+        } else if RuntimeFlags.parToMacSyntheticClickEnabled {
+            Diagnostics.markSwitchPhase("skyLightClickSkipped", extra: "parToMac unsafe bundle=\(application.bundleIdentifier ?? "?") wid=\(targetWid)")
         }
         _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
         Diagnostics.markSwitchPhase("slpsDone", extra: "parToMac")
@@ -1141,6 +1154,23 @@ class Window {
         manuallyUpdateFocusOrderForParallelsTransition()
         repokeFrontmostForCachedListeners(generation: Windows.currentZOrderFocusGeneration())
     }
+
+    private func shouldPostParToMacSyntheticClick() -> Bool {
+        guard RuntimeFlags.parToMacSyntheticClickEnabled else { return false }
+        guard let bundleIdentifier = application.bundleIdentifier else { return true }
+        return !Self.parToMacSyntheticClickUnsafeBundlePrefixes.contains { bundleIdentifier.hasPrefix($0) }
+    }
+
+    private static let parToMacSyntheticClickUnsafeBundlePrefixes = [
+        "com.microsoft.edgemac",
+        "com.google.Chrome",
+        "com.brave.Browser",
+        "com.apple.Safari",
+        "org.mozilla.firefox",
+        "com.operasoftware.Opera",
+        "com.vivaldi.Vivaldi",
+        "company.thebrowser.Browser",
+    ]
 
     /// Diagnostic: top-8 z-order with per-window owner+wid+level. Lets us
     /// see exactly which app's windows surface above the target after a
@@ -1278,7 +1308,7 @@ class Window {
                 Diagnostics.log("FRONTMOSTSET", "+\(delayMs)ms repoke skipped stale generation pid=\(targetPid) wid=\(targetWid)")
                 return
             }
-            guard !Windows.recentExternalKeyboardInputFollowsAltTabTarget() else {
+            guard !Windows.recentExternalKeyboardInputFollowsAltTabTarget(requireReleasable: true) else {
                 Diagnostics.log("FRONTMOSTSET", "+\(delayMs)ms repoke skipped after keyboard input pid=\(targetPid) wid=\(targetWid)")
                 return
             }

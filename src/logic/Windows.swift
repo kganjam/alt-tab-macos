@@ -5,6 +5,8 @@ class Windows {
     static var selectedWindowIndex = Int(0)
     static var selectedWindowTarget: String?
     static var hoveredWindowIndex: Int?
+    private static let persistedFocusOrderKey = "focusOrderWindowIds"
+    private static var didRestorePersistedFocusOrder = false
     // we use this to track if the focused window changed while alt-tab was open
     private static var lastFocusedWindowTarget: String?
     /// When AltTab initiates a focus change via SLPS + pin for a Parallels
@@ -156,6 +158,7 @@ class Windows {
             w.lastFocusOrder = nextOrder
             nextOrder += 1
         }
+        persistFocusOrder()
     }
 
     static func nextDisplayedFocusWindowId(after currentWid: CGWindowID?) -> CGWindowID? {
@@ -881,6 +884,18 @@ class Windows {
         releaseZOrderEnforcement(clearGuard: true)
     }
 
+    static func repairClickAfterMismatch(clickedWid: CGWindowID, clickedPid: pid_t, frontPid: pid_t, frontName: String) {
+        guard RuntimeFlags.zOrderFixesEnabled, frontPid > 0, frontPid != clickedPid else { return }
+        guard let clickedWindow = list.first(where: { $0.cgWindowId == clickedWid }),
+              clickedWindow.application.pid == clickedPid else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        let recentAltTabTarget = App.lastFocusedTargetWid == clickedWid && App.lastFocusedTargetTime.map { now - $0 < 5.0 } == true
+        let recentIntentTarget = recentZOrderIntents.last.map { $0.wid == clickedWid && now - $0.timestamp < zOrderEnforcementLifetimeSeconds() } == true
+        guard recentAltTabTarget || recentIntentTarget else { return }
+        Diagnostics.log("CLICKAFTER", "repairing click-route mismatch clicked=#\(clickedWid) pid=\(clickedPid) frontPid=\(frontPid) \(frontName)")
+        restoreFrontmostToTarget(targetWid: clickedWid, targetPid: clickedPid, frontPid: frontPid, source: "CLICKAFTER", bypassThrottle: true)
+    }
+
     static func releaseZOrderEnforcementForCreatedWindow(_ window: Window) {
         guard let wid = window.cgWindowId,
               let current = releaseCandidateForWindowCreation(pid: window.application.pid),
@@ -913,13 +928,11 @@ class Windows {
 
     static func releaseZOrderEnforcementForExternalKeyboardInput(label: String, canReleaseZOrder: Bool) {
         let observedAt = CFAbsoluteTimeGetCurrent()
+        guard canReleaseZOrder else { return }
         lastExternalKeyboardInputAt = observedAt
         lastExternalKeyboardInputLabel = label
-        if canReleaseZOrder {
-            lastReleasableExternalKeyboardInputAt = observedAt
-            lastReleasableExternalKeyboardInputLabel = label
-        }
-        guard canReleaseZOrder else { return }
+        lastReleasableExternalKeyboardInputAt = observedAt
+        lastReleasableExternalKeyboardInputLabel = label
         guard let current = recentZOrderIntents.last else { return }
         let targetWid = current.wid
         let targetTimestamp = current.timestamp
@@ -967,7 +980,7 @@ class Windows {
 
     @discardableResult
     static func releaseZOrderEnforcementForSameAppKeyboardFocusMove(wid: CGWindowID, pid: pid_t, label: String) -> Bool {
-        guard recentExternalKeyboardInputFollowsAltTabTarget() else { return false }
+        guard recentExternalKeyboardInputFollowsAltTabTarget(requireReleasable: true) else { return false }
         guard let current = recentZOrderIntents.last, current.pid == pid, current.wid != wid else { return false }
         Diagnostics.log("ZENFORCE", "released by same-app keyboard foreground move: \(label) focused=#\(wid) target=#\(current.wid) key=\(lastExternalKeyboardInputLabel)")
         Diagnostics.log("GUARD", "released stale z-order enforcement by same-app keyboard foreground move: \(label) focused=#\(wid) target=#\(current.wid) key=\(lastExternalKeyboardInputLabel)")
@@ -996,8 +1009,8 @@ class Windows {
 
     private static func externalForegroundOwnershipEvidence(current: ZOrderIntent, pid: pid_t, wid: CGWindowID?, now: CFAbsoluteTime) -> String {
         if now - lastMouseClickTime < 0.3 { return "mouse" }
-        if current.pid == pid && wid != nil && wid != current.wid && recentExternalKeyboardInputFollowsAltTabTarget() { return "keyboard:\(lastExternalKeyboardInputLabel)" }
-        if current.pid != pid && recentExternalKeyboardInputFollowsAltTabTarget() { return "keyboard:\(lastExternalKeyboardInputLabel)" }
+        if current.pid == pid && wid != nil && wid != current.wid && recentExternalKeyboardInputFollowsAltTabTarget(requireReleasable: true) { return "keyboard:\(lastReleasableExternalKeyboardInputLabel)" }
+        if current.pid != pid && recentExternalKeyboardInputFollowsAltTabTarget(requireReleasable: true) { return "keyboard:\(lastReleasableExternalKeyboardInputLabel)" }
         if current.wasEverAtZ0 && now - current.timestamp > 0.45 && externalForegroundPidIsNotSource(current: current, pid: pid) { return "settled-foreign-front" }
         return ""
     }
@@ -1320,7 +1333,7 @@ class Windows {
     }
 
     private static func repairAxFocusOnly(window: Window, targetWid: CGWindowID, targetPid: pid_t, label: String) {
-        guard !recentExternalKeyboardInputFollowsAltTabTarget() else {
+        guard !recentExternalKeyboardInputFollowsAltTabTarget(requireReleasable: true) else {
             Diagnostics.log("MONITOR", "AX-only repair skipped after keyboard input \(label) target=#\(targetWid)")
             return
         }
@@ -1466,15 +1479,10 @@ class Windows {
             } else {
                 restoreExpectedZOrderIfNeeded(intentIndex: recentZOrderIntents.count - 1)
             }
-        } else if targetZPos > 0 && sameAppBlockerWid != nil && mostRecent.wasEverAtZ0,
-                  let focusedWid = focusedWindowIdForPid(mostRecent.pid),
-                  focusedWid != mostRecent.wid {
-            // Target was already at z0 once; an untracked same-app window
-            // appeared on top AFTERWARDS — most likely a legitimate
-            // dialog/sheet when AX focus moved to it. If AX focus is still
-            // the target, it is a visual z-order regression and should
-            // fall through to the normal repair branch.
-            Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos) — same-app dialog/focused sibling above (target was at z0 prior); skipping")
+        } else if targetZPos > 0, let blocker = sameAppBlockerWid, mostRecent.wasEverAtZ0 {
+            Diagnostics.log("ZENFORCE", "released by same-app untracked foreground window: blocker=#\(blocker) \(sameAppBlockerName) target=#\(mostRecent.wid)")
+            Diagnostics.log("GUARD", "released stale z-order enforcement by same-app untracked foreground window: blocker=#\(blocker) target=#\(mostRecent.wid)")
+            releaseZOrderEnforcement(clearGuard: true)
         } else if targetZPos > 0 {
             guard mostRecent.raiseAttempts < ZOrderIntent.maxRaiseAttempts else {
                 Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), max \(ZOrderIntent.maxRaiseAttempts) attempts — keeping intent for delayed activation counter")
@@ -1588,16 +1596,17 @@ class Windows {
         let actual = Self.captureTopZRanking()
         let actualWids = actual.map { $0.wid }
         logPromotedWindowsAfterFocus(targetWid: targetWid, preZ: preZ, actual: actual)
-        guard actual.first?.wid == targetWid else {
-            Diagnostics.log("ZRESTORE", "target=#\(targetWid) is not z0 during sibling restore; skipping")
+        guard actualWids.contains(targetWid) else {
+            Diagnostics.log("ZRESTORE", "target=#\(targetWid) missing during sibling restore; skipping")
             return false
         }
+        let preRankByWid = Dictionary(uniqueKeysWithValues: preZ.map { ($0.wid, $0.rank) })
         var correctionsToApply = [(sibling: PreZEntry, divider: PreZEntry, reason: String)]()
         if let divider = preZ.first(where: { $0.wid != targetWid && $0.pid != targetPid && actualWids.contains($0.wid) }),
            let dividerIndex = actualWids.firstIndex(of: divider.wid) {
             let allowedSiblingWids = Set(preZ.prefix { $0.wid != divider.wid }.filter { $0.pid == targetPid && $0.wid != targetWid }.map { $0.wid })
-            correctionsToApply += actual.prefix(dividerIndex).dropFirst()
-                .filter { $0.pid == targetPid && !allowedSiblingWids.contains($0.wid) }
+            correctionsToApply += actual.prefix(dividerIndex)
+                .filter { $0.wid != targetWid && $0.pid == targetPid && preRankByWid[$0.wid] != nil && !allowedSiblingWids.contains($0.wid) }
                 .map { ($0, divider, "target-sibling") }
         } else {
             Diagnostics.log("ZRESTORE", "no visible unrelated divider for target=#\(targetWid); skipping target sibling restore")
@@ -2140,21 +2149,19 @@ class Windows {
                && (!Appearance.hideThumbnails || Preferences.previewSelectedWindow)
                && (Preferences.captureWindowsInBackground || App.appIsBeingUsed)
                && App.thumbnailCaptureAllowed(source) else { return }
-        let skipCoherencePreviews = UserDefaults.standard.bool(forKey: "disableCoherencePreviews")
-        // Background captures of Parallels Coherence windows hit
-        // CGSHWCaptureWindowList → WindowServer compositor → guest pixel
-        // blit, and on macOS 15 visibly flicker the mouse cursor when fired
-        // at high rates. OneNote rewrites its title on each keystroke,
-        // which fans out to a capture every ~200ms while the user types.
-        // Skip Coherence captures on background AX events and while the
-        // panel is open. Fresh panel-open captures are precisely timed
-        // against focus handoff and can make Parallels repaint/flicker.
-        let skipCoherenceForBackground = source == .refreshUiAfterExternalEvent && !App.appIsBeingUsed
-        let skipCoherenceForPanel = source == .refreshOnlyThumbnailsAfterShowUi && App.appIsBeingUsed && RuntimeFlags.skipCoherenceThumbnailsDuringPanel
+        // Coherence captures hit CGSHWCaptureWindowList → WindowServer
+        // compositor → guest pixel blit. On macOS 15 this can flicker the
+        // mouse cursor when fired at high rates. The user-level kill switch
+        // `bgThumbnailCoherenceEnabled` (default true) lets users disable
+        // Coherence captures entirely if the flicker is a problem; otherwise
+        // Coherence windows are treated identically to native ones across
+        // all capture sources (background periodic, in-panel timer,
+        // post-show, screen-change reissue, AX events).
+        let skipCoherence = !RuntimeFlags.bgThumbnailCoherenceEnabled
         var eligibleWindows = [Window]()
         for window in windows {
             if !window.isWindowlessApp, let cgWindowId = window.cgWindowId, cgWindowId != CGWindowID(bitPattern: -1) {
-                if (skipCoherencePreviews || skipCoherenceForBackground || skipCoherenceForPanel) && window.application.isParallelsCoherence { continue }
+                if skipCoherence && window.application.isParallelsCoherence { continue }
                 eligibleWindows.append(window)
             }
         }
@@ -2330,6 +2337,8 @@ class Windows {
                 }
             }
         }
+        ensureInitialSelectionSkipsSourceWindow()
+        logPanelOrder("initial-selection oldIndex=\(oldIndex)")
     }
 
     static func updateSelectedWindow() {
@@ -2405,9 +2414,10 @@ class Windows {
         }
     }
 
-    static func updateSelectedAndHoveredWindowIndex(_ newIndex: Int, _ fromMouse: Bool = false) {
+    static func updateSelectedAndHoveredWindowIndex(_ newIndex: Int, _ fromMouse: Bool = false, forceSelection: Bool = false) {
         guard newIndex >= 0 && newIndex < list.count else { return }
         guard shouldDisplay(list[newIndex]) else { return }
+        let previousIndex = selectedWindowIndex
         var index: Int?
         if fromMouse && (newIndex != hoveredWindowIndex || lastWindowActivityType == .focus) {
             let oldIndex = hoveredWindowIndex
@@ -2421,7 +2431,7 @@ class Windows {
         if !fromMouse {
             TilesView.thumbnailOverView.resetHoveredWindow()
         }
-        if (!fromMouse || Preferences.mouseHoverEnabled)
+        if (forceSelection || !fromMouse || Preferences.mouseHoverEnabled)
                && (newIndex != selectedWindowIndex || lastWindowActivityType == .hover) {
             let oldIndex = selectedWindowIndex
             selectedWindowIndex = newIndex
@@ -2436,6 +2446,7 @@ class Windows {
         let focusedView = TilesView.recycledViews[index]
         TilesView.scrollView.contentView.scrollToVisible(focusedView.frame)
         voiceOverWindow(index)
+        logSelectionChange(newIndex, previousIndex, fromMouse)
     }
 
     static func cycleSelectedWindowIndex(_ step: Int, allowWrap: Bool = true) {
@@ -2463,14 +2474,63 @@ class Windows {
 
     static func selectedWindowIndexAfterCycling(_ step: Int) -> Int {
         if list.count == 0 || !list.contains(where: { shouldDisplay($0) }) { return selectedWindowIndex }
+        let sourceWidToSkip = displayableAlternativeCount(excluding: App.sessionSourceWid) > 0 ? App.sessionSourceWid : nil
         var iterations = 0
         var targetIndex = selectedWindowIndex
         repeat {
             let next = (targetIndex + step) % list.count
             targetIndex = next < 0 ? list.count + next : next
             iterations += 1
-        } while !shouldDisplay(list[targetIndex]) && iterations <= list.count
+        } while (!shouldDisplay(list[targetIndex]) || (sourceWidToSkip != nil && list[targetIndex].cgWindowId == sourceWidToSkip)) && iterations <= list.count
         return targetIndex
+    }
+
+    private static func ensureInitialSelectionSkipsSourceWindow() {
+        guard let sourceWid = App.sessionSourceWid,
+              selectedWindow()?.cgWindowId == sourceWid else { return }
+        guard let alternateIndex = firstDisplayableIndexAfter(selectedWindowIndex, excluding: sourceWid) else {
+            Diagnostics.log("ORDER", "initial selection source has no alternate source=#\(sourceWid) oldIndex=\(selectedWindowIndex)")
+            return
+        }
+        Diagnostics.log("ORDER", "initial selection skipped source source=#\(sourceWid) oldIndex=\(selectedWindowIndex) newIndex=\(alternateIndex)")
+        updateSelectedAndHoveredWindowIndex(alternateIndex)
+    }
+
+    private static func firstDisplayableIndexAfter(_ index: Int, excluding wid: CGWindowID) -> Int? {
+        guard !list.isEmpty else { return nil }
+        for offset in 1...list.count {
+            let candidateIndex = (index + offset) % list.count
+            let candidate = list[candidateIndex]
+            if shouldDisplay(candidate) && candidate.cgWindowId != wid {
+                return candidateIndex
+            }
+        }
+        return nil
+    }
+
+    static func displayableAlternativeCount(excluding wid: CGWindowID?) -> Int {
+        list.filter { shouldDisplay($0) && $0.cgWindowId != wid }.count
+    }
+
+    static func logPanelOrder(_ label: String) {
+        guard Diagnostics.shouldLog("ORDER") else { return }
+        let visible = list.enumerated()
+            .filter { shouldDisplay($0.element) }
+            .prefix(12)
+            .map { orderDebugItem($0.offset, $0.element) }
+            .joined(separator: " | ")
+        Diagnostics.log("ORDER", "\(label) shortcut=\(App.shortcutIndex) source=#\(App.sessionSourceWid ?? 0) selectedIndex=\(selectedWindowIndex) selected=#\(selectedWindow()?.cgWindowId ?? 0) visible=[\(visible)]")
+    }
+
+    private static func logSelectionChange(_ newIndex: Int, _ previousIndex: Int, _ fromMouse: Bool) {
+        guard Diagnostics.shouldLog("ORDER") else { return }
+        let selectedWid = selectedWindow()?.cgWindowId ?? 0
+        Diagnostics.log("ORDER", "selection \(fromMouse ? "mouse" : "keyboard") oldIndex=\(previousIndex) newIndex=\(newIndex) source=#\(App.sessionSourceWid ?? 0) selected=#\(selectedWid) item=\(orderDebugItem(newIndex, list[newIndex]))")
+    }
+
+    private static func orderDebugItem(_ index: Int, _ window: Window) -> String {
+        let flags = "\(window.isMinimized ? "m" : "-")\(window.isHidden ? "h" : "-")\(shouldDisplay(window) ? "d" : "x")"
+        return "\(index):\(window.lastFocusOrder):#\(window.cgWindowId ?? 0):\(window.application.localizedName ?? "?"):\(flags)"
     }
 
     /// lastFocusOrder methods
@@ -2485,7 +2545,44 @@ class Windows {
             assignLastFocusOrderByLevel(cgWindowIds)
             return
         }
+        if restorePersistedFocusOrderIfNeeded() { return }
         assignClusterSafeLastFocusOrderByLevel(cgWindowIds)
+    }
+
+    private static func restorePersistedFocusOrderIfNeeded() -> Bool {
+        guard !didRestorePersistedFocusOrder else { return false }
+        didRestorePersistedFocusOrder = true
+        let storedIds = (UserDefaults.standard.array(forKey: persistedFocusOrderKey) as? [Int]) ?? []
+        guard !storedIds.isEmpty else { return false }
+        let windowsById = Dictionary(uniqueKeysWithValues: list.compactMap { window -> (Int, Window)? in
+            guard let wid = window.cgWindowId else { return nil }
+            return (Int(wid), window)
+        })
+        var ordered = [Window]()
+        var seen = Set<ObjectIdentifier>()
+        for wid in storedIds {
+            guard let window = windowsById[wid], seen.insert(ObjectIdentifier(window)).inserted else { continue }
+            ordered.append(window)
+        }
+        guard !ordered.isEmpty else { return false }
+        let remaining = list
+            .filter { !seen.contains(ObjectIdentifier($0)) }
+            .sorted { $0.lastFocusOrder < $1.lastFocusOrder }
+        list = ordered + remaining
+        for (index, window) in list.enumerated() {
+            window.lastFocusOrder = index
+        }
+        Diagnostics.log("RECENCY", "restored persisted focus order matched=\(ordered.count) total=\(list.count)")
+        return true
+    }
+
+    private static func persistFocusOrder() {
+        let ids = list
+            .sorted { $0.lastFocusOrder < $1.lastFocusOrder }
+            .compactMap { $0.cgWindowId.map { Int($0) } }
+            .prefix(300)
+            .map { $0 }
+        UserDefaults.standard.set(ids, forKey: persistedFocusOrderKey)
     }
 
     private static func assignLastFocusOrderByLevel(_ cgWindowIds: [CGWindowID]) {
@@ -2609,6 +2706,7 @@ class Windows {
                 $0.lastFocusOrder += 1
             }
         }
+        persistFocusOrder()
         prewarmLikelyFocusTargets()
         return windowsToRefresh
     }
@@ -2630,6 +2728,7 @@ class Windows {
         }
         window.lastFocusOrder = maxOrder
         Diagnostics.log("RECENCY", "moved window to end reason=\(reason) wid=#\(window.cgWindowId ?? 0) old=\(oldOrder) new=\(maxOrder)")
+        persistFocusOrder()
     }
 
     static func findOrCreate(_ windowAxUiElement: AXUIElement, _ wid: CGWindowID, _ app: Application, _ level: CGWindowLevel, _ title: String?, _ subrole: String?, _ role: String?, _ size: CGSize?, _ position: CGPoint?, _ isFullscreen: Bool?, _ isMinimized: Bool?) -> (Window?, Bool) {
@@ -2650,10 +2749,12 @@ class Windows {
         if list.count > TilesView.recycledViews.count {
             TilesView.recycledViews.append(TileView())
         }
+        BackgroundThumbnailRefresher.shared.register(window: window)
     }
 
     static func removeWindows(_ windows: [Window], _ addWindowlessWindowIfNeeded: Bool) {
         for w in windows {
+            BackgroundThumbnailRefresher.shared.unregister(window: w)
             if w.application.focusedWindow?.cgWindowId == w.cgWindowId {
                 w.application.focusedWindow = nil
             }

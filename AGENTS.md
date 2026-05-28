@@ -100,6 +100,18 @@ Use `bash ai/build.sh {compile|dev|install}`. Three modes, one script:
     for the Karabiner `fn+o` → Parallels Outlook Classic external-focus path.
     The no-key control should still reproduce stale restore if the external
     keyboard-release path is not exercised; use it only as a negative control.
+  - After Parallels target-focus changes, manually smoke-test Karabiner/guest
+    shortcuts such as OneNote `Cmd+1`/`fn+e` immediately after AltTab. New
+    same-pid untracked guest popups/search windows must stay above the target,
+    and AltTab must not register bare Cmd+number as a global shortcut.
+  - After recency/startup changes, restart AltTab and verify first-summon
+    gallery order preserves persisted MRU: current window first, previous
+    displayable window selected, and no same-app cluster imported from raw
+    WindowServer/Spaces enumeration.
+  - After Parallels→Mac focus changes, verify browsers keep their active tab.
+    A synthetic click must not land in browser chrome/tab strips; logs must not
+    show `skyLightClickDone ... parToMac posted=true` for Edge, Chrome, Safari,
+    Firefox, or similar browsers unless a safe target point is proven.
   - `bash ai/eval-rapid-overlap-transition.sh` when iterating specifically
     on stale activation, rapid Alt-Tab, or Coherence handoff issues.
   - `python3 ai/eval-log-anomalies.py --marker <MARKER> --end-marker "=== EVAL END MARKER: <MARKER> ===" --strict` on the bounded log region for any custom/manual experiment.
@@ -116,7 +128,8 @@ Use `bash ai/build.sh {compile|dev|install}`. Three modes, one script:
   evidence. Important anomaly classes include stale `app-activated` or
   `focused-window` events after a newer target, `parHideNow` timeout or
   `ready=false`, slow `updatesBeforeShowing`/`show prep`, `[DIAG SAMEAPP]`,
-  input-capture watchdogs, missing end markers, app restarts after a marker,
+  input-capture watchdogs, same-app popup/search windows buried behind their parent,
+  missing end markers, app restarts after a marker,
   mouse contamination, popup-storm guard aborts, transient UserNotificationCenter
   frontmost restores, stuck permission-popup flushing, and any unsafe native
   focus experiment path (`native level pin`, `nativeMultiWindowRepoke`,

@@ -20,7 +20,7 @@ class WindowCaptureScreenshots {
         guard !windows.isEmpty else { return }
         BackgroundWork.screenshotsQueue.addOperation {
             guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
-            guard source != .refreshOnlyThumbnailsAfterShowUi || App.appIsBeingUsed else { return }
+            guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
             let (cachedWindows, notCachedWindows) = sortCachedAndNotCached(windows)
             Logger.debug { "cached:\(cachedWindows.map { $0.windowID }) notCached:\(notCachedWindows)" }
             handleCachedWindows(cachedWindows, source)
@@ -40,12 +40,12 @@ class WindowCaptureScreenshots {
         SCShareableContent.getExcludingDesktopWindows(true, onScreenWindowsOnly: false) { shareableContent, error in
             guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
             guard let shareableContent, error == nil else { Logger.error { "\(shareableContent == nil) \(error)" }; return }
-            guard source != .refreshOnlyThumbnailsAfterShowUi || App.appIsBeingUsed else { return }
+            guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
             // this callback is executed on an undetermined queue; we move execution to main-thread
             BackgroundWork.screenshotsQueue.addOperation {
                 guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
                 cachedSCWindows = shareableContent.windows
-                guard source != .refreshOnlyThumbnailsAfterShowUi || App.appIsBeingUsed else { return }
+                guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
                 for notCachedWindow in notCachedWindows {
                     if let cachedWindow = (cachedSCWindows.first { $0.windowID == notCachedWindow }) {
                         oneTimeCapture(cachedWindow, source)
@@ -87,12 +87,12 @@ class WindowCaptureScreenshots {
                 }
                 return
             }
-            guard source != .refreshOnlyThumbnailsAfterShowUi || App.appIsBeingUsed else { return }
+            guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
             let pixelBuffer: CVPixelBuffer? = sampleBuffer.pixelBuffer() ?? sampleBuffer.imageBuffer
             guard let pixelBuffer else { Logger.error { "\(window.debugId) no pixelBuffer" }; return }
             DispatchQueue.main.async {
                 guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
-                guard source != .refreshOnlyThumbnailsAfterShowUi || App.appIsBeingUsed else { return }
+                guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
                 if let window = (Windows.list.first { $0.cgWindowId == scWindow.windowID }) {
                     window.refreshThumbnail(.pixelBuffer(pixelBuffer))
                 }
@@ -107,13 +107,13 @@ class WindowCaptureScreenshotsPrivateApi {
         for window in eligibleWindows {
             BackgroundWork.screenshotsQueue.addOperation { [weak window] in
                 guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
-                guard source != .refreshOnlyThumbnailsAfterShowUi || App.appIsBeingUsed else { return }
+                guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
                 guard let wid = window?.cgWindowId, let cgImage = oneTimeCapture(wid, source) else { return }
                 guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
-                guard source != .refreshOnlyThumbnailsAfterShowUi || App.appIsBeingUsed else { return }
+                guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
                 DispatchQueue.main.async { [weak window] in
                     guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
-                    guard source != .refreshOnlyThumbnailsAfterShowUi || App.appIsBeingUsed else { return }
+                    guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
                     window?.refreshThumbnail(.cgImage(cgImage))
                 }
             }

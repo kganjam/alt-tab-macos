@@ -240,10 +240,11 @@ class TileView: FlippedView {
             // appIsBeingUsed=true for ~200ms, and a hotkey-release in
             // that window re-fires focusTarget against the stale
             // keyboard-selected wid — focusing the wrong window.
-            Windows.updateSelectedAndHoveredWindowIndex(index, true)
+            Windows.updateSelectedAndHoveredWindowIndex(index, true, forceSelection: true)
             // Start switch timing for the mouse-click path so per-phase
             // logs measure click→focused, not stale time-since-last-key.
             Diagnostics.startSwitchTiming("mouseClick")
+            App.suppressFocusTargetUntilHide(reason: "mouse-click target=#\(element.cgWindowId ?? 0)")
             App.focusSelectedWindow(element)
         }
         mouseMovedCallback = { () -> Void in Windows.updateSelectedAndHoveredWindowIndex(index, true) }

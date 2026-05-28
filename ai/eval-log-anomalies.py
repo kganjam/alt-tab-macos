@@ -100,6 +100,8 @@ def scan(lines: list[str], args) -> list[Issue]:
             top = int(par.group("top"))
             if elapsed > args.par_hide_max_ms or not ready or not front or target != top:
                 add(issues, "FAIL", line, "par-hide", f"parHideNow elapsed={elapsed:.1f}ms ready={ready} front={front} target={target} top={top}")
+            if " guest=false" in line:
+                add(issues, "FAIL", line, "par-guest-foreground", "parHideNow fired before Windows guest foreground matched the target")
         guest = re.search(r"guestPrefocusDone .*?ok=(\w+).*?total=([0-9.]+)ms.*?sinceQueue=([0-9.]+)ms reason=(.*)$", line)
         if guest:
             ok = guest.group(1) == "true"
@@ -113,6 +115,8 @@ def scan(lines: list[str], args) -> list[Issue]:
         ft = re.search(r"\bfocusTarget \+([0-9.]+)ms", line)
         if ft and float(ft.group(1)) > args.focus_target_max_ms:
             add(issues, "FAIL", line, "focus-target-latency", f"focusTarget took {float(ft.group(1)):.1f}ms")
+        if re.search(r"\bfocusTarget \+[0-9.]+ms \[mouseClick\]", line):
+            add(issues, "FAIL", line, "stale-mouse-release", "holdShortcut release committed focusTarget after a thumbnail mouse click")
         if re.search(r"\bfocusSelectedWindow \+[0-9.]+ms .*? wid=nil\b", line):
             add(issues, "FAIL", line, "nil-focus-target", "focusSelectedWindow ran without a selected window id")
         if "[DIAG ANOMALY]" in line:
@@ -130,6 +134,8 @@ def scan(lines: list[str], args) -> list[Issue]:
             unc = re.search(r"UserNotificationCenter=(\d+)", line)
             if unc and int(unc.group(1)) > args.max_user_notification_windows:
                 add(issues, "FAIL", line, "popup-storm", f"UserNotificationCenter count={unc.group(1)} in top8")
+        if "[DIAG ZPROMOTE]" in line:
+            add(issues, "WARN", line, "z-promote", "pre-existing window was promoted materially above its pre-focus rank")
         if "[DIAG CAPTURE]" in line and "watchdog hiding stuck input capture" in line:
             add(issues, "FAIL", line, "capture-watchdog", "input capture watchdog fired")
         if args.fail_mouse_events and "[DIAG MOUSE]" in line:

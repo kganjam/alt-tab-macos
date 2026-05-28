@@ -88,6 +88,11 @@ class ATShortcut {
         ControlsTab.executeAction(id)
     }
 
+    static func resetForTests() {
+        lastEventIsARepeat = false
+        didTriggerHoldShortcutRelease = false
+    }
+
     /// keyboard events can be unreliable. They can arrive in the wrong order, or may never arrive
     /// this function acts as a safety net to improve the chances that some keyUp behaviors are enforced
     func redundantSafetyMeasures() {

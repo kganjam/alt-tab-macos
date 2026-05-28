@@ -54,6 +54,20 @@ class Preferences {
             "thumbnailCaptureEnabled": "true",
             "thumbnailCaptureSettleGateEnabled": "true",
             "thumbnailUseScreenCaptureKit": "false",
+            "visibleThumbnailRefreshIntervalMs": "1200",
+            "thumbnailCaptureFocusSettleGateMs": "3000",
+            "bgThumbnailRefreshEnabled": "true",
+            "bgThumbnailHotTierSize": "10",
+            "bgThumbnailHotIntervalMs": "5000",
+            "bgThumbnailWarmIntervalMs": "10000",
+            "bgThumbnailHotJitterMs": "1000",
+            "bgThumbnailWarmJitterMs": "2000",
+            "bgThumbnailInitialMaxDelayMs": "10000",
+            "bgThumbnailTickIntervalMs": "500",
+            "bgThumbnailMaxPerTick": "10",
+            "bgThumbnailMaxConcurrent": "4",
+            "bgThumbnailPostSelectionPauseMs": "3000",
+            "bgThumbnailCoherenceEnabled": "true",
             "focusOverlayCaptureEnabled": "true",
             "zOrderCacheEnabled": "true",
             "zOrderFixesEnabled": "true",
@@ -68,9 +82,14 @@ class Preferences {
             "parTargetAxFrontmostEnabled": "false",
             "parGuestPrefocusEnabled": "true",
             "parGuestForegroundDiagnosticsEnabled": "true",
+            "parGuestForegroundReadinessEnabled": "true",
+            "parGuestForegroundPollIntervalMs": "80",
+            "parGuestForegroundStableMs": "60",
+            "parGuestForegroundRetryIntervalMs": "140",
+            "parGuestForegroundRetryMaxCount": "3",
             "skipCoherenceThumbnailsDuringPanel": "true",
             "parGuestPrefocusHostDelayMs": "20",
-            "parGuestPrefocusMaxAgeMs": "350",
+            "parGuestPrefocusMaxAgeMs": "220",
             "nativeNoWindowsFocusEnabled": "false",
             "nativeExperimentalFocusModesEnabled": "false",
             "zOrderEnforcementMs": "2500",
@@ -87,20 +106,21 @@ class Preferences {
             "parHideMaxDelayMs": "1200",
             "parHidePollIntervalMs": "25",
             "parHideStableMs": "250",
-            "parSameBoundaryHideStableMs": "700",
-            "parSameBoundaryStackStableMs": "700",
+            "parSameBoundaryHideStableMs": "250",
+            "parSameBoundaryStackStableMs": "250",
             "parSameBoundaryStackStableWindowCount": "8",
             "parHideRequiresFrontmost": "true",
             "parTargetReassertDelayMs": "350",
             "parSameBoundaryReassertDelayMs": "120",
             "parTargetHardMaxDelayMs": "1600",
-            "parTargetVisualReassertDelayMs": "1100",
+            "parTargetVisualReassertDelayMs": "450",
             "parTargetVisualReassertIntervalMs": "450",
             "parTargetVisualReassertMaxCount": "4",
-            "parTargetAbsoluteMaxDelayMs": "3200",
-            "parToMacSyntheticClickEnabled": "true",
+            "parTargetAbsoluteMaxDelayMs": "1800",
+            "parToMacSyntheticClickEnabled": "false",
             "postAltTabFocusSuppressionMs": "2500",
             "protectNativeCommandBacktickShortcut": "false",
+            "protectNativeCommandNumberShortcuts": "true",
             "screenRecordingPermissionSkipped": "false",
             "trackpadHapticFeedbackEnabled": "true",
             "settingsWindowShownOnFirstLaunch": "false",
@@ -448,6 +468,8 @@ enum RuntimeFlags {
     static var thumbnailCaptureEnabled: Bool { bool("thumbnailCaptureEnabled", default: true) }
     static var thumbnailCaptureSettleGateEnabled: Bool { bool("thumbnailCaptureSettleGateEnabled", default: true) }
     static var thumbnailUseScreenCaptureKit: Bool { bool("thumbnailUseScreenCaptureKit", default: false) }
+    static var visibleThumbnailRefreshIntervalMs: Int { int("visibleThumbnailRefreshIntervalMs", default: 1200) }
+    static var thumbnailCaptureFocusSettleGateMs: Int { int("thumbnailCaptureFocusSettleGateMs", default: 3000) }
     static var focusOverlayCaptureEnabled: Bool { bool("focusOverlayCaptureEnabled", default: true) }
     static var zOrderCacheEnabled: Bool { bool("zOrderCacheEnabled", default: true) }
     static var zOrderFixesEnabled: Bool { bool("zOrderFixesEnabled", default: true) }
@@ -462,9 +484,14 @@ enum RuntimeFlags {
     static var parTargetAxFrontmostEnabled: Bool { bool("parTargetAxFrontmostEnabled", default: false) }
     static var parGuestPrefocusEnabled: Bool { bool("parGuestPrefocusEnabled", default: true) }
     static var parGuestForegroundDiagnosticsEnabled: Bool { bool("parGuestForegroundDiagnosticsEnabled", default: true) }
+    static var parGuestForegroundReadinessEnabled: Bool { bool("parGuestForegroundReadinessEnabled", default: true) }
+    static var parGuestForegroundPollIntervalMs: Int { int("parGuestForegroundPollIntervalMs", default: 80) }
+    static var parGuestForegroundStableMs: Int { int("parGuestForegroundStableMs", default: 60) }
+    static var parGuestForegroundRetryIntervalMs: Int { int("parGuestForegroundRetryIntervalMs", default: 140) }
+    static var parGuestForegroundRetryMaxCount: Int { int("parGuestForegroundRetryMaxCount", default: 3) }
     static var skipCoherenceThumbnailsDuringPanel: Bool { bool("skipCoherenceThumbnailsDuringPanel", default: true) }
     static var parGuestPrefocusHostDelayMs: Int { int("parGuestPrefocusHostDelayMs", default: 20) }
-    static var parGuestPrefocusMaxAgeMs: Int { int("parGuestPrefocusMaxAgeMs", default: 350) }
+    static var parGuestPrefocusMaxAgeMs: Int { int("parGuestPrefocusMaxAgeMs", default: 220) }
     static var nativeNoWindowsFocusEnabled: Bool { bool("nativeNoWindowsFocusEnabled", default: false) }
     static var nativeExperimentalFocusModesEnabled: Bool { bool("nativeExperimentalFocusModesEnabled", default: false) }
     static var zOrderEnforcementMs: Int { int("zOrderEnforcementMs", default: 2500) }
@@ -480,20 +507,33 @@ enum RuntimeFlags {
     static var parHidePollIntervalMs: Int { int("parHidePollIntervalMs", default: 25) }
     static var parHideStableMs: Int { int("parHideStableMs", default: 250) }
     static var parSameBoundaryDisplayDelayMs: Int { int("parSameBoundaryDisplayDelayMs", default: 150) }
-    static var parSameBoundaryHideStableMs: Int { int("parSameBoundaryHideStableMs", default: 700) }
-    static var parSameBoundaryStackStableMs: Int { int("parSameBoundaryStackStableMs", default: 700) }
+    static var parSameBoundaryHideStableMs: Int { int("parSameBoundaryHideStableMs", default: 250) }
+    static var parSameBoundaryStackStableMs: Int { int("parSameBoundaryStackStableMs", default: 250) }
     static var parSameBoundaryStackStableWindowCount: Int { int("parSameBoundaryStackStableWindowCount", default: 8) }
     static var parHideRequiresFrontmost: Bool { bool("parHideRequiresFrontmost", default: true) }
     static var parTargetReassertDelayMs: Int { int("parTargetReassertDelayMs", default: 350) }
     static var parSameBoundaryReassertDelayMs: Int { int("parSameBoundaryReassertDelayMs", default: 120) }
     static var parTargetHardMaxDelayMs: Int { int("parTargetHardMaxDelayMs", default: 1600) }
-    static var parTargetVisualReassertDelayMs: Int { int("parTargetVisualReassertDelayMs", default: 1100) }
+    static var parTargetVisualReassertDelayMs: Int { int("parTargetVisualReassertDelayMs", default: 450) }
     static var parTargetVisualReassertIntervalMs: Int { int("parTargetVisualReassertIntervalMs", default: 450) }
     static var parTargetVisualReassertMaxCount: Int { int("parTargetVisualReassertMaxCount", default: 4) }
-    static var parTargetAbsoluteMaxDelayMs: Int { int("parTargetAbsoluteMaxDelayMs", default: 3200) }
-    static var parToMacSyntheticClickEnabled: Bool { bool("parToMacSyntheticClickEnabled", default: true) }
+    static var parTargetAbsoluteMaxDelayMs: Int { int("parTargetAbsoluteMaxDelayMs", default: 1800) }
+    static var parToMacSyntheticClickEnabled: Bool { bool("parToMacSyntheticClickEnabled", default: false) }
     static var postAltTabFocusSuppressionMs: Int { int("postAltTabFocusSuppressionMs", default: 2500) }
     static var protectNativeCommandBacktickShortcut: Bool { bool("protectNativeCommandBacktickShortcut", default: false) }
+    static var protectNativeCommandNumberShortcuts: Bool { bool("protectNativeCommandNumberShortcuts", default: true) }
+    static var bgThumbnailRefreshEnabled: Bool { bool("bgThumbnailRefreshEnabled", default: true) }
+    static var bgThumbnailHotTierSize: Int { int("bgThumbnailHotTierSize", default: 10) }
+    static var bgThumbnailHotIntervalMs: Int { int("bgThumbnailHotIntervalMs", default: 5000) }
+    static var bgThumbnailWarmIntervalMs: Int { int("bgThumbnailWarmIntervalMs", default: 10000) }
+    static var bgThumbnailHotJitterMs: Int { int("bgThumbnailHotJitterMs", default: 1000) }
+    static var bgThumbnailWarmJitterMs: Int { int("bgThumbnailWarmJitterMs", default: 2000) }
+    static var bgThumbnailInitialMaxDelayMs: Int { int("bgThumbnailInitialMaxDelayMs", default: 10000) }
+    static var bgThumbnailTickIntervalMs: Int { int("bgThumbnailTickIntervalMs", default: 500) }
+    static var bgThumbnailMaxPerTick: Int { int("bgThumbnailMaxPerTick", default: 10) }
+    static var bgThumbnailMaxConcurrent: Int { int("bgThumbnailMaxConcurrent", default: 4) }
+    static var bgThumbnailPostSelectionPauseMs: Int { int("bgThumbnailPostSelectionPauseMs", default: 3000) }
+    static var bgThumbnailCoherenceEnabled: Bool { bool("bgThumbnailCoherenceEnabled", default: true) }
 
     private static func bool(_ key: String, default defaultValue: Bool) -> Bool {
         guard let value = UserDefaults.standard.object(forKey: key) else { return defaultValue }

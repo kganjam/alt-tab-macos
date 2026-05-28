@@ -2,6 +2,7 @@ import SwiftyBeaver
 import Foundation
 import ScreenCaptureKit
 import AVFoundation
+import Darwin
 
 class Logger {
     private static let logger = SwiftyBeaver.self
@@ -187,6 +188,7 @@ class Diagnostics {
         // perf — switch timing & panel build counters
         "SWITCH": .perf,
         "REFRESH": .perf,
+        "ORDER": .perf,
         "AXFOCUS": .perf,
         "LOGCOST": .perf,
         // trace — z-order/focus mechanics
@@ -220,7 +222,7 @@ class Diagnostics {
         "API": .verbose,
         "CTAP": .verbose,
     ]
-    private static let basicPerfCategories: Set<String> = ["SWITCH", "REFRESH", "AXFOCUS", "LOGCOST"]
+    private static let basicPerfCategories: Set<String> = ["SWITCH", "REFRESH", "ORDER", "AXFOCUS", "LOGCOST"]
 
     private static func categoryLevel(_ category: String) -> Level {
         return categoryLevels[category] ?? .info
@@ -228,6 +230,10 @@ class Diagnostics {
 
     private static let startTimeNs = DispatchTime.now().uptimeNanoseconds
     private static let logCostQueue = DispatchQueue(label: "Diagnostics.logCost")
+    private static let fileLogQueue = DispatchQueue(label: "Diagnostics.fileLog", qos: .utility)
+    private static var fileLogFd: Int32 = -1
+    private static var fileLogFailed = false
+    private static var fileLogShouldWrite: Bool?
     private static var logCostCount: UInt64 = 0
     private static var logCostTotalNs: UInt64 = 0
     private static var logCostFormatNs: UInt64 = 0
@@ -263,9 +269,46 @@ class Diagnostics {
         }
         let beforeNslogNs = DispatchTime.now().uptimeNanoseconds
         let line = "[DIAG \(category)] \(String(format: "t+%.3fms", elapsedMs)) utcMs=\(utcMs) tid=\(currentThreadId()) q=\(currentQueueLabel()) \(sanitized)"
+        writeFileLog(line)
         NSLog("%@", line as NSString)
         let endNs = DispatchTime.now().uptimeNanoseconds
         recordLogCost(nowNs: endNs, totalNs: endNs - logStartNs, formatNs: beforeNslogNs - logStartNs, nslogNs: endNs - beforeNslogNs)
+    }
+
+    private static func writeFileLog(_ line: String) {
+        guard !fileLogFailed else { return }
+        let payload = "AltTab[\(getpid()):\(currentThreadId())] \(line)\n"
+        fileLogQueue.async {
+            guard let data = payload.data(using: .utf8), !fileLogFailed else { return }
+            guard shouldWriteDirectFileLog() else { return }
+            if fileLogFd < 0 {
+                fileLogFd = Darwin.open("/tmp/alttab-run.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+            }
+            guard fileLogFd >= 0 else {
+                fileLogFailed = true
+                return
+            }
+            data.withUnsafeBytes {
+                guard let base = $0.baseAddress else { return }
+                _ = Darwin.write(fileLogFd, base, data.count)
+            }
+        }
+    }
+
+    private static func shouldWriteDirectFileLog() -> Bool {
+        if let fileLogShouldWrite { return fileLogShouldWrite }
+        let shouldWrite = !(fdMatchesRunLog(STDOUT_FILENO) || fdMatchesRunLog(STDERR_FILENO))
+        fileLogShouldWrite = shouldWrite
+        return shouldWrite
+    }
+
+    private static func fdMatchesRunLog(_ fd: Int32) -> Bool {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: "/tmp/alttab-run.log"),
+              let pathDev = (attrs[.systemNumber] as? NSNumber)?.uint64Value,
+              let pathInode = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value else { return false }
+        var fdInfo = Darwin.stat()
+        guard Darwin.fstat(fd, &fdInfo) == 0 else { return false }
+        return UInt64(fdInfo.st_dev) == pathDev && UInt64(fdInfo.st_ino) == pathInode
     }
 
     private static func shouldEmit(_ category: String) -> Bool {
@@ -307,6 +350,7 @@ class Diagnostics {
         logCostLastReportNs = now
         let count = max(logCostCount, 1)
         let line = String(format: "[DIAG LOGCOST] t+%.3fms utcMs=%lld tid=%@ q=%@ count=%llu avg=%.1fus max=%.1fus formatAvg=%.1fus nslogAvg=%.1fus", Double(now) / 1_000_000, Int64(Date().timeIntervalSince1970 * 1000), currentThreadId(), currentQueueLabel(), count, Double(logCostTotalNs) / Double(count) / 1000, Double(logCostMaxNs) / 1000, Double(logCostFormatNs) / Double(count) / 1000, Double(logCostNslogNs) / Double(count) / 1000)
+        writeFileLog(line)
         NSLog("%@", line as NSString)
     }
 
@@ -446,7 +490,7 @@ class Diagnostics {
             log("MONITOR", "\(label): keyboard foreground change owns z0 target=#\(targetWid) top=#\(top.wid) \(top.owner); not restoring target")
             return
         }
-        if let top, top.pid == targetPid, top.wid != targetWid, Windows.recentExternalKeyboardInputFollowsAltTabTarget() {
+        if let top, top.pid == targetPid, top.wid != targetWid, Windows.recentExternalKeyboardInputFollowsAltTabTarget(requireReleasable: true) {
             log("MONITOR", "\(label): same-app window surfaced after keyboard input target=#\(targetWid) top=#\(top.wid); not repairing stale AltTab target")
             DispatchQueue.main.async {
                 _ = Windows.releaseZOrderEnforcementForSameAppKeyboardFocusMove(wid: top.wid, pid: targetPid, label: label)
@@ -454,7 +498,7 @@ class Diagnostics {
             }
             return
         }
-        if let axWid = ax.wid, ax.pid == targetPid, axWid != targetWid, Windows.recentExternalKeyboardInputFollowsAltTabTarget() {
+        if let axWid = ax.wid, ax.pid == targetPid, axWid != targetWid, Windows.recentExternalKeyboardInputFollowsAltTabTarget(requireReleasable: true) {
             log("MONITOR", "\(label): same-app focus moved after keyboard input target=#\(targetWid) axWid=#\(axWid); not repairing stale AltTab target")
             DispatchQueue.main.async {
                 _ = Windows.releaseZOrderEnforcementForSameAppKeyboardFocusMove(wid: axWid, pid: targetPid, label: label)
@@ -1959,6 +2003,15 @@ class Winside {
         // Collapse runs of whitespace to a single space.
         let parts = noNewlines.split(whereSeparator: { $0.isWhitespace })
         return parts.joined(separator: " ")
+    }
+
+    static func foregroundTitle(_ foregroundTitle: String, matchesTargetTitle targetTitle: String) -> Bool {
+        let foreground = sanitizeTitle(foregroundTitle)
+        let target = sanitizeTitle(targetTitle)
+        guard !foreground.isEmpty, !target.isEmpty else { return false }
+        if foreground == target { return true }
+        guard foreground.hasPrefix(target) || target.hasPrefix(foreground) else { return false }
+        return min(foreground.count, target.count) >= 16
     }
 
     /// Cache of guest title → hwnd, populated from LIST. Refreshed

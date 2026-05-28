@@ -33,6 +33,8 @@ class App: AppCenterApplication {
     static var appIsBeingUsed = false
     static var shortcutIndex = 0
     static var forceDoNothingOnRelease = false
+    private static var focusTargetSuppressionUntil: CFAbsoluteTime = 0
+    private static var focusTargetSuppressionReason = ""
     /// Captured at the start of each AltTab session so that focus() can tell
     /// which window was REALLY in the foreground when the user hit Alt-Tab.
     /// Tracked by CGWindowID (not pid) so that switching between two
@@ -116,7 +118,7 @@ class App: AppCenterApplication {
               let targetWid = lastAltTabFocusTargetWid,
               wid == targetWid,
               now - lastAltTabFocusAt < Double(RuntimeFlags.postAltTabFocusSuppressionMs) / 1000,
-              Windows.recentExternalKeyboardInputFollowsAltTabTarget() else { return false }
+              Windows.recentExternalKeyboardInputFollowsAltTabTarget(requireReleasable: true) else { return false }
         let frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
         let topWid = Windows.captureTopZRanking(maxCount: 1).first?.wid
         guard frontPid != pid || topWid != wid else { return false }
@@ -152,8 +154,26 @@ class App: AppCenterApplication {
     }
 
     static func thumbnailCaptureAllowed(_ source: RefreshCausedBy, logBlocked: Bool = true) -> Bool {
-        guard RuntimeFlags.thumbnailCaptureSettleGateEnabled else { return true }
         let now = CFAbsoluteTimeGetCurrent()
+        // Post-selection pause: after the user commits an alt-tab choice,
+        // suppress ALL captures for `bgThumbnailPostSelectionPauseMs` so
+        // we don't compete with the focus handoff. This also catches
+        // delayed timer callbacks (in-panel 1200ms timer fires queued
+        // before hideUi, deferred buildUiAndShowPanel reshots, 1s screen-
+        // change reissue) — none of them should run inside the pause.
+        // Lifted when the panel reopens (`appIsBeingUsed == true`) since
+        // the user is then back in interactive mode and wants fresh tiles.
+        if !appIsBeingUsed && lastAltTabFocusAt > 0 {
+            let pauseSec = Double(RuntimeFlags.bgThumbnailPostSelectionPauseMs) / 1000
+            let sinceSelection = now - lastAltTabFocusAt
+            if sinceSelection < pauseSec {
+                if logBlocked {
+                    Diagnostics.log("CAPTURE", "thumbnail capture blocked source=\(source) reason=post-selection-pause remaining=\(Int((pauseSec - sinceSelection) * 1000))ms")
+                }
+                return false
+            }
+        }
+        guard RuntimeFlags.thumbnailCaptureSettleGateEnabled else { return true }
         thumbnailCaptureGateLock.lock()
         let blocked = thumbnailCaptureGateUntil > now
         let remainingMs = max(0, Int((thumbnailCaptureGateUntil - now) * 1000))
@@ -236,6 +256,19 @@ class App: AppCenterApplication {
     private static var parHideVisualReassertedToken = 0
     private static var parHideVisualReassertCount = 0
     private static var parHideVisualReassertAt: CFAbsoluteTime = 0
+    private struct ParGuestForegroundState {
+        var targetTitle: String
+        var readySince: CFAbsoluteTime?
+        var lastProbeAt: CFAbsoluteTime = 0
+        var probeInFlight = false
+        var lastTitle = ""
+        var lastHwnd = 0
+        var lastPid = 0
+        var lastSetAt: CFAbsoluteTime = 0
+        var setInFlight = false
+        var setAttempts = 0
+    }
+    private static var parGuestForegroundStates = [Int: ParGuestForegroundState]()
 
     override init() {
         super.init()
@@ -324,6 +357,7 @@ class App: AppCenterApplication {
         guard appIsBeingUsed else { return } // already hidden
         Diagnostics.log("PANEL", "hideUi keepPreview=\(keepPreview)")
         parHideToken += 1
+        parGuestForegroundStates.removeAll()
         // Phase 1 — sync state flip + the visible step. `appIsBeingUsed=false`
         // first so the deferred-cleanup re-entry guard is correct; tile-panel
         // orderOut second so the user-perceived latency for Mac→Mac ends here
@@ -334,6 +368,8 @@ class App: AppCenterApplication {
         appIsBeingUsed = false
         isFirstSummon = true
         forceDoNothingOnRelease = false
+        clearFocusTargetSuppression()
+        TilesView.stopVisibleThumbnailRefreshTimer()
         endInputCapture()
         hideTilesPanelWithoutChangingKeyWindow()
         // Phase 2 — defer the slow cleanup to the next runloop. Event-tap
@@ -467,8 +503,31 @@ class App: AppCenterApplication {
         }
     }
 
+    static func suppressFocusTargetUntilHide(reason: String, timeoutMs: Int = 2500) {
+        focusTargetSuppressionUntil = CFAbsoluteTimeGetCurrent() + Double(timeoutMs) / 1000
+        focusTargetSuppressionReason = reason
+        Diagnostics.log("KEY", "suppress focusTarget until hide reason=\(reason) timeout=\(timeoutMs)ms")
+    }
+
+    private static func clearFocusTargetSuppression() {
+        focusTargetSuppressionUntil = 0
+        focusTargetSuppressionReason = ""
+    }
+
+    private static func focusTargetIsSuppressed() -> Bool {
+        let remainingMs = Int((focusTargetSuppressionUntil - CFAbsoluteTimeGetCurrent()) * 1000)
+        guard remainingMs > 0 else {
+            clearFocusTargetSuppression()
+            return false
+        }
+        Diagnostics.markSwitchPhase("focusTargetIgnored", extra: focusTargetSuppressionReason)
+        Diagnostics.log("KEY", "ignored focusTarget during \(focusTargetSuppressionReason) remaining=\(remainingMs)ms")
+        return true
+    }
+
     static func focusTarget() {
         guard appIsBeingUsed else { return } // already hidden
+        guard !focusTargetIsSuppressed() else { return }
         Diagnostics.markSwitchPhase("focusTarget")
         let selectedWindow = Windows.selectedWindow()
         Logger.info { selectedWindow?.debugId }
@@ -674,6 +733,12 @@ class App: AppCenterApplication {
             hideUi(true)
             return
         }
+        if targetWid == sessionSourceWid {
+            Diagnostics.markSwitchPhase("focusSelectedWindowNoop", extra: "source wid=\(targetWid ?? 0)")
+            Diagnostics.log("KEY", "release ignored: selected source/current window; hide only wid=\(targetWid ?? 0)")
+            hideUi(true)
+            return
+        }
         if now - lastFocusTime < 0.2 && targetWid == lastFocusWid {
             Diagnostics.log("KEY", "DEBOUNCED duplicate focusSelectedWindow (gap=\(Int((now - lastFocusTime) * 1000))ms)")
             hideUi(true)
@@ -684,7 +749,7 @@ class App: AppCenterApplication {
             Applications.list.first { $0.pid == pid }?.isParallelsCoherence
         } ?? false
         let isParInvolved = targetIsPar || sourceIsPar
-        let parCaptureTimeoutMs = max(RuntimeFlags.parTargetAbsoluteMaxDelayMs, RuntimeFlags.parTargetHardMaxDelayMs, RuntimeFlags.parHideMaxDelayMs) + 500
+        let parCaptureTimeoutMs = RuntimeFlags.thumbnailCaptureFocusSettleGateMs
         let focusCaptureToken = isParInvolved
             ? blockThumbnailCaptures(reason: "par-focus-selected target=#\(targetWid ?? 0)", timeoutMs: parCaptureTimeoutMs)
             : 0
@@ -693,6 +758,9 @@ class App: AppCenterApplication {
         lastFocusWid = targetWid
         if let targetWid {
             noteAltTabFocusIntent(targetWid: targetWid)
+            if targetWid == sessionSourceWid && Windows.displayableAlternativeCount(excluding: targetWid) > 0 {
+                Windows.logPanelOrder("source-target-focus")
+            }
             Windows.requestZOrderReview(reason: "alttab-focus-intent", wid: targetWid, fullDelayMs: 250)
         }
         // Click-time live-title check for Parallels Coherence windows.
@@ -748,7 +816,7 @@ class App: AppCenterApplication {
             } else {
                 PreviewPanel.shared.orderOut(nil)
             }
-            scheduleParHideUi(targetWid: targetWid, targetPid: selectedWindow.application.pid, sourceIsPar: sourceIsPar, targetIsPar: targetIsPar, captureToken: focusCaptureToken)
+            scheduleParHideUi(targetWid: targetWid, targetPid: selectedWindow.application.pid, targetTitle: selectedWindow.title, sourceIsPar: sourceIsPar, targetIsPar: targetIsPar, captureToken: focusCaptureToken)
         } else {
             // Non-Parallels: focus FIRST, then dismiss the panel. Prior
             // order called hideUi(true) synchronously (~25-75ms on the
@@ -782,23 +850,89 @@ class App: AppCenterApplication {
 
     private static func cancelPendingParHide() {
         parHideToken += 1
+        parGuestForegroundStates.removeAll()
         if let token = pendingParCaptureGateToken {
             pendingParCaptureGateToken = nil
             releaseThumbnailCaptureGate(token, reason: "cancel-par-hide")
         }
     }
 
-    private static func scheduleParHideUi(targetWid: CGWindowID?, targetPid: pid_t?, sourceIsPar: Bool, targetIsPar: Bool, captureToken preFocusCaptureToken: UInt64 = 0) {
+    private static func prepareParGuestForegroundReadiness(token: Int, targetIsPar: Bool, targetTitle: String?) {
+        parGuestForegroundStates.removeAll()
+        guard RuntimeFlags.parGuestForegroundReadinessEnabled, targetIsPar, Winside.isEnabled,
+              let targetTitle, !targetTitle.isEmpty else { return }
+        parGuestForegroundStates[token] = ParGuestForegroundState(targetTitle: targetTitle)
+    }
+
+    private static func updateParGuestForegroundReadiness(token: Int, now: CFAbsoluteTime) {
+        guard var state = parGuestForegroundStates[token] else { return }
+        let interval = Double(max(RuntimeFlags.parGuestForegroundPollIntervalMs, 25)) / 1000
+        guard !state.probeInFlight, state.lastProbeAt == 0 || now - state.lastProbeAt >= interval else { return }
+        state.probeInFlight = true
+        state.lastProbeAt = now
+        let targetTitle = state.targetTitle
+        parGuestForegroundStates[token] = state
+        Winside.queryForegroundAsync(label: "readiness target") { foreground in
+            DispatchQueue.main.async {
+                guard var current = parGuestForegroundStates[token] else { return }
+                current.probeInFlight = false
+                if let foreground {
+                    current.lastHwnd = foreground.0
+                    current.lastPid = foreground.1
+                    current.lastTitle = foreground.2
+                    if Winside.foregroundTitle(foreground.2, matchesTargetTitle: targetTitle) {
+                        current.readySince = current.readySince ?? CFAbsoluteTimeGetCurrent()
+                    } else {
+                        current.readySince = nil
+                    }
+                } else {
+                    current.readySince = nil
+                }
+                parGuestForegroundStates[token] = current
+            }
+        }
+    }
+
+    private static func parGuestForegroundStatus(token: Int, now: CFAbsoluteTime) -> (ready: Bool, stableMs: Int, requiredMs: Int, title: String) {
+        guard let state = parGuestForegroundStates[token] else { return (true, 0, 0, "") }
+        let requiredMs = RuntimeFlags.parGuestForegroundStableMs
+        let stableMs = state.readySince.map { Int((now - $0) * 1000) } ?? 0
+        return (stableMs >= requiredMs, stableMs, requiredMs, state.lastTitle)
+    }
+
+    private static func retryParGuestForegroundIfNeeded(token: Int, targetWid: CGWindowID?, now: CFAbsoluteTime, elapsedMs: Int) {
+        guard var state = parGuestForegroundStates[token], state.readySince == nil else { return }
+        guard !state.setInFlight, state.setAttempts < RuntimeFlags.parGuestForegroundRetryMaxCount else { return }
+        let interval = Double(max(RuntimeFlags.parGuestForegroundRetryIntervalMs, RuntimeFlags.parGuestForegroundPollIntervalMs)) / 1000
+        guard elapsedMs >= RuntimeFlags.parGuestForegroundPollIntervalMs, state.lastSetAt == 0 || now - state.lastSetAt >= interval else { return }
+        state.setInFlight = true
+        state.setAttempts += 1
+        state.lastSetAt = now
+        let attempt = state.setAttempts
+        let title = state.targetTitle
+        parGuestForegroundStates[token] = state
+        Winside.setForegroundForTitleMeasuredAsync(title, label: "readiness-retry wid=\(targetWid ?? 0) attempt=\(attempt)", shouldProceed: {
+            token == parHideToken
+        }) { result in
+            guard var current = parGuestForegroundStates[token] else { return }
+            current.setInFlight = false
+            parGuestForegroundStates[token] = current
+            Diagnostics.log("FOCUS", String(format: "guestForegroundRetryDone wid=%u attempt=%d ok=%@ hwnd=%@ total=%.1fms reason=%@", targetWid ?? 0, attempt, result.ok ? "true" : "false", result.hwnd.map(String.init) ?? "nil", result.elapsedMs, result.reason))
+        }
+    }
+
+    private static func scheduleParHideUi(targetWid: CGWindowID?, targetPid: pid_t?, targetTitle: String?, sourceIsPar: Bool, targetIsPar: Bool, captureToken preFocusCaptureToken: UInt64 = 0) {
         parHideToken += 1
         let token = parHideToken
         parHideVisualReassertedToken = token
         parHideVisualReassertCount = 0
         parHideVisualReassertAt = 0
+        prepareParGuestForegroundReadiness(token: token, targetIsPar: targetIsPar, targetTitle: targetTitle)
         let minDelayMs = parHideUiDelayMs(sourceIsPar: sourceIsPar, targetIsPar: targetIsPar)
         let maxDelayMs = max(minDelayMs, RuntimeFlags.parHideMaxDelayMs)
         let hardMaxDelayMs = targetIsPar && RuntimeFlags.zOrderFixesEnabled ? max(maxDelayMs, RuntimeFlags.parTargetHardMaxDelayMs) : maxDelayMs
         let startedAt = CFAbsoluteTimeGetCurrent()
-        let captureTimeoutMs = targetIsPar ? max(hardMaxDelayMs, RuntimeFlags.parTargetAbsoluteMaxDelayMs) + 500 : hardMaxDelayMs + 500
+        let captureTimeoutMs = RuntimeFlags.thumbnailCaptureFocusSettleGateMs
         let captureToken = preFocusCaptureToken > 0 ? preFocusCaptureToken : blockThumbnailCaptures(reason: "par-focus-settle target=#\(targetWid ?? 0)", timeoutMs: captureTimeoutMs)
         pendingParCaptureGateToken = captureToken > 0 ? captureToken : nil
         Diagnostics.markSwitchPhase("parHideScheduled", extra: "\(minDelayMs)-\(maxDelayMs)/\(hardMaxDelayMs)ms sourcePar=\(sourceIsPar) targetPar=\(targetIsPar)")
@@ -827,18 +961,22 @@ class App: AppCenterApplication {
             let stableEnough = stableMs >= requiredStableMs
             let frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
             let frontmostReady = !RuntimeFlags.parHideRequiresFrontmost || targetPid == nil || frontPid == targetPid
-            let settled = targetReady && stableEnough && frontmostReady && stackStableEnough
+            updateParGuestForegroundReadiness(token: token, now: now)
+            let guest = parGuestForegroundStatus(token: token, now: now)
+            let settled = targetReady && stableEnough && frontmostReady && stackStableEnough && guest.ready
             let absoluteMaxDelayMs = targetIsPar ? max(hardMaxDelayMs, RuntimeFlags.parTargetAbsoluteMaxDelayMs) : hardMaxDelayMs
             maybeReassertParallelsTarget(token: token, sourceIsPar: sourceIsPar, targetIsPar: targetIsPar, elapsedMs: elapsedMs, targetReady: targetReady, frontmostReady: frontmostReady, targetWid: targetWid, targetPid: targetPid, frontPid: frontPid)
+            retryParGuestForegroundIfNeeded(token: token, targetWid: targetWid, now: now, elapsedMs: elapsedMs)
             guard elapsedMs >= minDelayMs && (settled || elapsedMs >= absoluteMaxDelayMs) else {
                 pollParHideUi(token: token, captureToken: captureToken, targetWid: targetWid, targetPid: targetPid, sourceIsPar: sourceIsPar, targetIsPar: targetIsPar, startedAt: startedAt, minDelayMs: minDelayMs, maxDelayMs: maxDelayMs, hardMaxDelayMs: hardMaxDelayMs, readySince: nextReadySince, stackSignature: currentStackSignature, stackReadySince: nextStackReadySince)
                 return
             }
-            Diagnostics.markSwitchPhase("parHideNow", extra: "\(elapsedMs)ms ready=\(targetReady) stable=\(stableMs)/\(requiredStableMs)ms stack=\(stackStableMs)/\(requiredStackStableMs)ms front=\(frontmostReady) target=#\(targetWid ?? 0) top=#\(topWid ?? 0) frontPid=\(frontPid ?? 0) targetPid=\(targetPid ?? 0) hardMax=\(hardMaxDelayMs) absoluteMax=\(absoluteMaxDelayMs)")
+            Diagnostics.markSwitchPhase("parHideNow", extra: "\(elapsedMs)ms ready=\(targetReady) stable=\(stableMs)/\(requiredStableMs)ms stack=\(stackStableMs)/\(requiredStackStableMs)ms front=\(frontmostReady) target=#\(targetWid ?? 0) top=#\(topWid ?? 0) frontPid=\(frontPid ?? 0) targetPid=\(targetPid ?? 0) hardMax=\(hardMaxDelayMs) absoluteMax=\(absoluteMaxDelayMs) guest=\(guest.ready) guestStable=\(guest.stableMs)/\(guest.requiredMs)ms guestTitle='\(guest.title.prefix(40))'")
             logGuestForegroundIfNeeded("parHideNow target=#\(targetWid ?? 0) top=#\(topWid ?? 0) front=\(frontmostReady)")
             if pendingParCaptureGateToken == captureToken {
                 pendingParCaptureGateToken = nil
             }
+            parGuestForegroundStates[token] = nil
             hideUi(true)
             if settled {
                 releaseThumbnailCaptureGate(captureToken, reason: "par-hide-settled")
@@ -855,7 +993,6 @@ class App: AppCenterApplication {
 
     private static func maybeReassertParallelsTarget(token: Int, sourceIsPar: Bool, targetIsPar: Bool, elapsedMs: Int, targetReady: Bool, frontmostReady: Bool, targetWid: CGWindowID?, targetPid: pid_t?, frontPid: pid_t?) {
         guard targetIsPar && RuntimeFlags.zOrderFixesEnabled else { return }
-        if sourceIsPar && targetIsPar { return }
         let reassertDelayMs = sourceIsPar && targetIsPar ? RuntimeFlags.parSameBoundaryReassertDelayMs : RuntimeFlags.parTargetReassertDelayMs
         guard elapsedMs >= max(reassertDelayMs, RuntimeFlags.parHidePollIntervalMs) else { return }
         guard let targetWid, let targetPid else { return }
@@ -938,6 +1075,7 @@ class App: AppCenterApplication {
     static func showUiOrCycleSelection(_ shortcutIndex: Int, _ forceDoNothingOnRelease_: Bool) {
         let showStartedAt = CFAbsoluteTimeGetCurrent()
         cancelPendingParHide()
+        clearFocusTargetSuppression()
         forceDoNothingOnRelease = forceDoNothingOnRelease_
         Logger.debug { "isFirstSummon:\(isFirstSummon) shortcutIndex:\(shortcutIndex)" }
         let startingNewSession = !appIsBeingUsed
@@ -1000,6 +1138,14 @@ class App: AppCenterApplication {
             if isVeryFirstSummon {
                 Windows.sortByLevel(shortcutIndex)
                 isVeryFirstSummon = false
+                if startingNewSession {
+                    previousSessionSourceWid = preferredPreviousWidAtSessionStart(
+                        currentWid: sessionSourceWid,
+                        recencyPreviousWid: Windows.nextDisplayedFocusWindowId(after: sessionSourceWid))
+                    Windows.normalizeFocusOrderAtSessionStart(
+                        currentWid: sessionSourceWid,
+                        previousWid: previousSessionSourceWid)
+                }
             }
             let afterInitialSortAt = CFAbsoluteTimeGetCurrent()
             isFirstSummon = false
@@ -1085,6 +1231,7 @@ class App: AppCenterApplication {
         }
         KeyRepeatTimer.startRepeatingKeyNextWindow()
         TilesView.refreshVisibleThumbnailsIfNeeded("show", force: true)
+        TilesView.startVisibleThumbnailRefreshTimer()
         let prioritized = Set(TilesView.visibleWindowsForThumbnailRefresh().compactMap { $0.cgWindowId })
         let deferred = Windows.list.filter { window in
             guard let wid = window.cgWindowId else { return false }
@@ -1146,6 +1293,7 @@ class App: AppCenterApplication {
 //            App.showSettingsWindow()
         #endif
         UsageStats.prune()
+        BackgroundThumbnailRefresher.shared.start()
         Logger.info { "Finished launching AltTab" }
     }
 }
@@ -1350,6 +1498,9 @@ extension App: NSApplicationDelegate {
                                         }
                                         Diagnostics.log("CLICKAFTER",
                                             "+200ms after click on wid=\(clickedWid) pid=\(clickedPid) (\(clickedShort.prefix(30))) → frontmost is pid=\(frontPid) \(frontName) axFoc=#\(axFocusedWid). Input would route to a DIFFERENT app than the user clicked.")
+                                        DispatchQueue.main.async {
+                                            Windows.repairClickAfterMismatch(clickedWid: clickedWid, clickedPid: clickedPid, frontPid: pid_t(frontPid), frontName: frontName)
+                                        }
                                     }
                                 }
                             }
@@ -1401,7 +1552,15 @@ extension App: NSApplicationDelegate {
 }
 
 enum RefreshCausedBy {
+    case refreshVisibleThumbnailsAfterShowUi
     case refreshOnlyThumbnailsAfterShowUi
     case refreshUiAfterExternalEvent
     case screenParametersChanged
+    /// Driven by BackgroundThumbnailRefresher's tick loop while the panel
+    /// is closed. Per-window, off-main, low-pri.
+    case backgroundPeriodic
+
+    var requiresOpenPanel: Bool {
+        self == .refreshVisibleThumbnailsAfterShowUi || self == .refreshOnlyThumbnailsAfterShowUi
+    }
 }

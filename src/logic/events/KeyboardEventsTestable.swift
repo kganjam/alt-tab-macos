@@ -1,3 +1,4 @@
+import Carbon.HIToolbox.Events
 import ShortcutRecorder
 
 class KeyboardEventsTestable {
@@ -17,10 +18,15 @@ class KeyboardEventsTestable {
         lastObservedModifiersAt = CFAbsoluteTimeGetCurrent()
     }
 
+    static func resetForTests() {
+        lastObservedModifiers = nil
+        lastObservedModifiersAt = 0
+    }
+
     static func activeHoldModifierIsDown(_ modifiers: NSEvent.ModifierFlags? = nil) -> Bool {
         guard App.appIsBeingUsed,
               let holdShortcut = ControlsTab.shortcuts[Preferences.indexToName("holdShortcut", App.shortcutIndex)]?.shortcut else { return false }
-        let current = modifiers ?? recentObservedModifiers() ?? ModifierFlags.current
+        let current = modifiers ?? ModifierFlags.current
         let currentModifiers = cocoaToCarbonFlags(current).cleaned()
         let holdModifiers = holdShortcut.carbonModifierFlags.cleaned()
         return holdModifiers != 0 && currentModifiers & holdModifiers == holdModifiers
@@ -29,8 +35,25 @@ class KeyboardEventsTestable {
     static func modifierOnlyEventCanReleaseZOrder(_ modifiers: NSEvent.ModifierFlags?) -> Bool {
         guard let modifiers else { return false }
         let currentModifiers = cocoaToCarbonFlags(modifiers).cleaned()
-        return currentModifiers != 0
+        guard currentModifiers != 0 else { return false }
+        for shortcutModifiers in configuredShortcutModifierSets() where currentModifiers & shortcutModifiers == currentModifiers {
+            return false
+        }
+        return true
     }
+
+    static func isNativeCommandNumberShortcut(_ controlId: String, _ shortcut: Shortcut) -> Bool {
+        guard controlId.hasPrefix("nextWindowShortcut") else { return false }
+        let modifiers = shortcut.carbonModifierFlags.cleaned()
+        let commandOnly = modifiers == UInt32(cmdKey)
+        return commandOnly && nativeCommandNumberKeyCodes.contains(shortcut.carbonKeyCode)
+    }
+
+    private static let nativeCommandNumberKeyCodes = Set([
+        UInt32(kVK_ANSI_1), UInt32(kVK_ANSI_2), UInt32(kVK_ANSI_3),
+        UInt32(kVK_ANSI_4), UInt32(kVK_ANSI_5), UInt32(kVK_ANSI_6),
+        UInt32(kVK_ANSI_7), UInt32(kVK_ANSI_8), UInt32(kVK_ANSI_9),
+    ])
 
     private static func recentObservedModifiers() -> NSEvent.ModifierFlags? {
         guard CFAbsoluteTimeGetCurrent() - lastObservedModifiersAt < 1.0 else { return nil }

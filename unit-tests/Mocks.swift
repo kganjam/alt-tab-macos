@@ -36,6 +36,29 @@ class App {
         get { app.forceDoNothingOnRelease }
         set { app.forceDoNothingOnRelease = newValue }
     }
+    static func noteInputCaptureActivity(_ reason: String) {}
+    static func inputCaptureIsOlderThan(_ ms: Int) -> Bool { false }
+    static func deferStaleInputCaptureHideIfFocusIsSettling() -> Bool { false }
+    static func hideUi() {}
+}
+
+enum RuntimeFlags {
+    static let inputCapturePassthroughMs = 2500
+}
+
+class Windows {
+    static var releaseKeyboardInputs = [(label: String, canReleaseZOrder: Bool)]()
+    static var altTabShortcutInputs = [String]()
+    static func noteAltTabShortcutInput(label: String) {
+        altTabShortcutInputs.append(label)
+    }
+    static func releaseZOrderEnforcementForExternalKeyboardInput(label: String, canReleaseZOrder: Bool) {
+        releaseKeyboardInputs.append((label, canReleaseZOrder))
+    }
+    static func reset() {
+        releaseKeyboardInputs = []
+        altTabShortcutInputs = []
+    }
 }
 
 class TilesPanel {

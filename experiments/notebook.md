@@ -855,3 +855,77 @@ corrections below the visible-fold reflect the user's expected order.
   - keep normal full reviews for AltTab focus intents and non-Parallels real lifecycle events;
   - downgrade Parallels `kAXWindowCreatedNotification` review work to top-only (`created-app-parallels`) because those events are often transient Coherence helper/window churn during guest foreground changes.
 - Validation signal: `fn+l`/`fn+o` bursts should show `z-order top review flush` lines instead of dozens of immediate top cache refreshes, no full `created-app` reviews for Parallels, and still no focus/z anomaly markers.
+
+## 2026-05-20 — AltTab order anomaly: source selected as target
+
+- User clarified the suspected regression was AltTab gallery/list order, not final z-order settling.
+- Log review around `21:13:12-21:13:17` showed final z-order monitors were OK, but one session focused Terminal `#158109` with `source=#158109`/`target=#158109`. That is a panel-selection/order failure: a normal AltTab session should initially select the previous displayable window, not the current source, when alternatives exist.
+- The old logs did not emit the actual visible panel order or selected index, so this failure class was hard to prove after the fact. Added `[DIAG ORDER]` for initial selection, selection changes, and source-target focus attempts, plus `[DIAG ANOMALY]` when initial keyboard selection must be corrected away from the source.
+- Defensive fix: after initial selection, if the selected window is still the source and another displayable candidate exists, force selection to the next displayable window and log the anomaly. This keeps keyboard AltTab from no-op focusing the current window when the list/selection state drifts.
+- Release coverage: added REL-091. Required proof is 3x normal Alt-Tab and Alt+` from several multi-window apps, with no source==selected/target anomalies unless only one displayable candidate exists.
+
+## 2026-05-21 — Outlook gallery drop latency profiling
+
+- User reported Outlook from the gallery taking about four seconds to drop into the target window. The active AltTab process had stdout/stderr at `/dev/null`, so the reported transition was not recoverable from `/tmp/alttab-run.log`; direct diagnostic file logging is now enabled when stdout/stderr are not already redirected to the run log.
+- First clean Terminal→Outlook gallery eval after restoring logging reached target z0 in `~450ms`, had `0` post-z0 flicker samples, and hid the panel at `parHideNow 374ms ready=true stable=256/250ms front=true`. This disproves a current 4s target-settle path for that measured case.
+- The eval also exposed two diagnostic problems: CLI `--select-and-focus` reused a stale switch timer, so log lines showed bogus `+19s` focus phases, and the first direct file logger used seek+write rather than append-safe writes, which overwrote eval markers when shell redirection and app logging shared the file.
+- Fixes: CLI focus commands now call `Diagnostics.startSwitchTiming(...)`; direct file logging opens `/tmp/alttab-run.log` with `O_APPEND` and writes only when stdout/stderr are not already the run log; benign source-skip corrections now log under `ORDER` instead of `[DIAG ANOMALY]`.
+- Latency tuning: same-boundary Parallels stable/stack defaults were changed from `700ms` to the user-validated `250ms`. Cross-boundary Mac→Outlook remains gated on actual target z0/front/stability and should hide around `~400-500ms` when the target settles normally.
+- Validation after the patch: compile passed, dev relaunch passed the 5s runtime anomaly monitor, and a clean Terminal→Outlook gallery eval reached z0 in `428.6ms` with no z0 flicker/source-reappear/sibling-intrusion failures. The final duplicate-log gating compile passed; another dev relaunch passed the startup anomaly monitor.
+
+## 2026-05-23 — thumbnail click overwritten by stale hold release
+
+- User clicked a Parallels browser/IE-like thumbnail (`Microsoft Edge #158934`), but Terminal came above it and Edge remained at z1.
+- Log sequence: `14:06:13.699` mouse-click focus began for Edge, `14:06:14.298` Edge was z1 under OneNote while the panel was still active, then `14:06:14.450` a hold-modifier release fired `focusTarget` in the same `[mouseClick]` timing session and focused stale source Terminal `#160425`.
+- Root cause: the tile click path called `updateSelectedAndHoveredWindowIndex(index, true)`, which only changes the keyboard-selected window when `mouseHoverEnabled` is true. During Parallels settle, `appIsBeingUsed` remained true long enough for a delayed hold release to commit `focusTarget` against the stale selected/source window.
+- Fix candidate: thumbnail mouse-up now forces selection to the clicked tile regardless of hover preference and suppresses hold-release `focusTarget` until the click handoff hides or times out. Runtime and eval log scanners now fail any future `focusTarget ... [mouseClick]`.
+- Release coverage: added `REL-093`; full automation still needs actual mouse-position thumbnail-click coverage, but the stale-release signature is now mechanically detectable.
+
+## 2026-05-24 — Parallels thumbnails too stale in gallery
+
+- Current code before the fix intentionally skipped Parallels Coherence thumbnail capture for `refreshUiAfterExternalEvent` while the panel was closed and for all `refreshOnlyThumbnailsAfterShowUi` panel refreshes when `skipCoherenceThumbnailsDuringPanel=true`.
+- The visible symptom followed directly: every gallery show logged visible thumbnail refreshes, then `thumbnail eligible ... skipped=N`; those skipped rows were Coherence windows, so their thumbnails stayed at the last successful capture or app icon.
+- Intended behavior is narrower: captures should be blocked only during the post-target-selection settle window, about three seconds, because capture can make Parallels repaint/flicker during focus handoff. Outside that window, visible gallery thumbnails should refresh periodically.
+- Fix candidate: split visible panel thumbnail refresh into `refreshVisibleThumbnailsAfterShowUi`, allow visible Coherence windows through that path, keep deferred/bulk panel refreshes and background AX refreshes skipping Coherence, and add a visible refresh timer at `visibleThumbnailRefreshIntervalMs` default `1200ms`.
+- The target-selected capture gate is now explicitly controlled by `thumbnailCaptureFocusSettleGateMs` default `3000ms`; `thumbnailCaptureAllowed` still blocks all capture sources while that gate is active.
+
+## 2026-05-26 — restart MRU drift and Edge Beta tab jump
+
+- Edge Beta active-tab regression had concrete log evidence at `02:32:09`: AltTab switched Parallels OneNote `#166159` to Edge Beta `#175026`, then `focusMacOsWindowOverParallelsCoherence` posted `skyLightClickDone ... parToMac posted=true wid=175026`. Immediately after the handoff, Edge’s visible title changed from the selected tab title to a left/first tab title.
+- Root cause: the Parallels→Mac synthetic click was a raw host click at a fixed local point around `(120,18)`. That point can land in browser chrome/tab-strip, so it can activate a different browser tab. Synthetic focus clicks are not safe as a default browser focus primitive.
+- Fix candidate: default `parToMacSyntheticClickEnabled=false` and, even when the flag is enabled experimentally, skip browser bundle prefixes such as Edge, Chrome, Safari, Firefox, Brave, Opera, Vivaldi, and Arc until a safe click target can be proven.
+- Restart/gallery order drift had a separate root cause: `lastFocusOrder` was in-memory only, startup window discovery came from raw WindowServer/AX/Spaces order, and first-summon `sortByLevel` ran after session-start normalization, overwriting the current/previous MRU correction. That lets restart import raw same-app clusters or arbitrary startup enumeration order.
+- Fix candidate: persist top focus-order window ids, restore them once during the first `recentlyFocused` sort, then rerun session-start normalization after first-summon sort so the current window remains first and the previous displayable window is selected.
+- Release coverage: added `REL-095` for restart MRU persistence and `REL-096` for browser active-tab preservation. Validation requires 3x restart first-summon checks and 3x Parallels→browser checks that browser title/current tab does not change and no `skyLightClickDone ... parToMac posted=true` appears for browser bundle ids.
+
+## 2026-05-26 — Parallels host z0 before guest foreground readiness
+
+- User reported another focus issue around `09:46`. Logs show AltTab selected Outlook Classic `#166182` from PowerPoint. The host/macOS side looked ready at `09:46:05.320`: `parHideNow ... ready=true ... front=true target=#166182 top=#166182 frontPid=31510`.
+- The guest side contradicted that readiness: Winside foreground at `parHideScheduled` and `parHideNow` was still `20260528_Immunogy Seminar.pptx - PowerPo` (PowerPoint HWND), not Outlook. About 800ms later, PowerPoint reappeared at host z0 and `[DIAG ANOMALY] targetNotZ0 topPidMismatch` fired; AltTab repaired after the visible failure.
+- Root cause: the Parallels hide gate only considered host WindowServer z0/stability/frontPid. For Coherence targets, that is insufficient because Parallels can still have a different Windows guest HWND active and later mirror it back above the selected host window.
+- Fix candidate: for target Parallels windows, maintain a per-handoff guest foreground readiness state. Poll Winside `FG`, compare sanitized title against the selected target title, require a stable guest title match before hiding the panel, and retry guest `SETTITLE64` while the guest foreground is wrong. `parHideNow` now logs `guest=true/false` and `guestStable`, and both realtime and bounded log anomaly scanners fail `guest=false`.
+- Release coverage: added `REL-097`. Validation requires Mac→Par and Par→Par bounded logs with `parHideNow ... guest=true` and no post-hide z/focus anomaly.
+
+## 2026-05-26 — Guest readiness false negative from truncated title
+
+- Evidence: after the guest readiness gate was added, a Terminal→OneNote transition still hid at `parHideNow +2360ms` with `guest=false`, even though surrounding Winside `FG readiness target` lines all reported `hwnd=269926` and title `in relation to code - OneNote`.
+- Root cause: the selected Coherence window title carried extra host-side text/newlines while the guest foreground title was a shorter prefix. The matcher required a common length of at least 32 characters, so a correct 27-character prefix never became guest-ready and the handoff waited until the absolute max.
+- Fix: title readiness now accepts sanitized prefix matches of at least 16 characters. Exact matches still pass, short ambiguous prefixes still fail, and `parHideNow ... guest=false` remains a hard realtime/bounded anomaly.
+- Related process fix: `ai/monitor-runtime-anomalies.py` now reports `[DIAG SAMEAPP]` as a warning count instead of silently ignoring it, while preserving build failure semantics for hard focus/z/input anomalies.
+
+## 2026-05-26 — Native same-app sibling blocked selected target
+
+- Evidence: Terminal→TextEdit selected target `#169518`, AX focus reported `axWid=#169518`, but WindowServer z0 was another TextEdit window `#169895`. Logs repeatedly emitted `ZPROMOTE target=#169518 promoted=[z0=#169895 TextEdit expectedZ=15 Δ-15]`, then `[DIAG ANOMALY] targetNotZ0`.
+- Root cause: the sibling-restore code logged promoted windows but refused to apply corrections unless the target was already z0. That is backwards for this failure: a pre-existing same-app sibling promoted from deep z-order can itself be what prevents the selected target from becoming z0.
+- Fix: sibling restore now applies to pre-existing same-app blockers above the first unrelated divider even when the selected target is at z1, while still skipping new/untracked same-app popups. Keyboard cycling also skips the session source window when any alternative is displayable, avoiding source no-op targets after reverse cycling.
+- Runtime coverage: `ai/monitor-runtime-anomalies.py` now reports `ZPROMOTE` as a warning so promoted-sibling evidence is visible before delayed invariant checks escalate to hard anomalies.
+
+## 2026-05-27 — Edge/PPT report exposed post-click route drift
+
+Claim: the reported “clicked Edge Beta but PowerPoint came up” is not visible as PowerPoint stealing z0 during the Edge focus. Evidence at 09:08:05 shows Edge Beta `#175026` was z0 at +150/+500/+1200/+2500ms; PowerPoint `#176637` was z1. The perceived failure likely came from history/next-target ordering in the following AltTab session.
+
+Separate concrete bug in the same log window: after clicking Karabiner `#178148`, `CLICKAFTER` at +200ms showed frontmost/input route back on Outlook `#166182` even though Karabiner was visually clicked and had settled z0. This is exactly the class where visual z and keyboard route disagree.
+
+Fix: `Windows.repairClickAfterMismatch` now reasserts the clicked window when `CLICKAFTER` detects a different frontmost app and the clicked window is a recent AltTab target/intent. This keeps the repair bounded to recent AltTab handoffs and avoids interfering with arbitrary user clicks.
+
+Validation: `bash ai/build.sh compile` passed after the patch. Full runtime validation still needs a dev restart and a real click sequence check.
