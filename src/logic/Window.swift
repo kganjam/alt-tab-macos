@@ -1518,6 +1518,20 @@ class Window {
         if spaceIds.isEmpty, let activeTab = TabGroup.activeTabSibling(of: self) {
             spaceIds = activeTab.spaceIds
         }
+        // Newly-created top-level windows often hit a race: AltTab's
+        // AX `kAXWindowCreatedNotification` fires before WindowServer
+        // has registered the new window with a space, so
+        // CGSCopySpacesForWindows returns []. With `spaceIds = []`,
+        // `isWindowInVisibleSpace` returns false → the window is
+        // permanently filtered as "notInVisibleSpace" because nothing
+        // re-triggers `updateSpaces` on a window the user can't see
+        // to interact with. Default to the currently visible spaces so
+        // the window appears in the panel; if/when AX fires another
+        // event for this window, updateSpaces re-runs with the now-
+        // populated CGS result.
+        if spaceIds.isEmpty {
+            spaceIds = Spaces.visibleSpaces
+        }
         self.spaceIds = spaceIds
         self.spaceIndexes = spaceIds.compactMap { spaceId in Spaces.idsAndIndexes.first { $0.0 == spaceId }?.1 }
         self.isOnAllSpaces = spaceIds.count > 1

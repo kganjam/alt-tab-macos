@@ -120,17 +120,22 @@ if [ "$MODE" = "dev" ]; then
     # leaving AltTab dead after a successful dev build. Use launchctl to pass
     # the override env through LaunchServices without modifying the installed
     # bundle, preserving TCC grants.
-    echo "=== DEV BUILD: $BUILD_DATE — dylib=$DEV_DYLIB ===" >> /tmp/alttab-run.log
+    # AltTab's Logger.swift now writes its own per-process log to
+    # /tmp/alttab/<YYYYMMDD-HHMMSS>.<pid>.log (latest via /tmp/alttab/latest.log).
+    # We deliberately do NOT pass --stdout/--stderr here — that was truncating
+    # the prior shared /tmp/alttab-run.log on every dev rebuild.
     launchctl setenv ALTTAB_DYLIB_OVERRIDE "$DEV_DYLIB"
-    open -na "$DEST" --stdout /tmp/alttab-run.log --stderr /tmp/alttab-run.log
+    open -na "$DEST"
     sleep 3
     PID=$(pgrep -f 'AltTab\.app/Contents/MacOS/AltTab' | head -1)
+    LOG_PATH=$(readlink /tmp/alttab/latest.log 2>/dev/null)
     echo "Dev AltTab pid $PID, dylib: $DEV_DYLIB"
+    echo "Log file: ${LOG_PATH:-/tmp/alttab/latest.log}"
     MONITOR_SECONDS="${ALTTAB_POST_BUILD_MONITOR_SECONDS:-5}"
     if [ "$MONITOR_SECONDS" != "0" ]; then
         echo "=== monitoring runtime anomalies for ${MONITOR_SECONDS}s ==="
         if ! python3 ai/monitor-runtime-anomalies.py --duration "$MONITOR_SECONDS"; then
-            echo "POST-BUILD RUNTIME ANOMALIES DETECTED — inspect /tmp/alttab-run.log" >&2
+            echo "POST-BUILD RUNTIME ANOMALIES DETECTED — inspect ${LOG_PATH:-/tmp/alttab/latest.log}" >&2
             exit 86
         fi
     fi
@@ -210,14 +215,19 @@ bash "$(dirname "$0")/tcc.sh" grant 2>&1 | sed 's/^/  [tcc] /' || true
 
 defaults delete com.lwouis.alt-tab-macos diagnosticsEnabled 2>/dev/null || true
 
-echo "=== NEW BUILD: $BUILD_DATE (pid $$) ===" >> /tmp/alttab-run.log
-open -na "$DEST" --stdout /tmp/alttab-run.log --stderr /tmp/alttab-run.log
+# AltTab's Logger.swift writes its own per-process log to
+# /tmp/alttab/<YYYYMMDD-HHMMSS>.<pid>.log (latest via /tmp/alttab/latest.log
+# and the back-compat /tmp/alttab-run.log symlink). Do NOT pass
+# --stdout/--stderr here — that was truncating the log on every rebuild.
+open -na "$DEST"
 sleep 3
 PID=$(pgrep -f 'AltTab\.app/Contents/MacOS/AltTab' | head -1)
 RUNNING_PATH=$(ps -p "$PID" -o command= 2>/dev/null | head -1)
+LOG_PATH=$(readlink /tmp/alttab/latest.log 2>/dev/null)
 echo ""
 echo "AltTab pid $PID, version: CUSTOM BUILD ($BUILD_DATE)"
 echo "Running from: $RUNNING_PATH"
+echo "Log file: ${LOG_PATH:-/tmp/alttab/latest.log}"
 case "$RUNNING_PATH" in
     /Applications/AltTab.app/*) ;;
     *) echo "WARNING: AltTab is running from an unexpected path. Permissions may not apply." ;;
@@ -226,7 +236,7 @@ MONITOR_SECONDS="${ALTTAB_POST_BUILD_MONITOR_SECONDS:-5}"
 if [ "$MONITOR_SECONDS" != "0" ]; then
     echo "=== monitoring runtime anomalies for ${MONITOR_SECONDS}s ==="
     if ! python3 ai/monitor-runtime-anomalies.py --duration "$MONITOR_SECONDS"; then
-        echo "POST-BUILD RUNTIME ANOMALIES DETECTED — inspect /tmp/alttab-run.log" >&2
+        echo "POST-BUILD RUNTIME ANOMALIES DETECTED — inspect ${LOG_PATH:-/tmp/alttab/latest.log}" >&2
         exit 86
     fi
 fi

@@ -117,7 +117,7 @@ class Preferences {
             "parTargetVisualReassertIntervalMs": "450",
             "parTargetVisualReassertMaxCount": "4",
             "parTargetAbsoluteMaxDelayMs": "1800",
-            "parToMacSyntheticClickEnabled": "false",
+            "parToMacSyntheticClickEnabled": "true",
             "postAltTabFocusSuppressionMs": "2500",
             "protectNativeCommandBacktickShortcut": "false",
             "protectNativeCommandNumberShortcuts": "true",
@@ -518,7 +518,22 @@ enum RuntimeFlags {
     static var parTargetVisualReassertIntervalMs: Int { int("parTargetVisualReassertIntervalMs", default: 450) }
     static var parTargetVisualReassertMaxCount: Int { int("parTargetVisualReassertMaxCount", default: 4) }
     static var parTargetAbsoluteMaxDelayMs: Int { int("parTargetAbsoluteMaxDelayMs", default: 1800) }
-    static var parToMacSyntheticClickEnabled: Bool { bool("parToMacSyntheticClickEnabled", default: false) }
+    /// When host-side parHide evidence (target at z0, frontmost, stable) has
+    /// held for at least this many ms past the required stable threshold,
+    /// drop the guest.ready requirement and fire parHideNow. Mitigates the
+    /// case where guest title-matching fails (e.g., Outlook reports
+    /// inbox-specific titles) and every Coherence switch eats the full
+    /// `parTargetAbsoluteMaxDelayMs` (~1.8s) timeout.
+    static var parGuestBypassHostStableMs: Int { int("parGuestBypassHostStableMs", default: 0) }
+    /// Post a synthetic SkyLight click on the target Mac window when
+    /// switching from Parallels Coherence to a native macOS window. SLPS
+    /// alone makes the target frontmost but doesn't always trigger full
+    /// NSApp activation — without the click, traffic-light buttons stay
+    /// grey and the user perceives the app as inactive. Browsers
+    /// (Chrome/Safari/Edge/Firefox/etc.) are in
+    /// `parToMacSyntheticClickUnsafeBundlePrefixes` and skip the click
+    /// because synthetic clicks can accidentally activate links/buttons.
+    static var parToMacSyntheticClickEnabled: Bool { bool("parToMacSyntheticClickEnabled", default: true) }
     static var postAltTabFocusSuppressionMs: Int { int("postAltTabFocusSuppressionMs", default: 2500) }
     static var protectNativeCommandBacktickShortcut: Bool { bool("protectNativeCommandBacktickShortcut", default: false) }
     static var protectNativeCommandNumberShortcuts: Bool { bool("protectNativeCommandNumberShortcuts", default: true) }

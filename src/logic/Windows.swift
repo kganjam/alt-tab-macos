@@ -1536,10 +1536,25 @@ class Windows {
                     queuedAxRecoveryWids.remove(wid)
                 }
             }
-            let isCurrent = DispatchQueue.main.sync {
-                isCurrentZOrderEnforcementGeneration(generation) && recentZOrderIntents.last?.wid == wid
+            // Check we're still the current generation AND no same-app window
+            // is sitting on top of us. The same-app-on-top case is a Coherence
+            // app (or any app) opening a legitimate child window/popup — e.g.
+            // user clicks a row in Windows Settings and the per-setting detail
+            // panel opens as a new window of pid=Settings. AltTab observes
+            // "target #parent no longer at z0" and would otherwise call
+            // kAXFrontmost+AXRaise on the parent, which dismisses the child
+            // popup. Skipping recovery here lets the popup live.
+            let (isCurrent, sameAppOnTop, topWid) = DispatchQueue.main.sync { () -> (Bool, Bool, CGWindowID?) in
+                let isCurrent = isCurrentZOrderEnforcementGeneration(generation) && recentZOrderIntents.last?.wid == wid
+                let top = Windows.captureTopZRanking(maxCount: 1).first
+                let same = top?.pid == pid && top?.wid != wid
+                return (isCurrent, same, top?.wid)
             }
             guard isCurrent, let window else { return }
+            if sameAppOnTop {
+                Diagnostics.log("ZENFORCE", "AX recovery skipped — same-app window on top wid=\(wid) top=#\(topWid ?? 0) attempt #\(attempt)")
+                return
+            }
             if let appAx = window.application.axUiElement, let selfAx = window.axUiElement {
                 try? appAx.setAttribute(kAXFocusedWindowAttribute, selfAx)
                 if window.application.isParallelsCoherence {
@@ -2474,14 +2489,18 @@ class Windows {
 
     static func selectedWindowIndexAfterCycling(_ step: Int) -> Int {
         if list.count == 0 || !list.contains(where: { shouldDisplay($0) }) { return selectedWindowIndex }
-        let sourceWidToSkip = displayableAlternativeCount(excluding: App.sessionSourceWid) > 0 ? App.sessionSourceWid : nil
+        // Don't skip the source window during cycling. `ensureInitialSelection
+        // SkipsSourceWindow` already moves selection off the source on initial
+        // panel-open; skipping again during cycling caused Shift+Tab from z1
+        // to wrap past z0 (the source) all the way to count-1, instead of
+        // landing on z0 as expected.
         var iterations = 0
         var targetIndex = selectedWindowIndex
         repeat {
             let next = (targetIndex + step) % list.count
             targetIndex = next < 0 ? list.count + next : next
             iterations += 1
-        } while (!shouldDisplay(list[targetIndex]) || (sourceWidToSkip != nil && list[targetIndex].cgWindowId == sourceWidToSkip)) && iterations <= list.count
+        } while !shouldDisplay(list[targetIndex]) && iterations <= list.count
         return targetIndex
     }
 
@@ -2549,21 +2568,92 @@ class Windows {
         assignClusterSafeLastFocusOrderByLevel(cgWindowIds)
     }
 
+    /// Multi-tier window key for persistence across AltTab restarts.
+    /// `wid` (cgWindowId) is fastest but unreliable — Parallels Coherence
+    /// shim windows often get fresh wids when AltTab restarts and re-queries
+    /// Parallels for the window list. We fall back to `(bundleId, title)` for
+    /// title-stable apps, then geometric match `(bundleId, frame, screenUuid)`
+    /// for title-changing apps (Terminal showing cwd, browsers showing tab
+    /// title, etc.). Screen UUID survives reboots, so multi-monitor layouts
+    /// restore correctly.
+    private struct PersistedWindowKey: Codable {
+        let wid: Int
+        let bundleId: String?
+        let title: String?
+        let x: Double?
+        let y: Double?
+        let w: Double?
+        let h: Double?
+        let screen: String?
+    }
+
     private static func restorePersistedFocusOrderIfNeeded() -> Bool {
         guard !didRestorePersistedFocusOrder else { return false }
         didRestorePersistedFocusOrder = true
-        let storedIds = (UserDefaults.standard.array(forKey: persistedFocusOrderKey) as? [Int]) ?? []
-        guard !storedIds.isEmpty else { return false }
-        let windowsById = Dictionary(uniqueKeysWithValues: list.compactMap { window -> (Int, Window)? in
-            guard let wid = window.cgWindowId else { return nil }
-            return (Int(wid), window)
-        })
+        let stored = loadPersistedFocusOrder()
+        guard !stored.isEmpty else { return false }
+
+        // Build lookup tables for the current window list. Each window is
+        // matchable by wid OR (bundleId, title) OR (bundleId, geometric
+        // fingerprint within tolerance, optional screen). A window can only
+        // be claimed once.
+        var byWid = [Int: Window]()
+        var byBundleTitle = [String: [Window]]()       // "<bundleId>|<title>" -> [windows]
+        var byBundleGeometry = [String: [Window]]()     // "<bundleId>|<screen>" -> [windows]
+        for window in list {
+            if let wid = window.cgWindowId { byWid[Int(wid)] = window }
+            let bundleId = window.application.bundleIdentifier ?? ""
+            if let title = window.title, !title.isEmpty {
+                byBundleTitle["\(bundleId)|\(title)", default: []].append(window)
+            }
+            let screen = window.screenId.map { $0 as String } ?? ""
+            byBundleGeometry["\(bundleId)|\(screen)", default: []].append(window)
+        }
+
         var ordered = [Window]()
         var seen = Set<ObjectIdentifier>()
-        for wid in storedIds {
-            guard let window = windowsById[wid], seen.insert(ObjectIdentifier(window)).inserted else { continue }
+        let posTol: CGFloat = 8   // px — survives DPI rounding and minor user nudges
+        let sizeTol: CGFloat = 16 // px — survives content-driven autosize wobble
+
+        func claim(_ window: Window) -> Bool {
+            guard seen.insert(ObjectIdentifier(window)).inserted else { return false }
             ordered.append(window)
+            return true
         }
+
+        var matchTier = [Int: Int]() // tier counts for diag: 1=wid, 2=title, 3=geom
+        for key in stored {
+            // Tier 1: wid (cheap, works for native macOS windows whose wids stay stable)
+            if let w = byWid[key.wid], !seen.contains(ObjectIdentifier(w)), claim(w) {
+                matchTier[1, default: 0] += 1
+                continue
+            }
+            // Tier 2: bundleId + exact title
+            if let bundleId = key.bundleId, let title = key.title,
+               let candidates = byBundleTitle["\(bundleId)|\(title)"] {
+                if let w = candidates.first(where: { !seen.contains(ObjectIdentifier($0)) }), claim(w) {
+                    matchTier[2, default: 0] += 1
+                    continue
+                }
+            }
+            // Tier 3: bundleId + geometric fingerprint (+ screen if recorded)
+            if let bundleId = key.bundleId, let kx = key.x, let ky = key.y, let kw = key.w, let kh = key.h {
+                let screen = key.screen ?? ""
+                let candidates = byBundleGeometry["\(bundleId)|\(screen)"] ?? []
+                if let w = candidates.first(where: { window in
+                    guard !seen.contains(ObjectIdentifier(window)),
+                          let p = window.position, let s = window.size else { return false }
+                    return abs(p.x - CGFloat(kx)) <= posTol
+                        && abs(p.y - CGFloat(ky)) <= posTol
+                        && abs(s.width - CGFloat(kw)) <= sizeTol
+                        && abs(s.height - CGFloat(kh)) <= sizeTol
+                }), claim(w) {
+                    matchTier[3, default: 0] += 1
+                    continue
+                }
+            }
+        }
+
         guard !ordered.isEmpty else { return false }
         let remaining = list
             .filter { !seen.contains(ObjectIdentifier($0)) }
@@ -2572,17 +2662,45 @@ class Windows {
         for (index, window) in list.enumerated() {
             window.lastFocusOrder = index
         }
-        Diagnostics.log("RECENCY", "restored persisted focus order matched=\(ordered.count) total=\(list.count)")
+        Diagnostics.log("RECENCY", "restored persisted focus order matched=\(ordered.count)/\(stored.count) total=\(list.count) tier1Wid=\(matchTier[1] ?? 0) tier2Title=\(matchTier[2] ?? 0) tier3Geom=\(matchTier[3] ?? 0)")
         return true
     }
 
+    private static func loadPersistedFocusOrder() -> [PersistedWindowKey] {
+        // New format: JSON-encoded [PersistedWindowKey] under the same key.
+        // Old format (back-compat): plain `[Int]` of cgWindowIds. Try new
+        // first; on decode failure or wrong type, treat as old.
+        if let data = UserDefaults.standard.data(forKey: persistedFocusOrderKey),
+           let keys = try? JSONDecoder().decode([PersistedWindowKey].self, from: data) {
+            return keys
+        }
+        // Back-compat: read [Int] and synthesize wid-only keys (no title/geom).
+        if let ids = UserDefaults.standard.array(forKey: persistedFocusOrderKey) as? [Int] {
+            return ids.map { PersistedWindowKey(wid: $0, bundleId: nil, title: nil, x: nil, y: nil, w: nil, h: nil, screen: nil) }
+        }
+        return []
+    }
+
     private static func persistFocusOrder() {
-        let ids = list
+        let keys: [PersistedWindowKey] = list
             .sorted { $0.lastFocusOrder < $1.lastFocusOrder }
-            .compactMap { $0.cgWindowId.map { Int($0) } }
             .prefix(300)
-            .map { $0 }
-        UserDefaults.standard.set(ids, forKey: persistedFocusOrderKey)
+            .compactMap { window in
+                guard let wid = window.cgWindowId else { return nil }
+                return PersistedWindowKey(
+                    wid: Int(wid),
+                    bundleId: window.application.bundleIdentifier,
+                    title: window.title,
+                    x: window.position.map { Double($0.x) },
+                    y: window.position.map { Double($0.y) },
+                    w: window.size.map { Double($0.width) },
+                    h: window.size.map { Double($0.height) },
+                    screen: window.screenId.map { $0 as String }
+                )
+            }
+        if let data = try? JSONEncoder().encode(keys) {
+            UserDefaults.standard.set(data, forKey: persistedFocusOrderKey)
+        }
     }
 
     private static func assignLastFocusOrderByLevel(_ cgWindowIds: [CGWindowID]) {

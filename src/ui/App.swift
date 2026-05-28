@@ -963,7 +963,23 @@ class App: AppCenterApplication {
             let frontmostReady = !RuntimeFlags.parHideRequiresFrontmost || targetPid == nil || frontPid == targetPid
             updateParGuestForegroundReadiness(token: token, now: now)
             let guest = parGuestForegroundStatus(token: token, now: now)
-            let settled = targetReady && stableEnough && frontmostReady && stackStableEnough && guest.ready
+            // Guest.ready is unreliable for some Coherence apps (e.g. Outlook
+            // reports per-message inbox titles that don't equal the AltTab
+            // target title), so without a bypass every switch into those apps
+            // would eat the full `parTargetAbsoluteMaxDelayMs` (~1.8s).
+            // Bypass: drop guest.ready once host is stable for the required
+            // threshold (default `parGuestBypassHostStableMs=0` adds no extra
+            // wait on top of the existing stable threshold).
+            let hostFullyStable = stableMs >= max(requiredStableMs, RuntimeFlags.parGuestBypassHostStableMs)
+            // Instant-settle: when the very first poll already shows target
+            // at z0 AND host frontmost AND z-stack stable, the visual
+            // handoff is already complete — no reason to wait for a stable
+            // threshold designed to filter transient z-order during a slow
+            // handoff. Cuts switch-into-Coherence latency to ~30ms (minDelay
+            // for same-boundary) or ~200ms (cross-boundary minDelay) instead
+            // of ~250ms+.
+            let instantSettle = targetReady && frontmostReady && stackStableEnough && stableMs > 0
+            let settled = instantSettle || (targetReady && stableEnough && frontmostReady && stackStableEnough && (guest.ready || hostFullyStable))
             let absoluteMaxDelayMs = targetIsPar ? max(hardMaxDelayMs, RuntimeFlags.parTargetAbsoluteMaxDelayMs) : hardMaxDelayMs
             maybeReassertParallelsTarget(token: token, sourceIsPar: sourceIsPar, targetIsPar: targetIsPar, elapsedMs: elapsedMs, targetReady: targetReady, frontmostReady: frontmostReady, targetWid: targetWid, targetPid: targetPid, frontPid: frontPid)
             retryParGuestForegroundIfNeeded(token: token, targetWid: targetWid, now: now, elapsedMs: elapsedMs)
@@ -1225,6 +1241,15 @@ class App: AppCenterApplication {
         guard appIsBeingUsed else { return }
         Diagnostics.log("PANEL", "showPanel (window count=\(Windows.list.count))")
         TilesPanel.shared.show()
+        // Enable the scroll-wheel CGEventTap while the panel is up. Without
+        // this, mouse-wheel scroll events leak through to whichever app sits
+        // under the cursor; some of those apps respond to scroll by raising
+        // themselves, which AltTab observes as external focus and reacts to
+        // by calling `noteDirectFocusOutsideAltTab` → `hideUi`. Net effect:
+        // a single mouse-wheel scroll dismissed the alt-tab list.
+        // (Trackpad-opened sessions already enable this tap via TrackpadEvents
+        // gesture detection. Keyboard-opened sessions didn't, hence the bug.)
+        ScrollwheelEvents.toggle(true)
         Windows.previewSelectedWindowIfNeeded()
         if TilesView.isSearchEditing {
             TilesView.enableSearchEditing()

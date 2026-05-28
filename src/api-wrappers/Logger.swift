@@ -86,8 +86,10 @@ class Logger {
 }
 
 /// Custom diagnostic logging for debugging the Parallels Coherence focus
-/// transitions. All output goes through NSLog so it appears in Console.app
-/// (filter "AltTab") and in the launch redirect log at /tmp/alttab-run.log.
+/// transitions. Each AltTab process writes to its own log file at
+/// /tmp/alttab/<YYYYMMDD-HHMMSS>.<pid>.log (and a `latest.log` symlink
+/// points to the most-recently-started process's file). Lines are also
+/// emitted via NSLog so they appear in Console.app (filter "AltTab").
 ///
 /// Toggle via UserDefaults:
 ///   defaults write com.lwouis.alt-tab-macos diagnosticsEnabled -bool true   # default
@@ -233,7 +235,33 @@ class Diagnostics {
     private static let fileLogQueue = DispatchQueue(label: "Diagnostics.fileLog", qos: .utility)
     private static var fileLogFd: Int32 = -1
     private static var fileLogFailed = false
-    private static var fileLogShouldWrite: Bool?
+
+    /// Per-process log file path. Computed lazily on first write so that
+    /// startup work that runs before the first log doesn't pay for the
+    /// directory creation. The PID suffix lets two AltTab processes
+    /// briefly overlap during a restart without one clobbering the
+    /// other's file via the symlink race.
+    ///
+    /// Also maintains two convenience symlinks pointing at the current
+    /// per-pid file:
+    ///   /tmp/alttab/latest.log   — the recommended path for tailers/eval scripts
+    ///   /tmp/alttab-run.log      — back-compat for older eval scripts (they
+    ///                              write EVAL MARKER lines via `>>`, which
+    ///                              follows the symlink correctly)
+    static let fileLogPath: String = {
+        let dir = "/tmp/alttab"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
+        let path = "\(dir)/\(formatter.string(from: Date())).\(getpid()).log"
+        for link in ["\(dir)/latest.log", "/tmp/alttab-run.log"] {
+            try? FileManager.default.removeItem(atPath: link)
+            try? FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: path)
+        }
+        return path
+    }()
     private static var logCostCount: UInt64 = 0
     private static var logCostTotalNs: UInt64 = 0
     private static var logCostFormatNs: UInt64 = 0
@@ -280,9 +308,9 @@ class Diagnostics {
         let payload = "AltTab[\(getpid()):\(currentThreadId())] \(line)\n"
         fileLogQueue.async {
             guard let data = payload.data(using: .utf8), !fileLogFailed else { return }
-            guard shouldWriteDirectFileLog() else { return }
             if fileLogFd < 0 {
-                fileLogFd = Darwin.open("/tmp/alttab-run.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+                fileLogFd = Darwin.open(fileLogPath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
+                                        S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
             }
             guard fileLogFd >= 0 else {
                 fileLogFailed = true
@@ -293,22 +321,6 @@ class Diagnostics {
                 _ = Darwin.write(fileLogFd, base, data.count)
             }
         }
-    }
-
-    private static func shouldWriteDirectFileLog() -> Bool {
-        if let fileLogShouldWrite { return fileLogShouldWrite }
-        let shouldWrite = !(fdMatchesRunLog(STDOUT_FILENO) || fdMatchesRunLog(STDERR_FILENO))
-        fileLogShouldWrite = shouldWrite
-        return shouldWrite
-    }
-
-    private static func fdMatchesRunLog(_ fd: Int32) -> Bool {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: "/tmp/alttab-run.log"),
-              let pathDev = (attrs[.systemNumber] as? NSNumber)?.uint64Value,
-              let pathInode = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value else { return false }
-        var fdInfo = Darwin.stat()
-        guard Darwin.fstat(fd, &fdInfo) == 0 else { return false }
-        return UInt64(fdInfo.st_dev) == pathDev && UInt64(fdInfo.st_ino) == pathInode
     }
 
     private static func shouldEmit(_ category: String) -> Bool {
