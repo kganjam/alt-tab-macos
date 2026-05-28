@@ -1536,23 +1536,33 @@ class Windows {
                     queuedAxRecoveryWids.remove(wid)
                 }
             }
-            // Check we're still the current generation AND no same-app window
-            // is sitting on top of us. The same-app-on-top case is a Coherence
-            // app (or any app) opening a legitimate child window/popup — e.g.
-            // user clicks a row in Windows Settings and the per-setting detail
-            // panel opens as a new window of pid=Settings. AltTab observes
-            // "target #parent no longer at z0" and would otherwise call
-            // kAXFrontmost+AXRaise on the parent, which dismisses the child
-            // popup. Skipping recovery here lets the popup live.
-            let (isCurrent, sameAppOnTop, topWid) = DispatchQueue.main.sync { () -> (Bool, Bool, CGWindowID?) in
+            // Skip recovery if any non-target window is sitting at z0. Two
+            // user-facing scenarios that triggered the prior behavior:
+            //   1) Same-app child window: clicking a row in Windows Settings
+            //      (Coherence) spawns a per-setting detail panel of the same
+            //      pid. AltTab observed "target #parent no longer at z0" and
+            //      forced the parent back via kAXFrontmost — dismissing the
+            //      just-opened child popup.
+            //   2) Different-app new window: user opens LinearMouse settings
+            //      from its menu bar icon while PowerPoint is the alt-tab
+            //      target. LinearMouse settings appears at z0; AltTab forces
+            //      PowerPoint back; settings dialog disappears behind PPT.
+            // Both are legitimate user-initiated foreground changes that
+            // recovery would actively destroy. Recovery still runs when the
+            // top z-order slot is empty / unknown / matches the target.
+            // Tradeoff: a genuine focus regression (e.g. Coherence drops the
+            // target window after a switch, with no other window taking its
+            // place) is no longer corrected by this path — but the prior
+            // behavior was visibly worse for the user.
+            let (isCurrent, nonTargetOnTop, topWid) = DispatchQueue.main.sync { () -> (Bool, Bool, CGWindowID?) in
                 let isCurrent = isCurrentZOrderEnforcementGeneration(generation) && recentZOrderIntents.last?.wid == wid
                 let top = Windows.captureTopZRanking(maxCount: 1).first
-                let same = top?.pid == pid && top?.wid != wid
-                return (isCurrent, same, top?.wid)
+                let nonTarget = top?.wid != nil && top?.wid != wid
+                return (isCurrent, nonTarget, top?.wid)
             }
             guard isCurrent, let window else { return }
-            if sameAppOnTop {
-                Diagnostics.log("ZENFORCE", "AX recovery skipped — same-app window on top wid=\(wid) top=#\(topWid ?? 0) attempt #\(attempt)")
+            if nonTargetOnTop {
+                Diagnostics.log("ZENFORCE", "AX recovery skipped — non-target window on top wid=\(wid) top=#\(topWid ?? 0) attempt #\(attempt)")
                 return
             }
             if let appAx = window.application.axUiElement, let selfAx = window.axUiElement {
