@@ -6,6 +6,28 @@
 - Organize source files into folders. Folders should group files that change together, at the same pace (e.g. one feature)
 - Favor low latency and responsiveness. Reuse objects, avoid wasting memory or I/O.
 
+# Project map & deep-dive docs
+
+Customized fork of lwouis/alt-tab-macos. **Start with `ARCHITECTURE.md`** (subsystem
++ source map, and the thumbnail/IOSurface design), then this file. To pull from the
+original project, see **`UPSTREAM.md`**. Subsystems and where they live:
+
+- Window/app model & lifecycle: `src/logic/Window.swift`, `Windows.swift`,
+  `Application.swift`, `Applications.swift`. `Windows.list` is mutated on the main
+  thread only; `Applications.removeZombieWindows()` GCs windows closed without an AX event.
+- Focus / z-order / recency: `src/logic/Windows.swift`, `Window.focus()`,
+  `src/logic/events/AccessibilityEvents.swift` (see "Per-window focus behavior").
+- Parallels Coherence: `src/logic/Window.swift`, `src/ui/App.swift`.
+- Thumbnail capture & IOSurface budget: `src/logic/events/WindowCaptureEvents.swift`,
+  `src/logic/ThumbnailCache.swift`, `src/logic/BackgroundThumbnailRefresher.swift`
+  (see "Thumbnail capture & IOSurface budget" below).
+- Diagnostics: `src/api-wrappers/Logger.swift` (`Diagnostics`), level-gated, logs to
+  `/tmp/alttab/latest.log`.
+- Preferences / runtime flags: `src/logic/Preferences.swift` (`Preferences`, `RuntimeFlags`).
+- Eval harness & release gate: `ai/eval-*.sh`, `experiments/release-issue-monitor.md`,
+  `experiments/release-risk-code-review.md`, `experiments/focus-hypotheses.md`,
+  `experiments/notebook.md`.
+
 # Build / install / dev iteration
 
 Use `bash ai/build.sh {compile|dev|install}`. Three modes, one script:
@@ -30,6 +52,11 @@ Use `bash ai/build.sh {compile|dev|install}`. Three modes, one script:
   `/Applications/AltTab.app` via `ditto`+`mv`. **Will trigger TCC
   re-grant prompts.** Use only when `shim/main.c`, Pods, framework deps,
   or entitlements change — rare.
+
+Unit tests (pure-logic, 24 cases): `xcodebuild test -workspace alt-tab-macos.xcworkspace
+-scheme Test -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO`. They cover
+Appearance / shortcut-recorder / keyboard-utils / search acronyms. Focus / z-order /
+capture correctness is NOT unit-tested — that is the `ai/` eval harness's job.
 
 # Working notes and accessory docs
 
@@ -187,6 +214,28 @@ Rules to keep TCC grants stable:
 
 If you need to think harder about this, see memory note
 `project_alttab_tcc_seal.md`.
+
+# Thumbnail capture & IOSurface budget (NEVER REGRESS the surface budget)
+- WindowServer keeps a per-client IOSurface tally and `abort()`s
+  (`WSIOSurfaceDebugTallyAndAbort`, killing the whole graphics session) if a client
+  holds too many. A background refresher retaining one live IOSurface per window
+  forever crashed WindowServer over a multi-day session (REL-100).
+- The budget is bounded by: detaching non-hot-tier captures into malloc bitmaps
+  (releasing the IOSurface) so only the bounded hot tier (`bgThumbnailHotTierSize`,
+  default 10) holds live surfaces; a 3-tier cadence (hot/warm/cold = 5s/60s/300s);
+  skipping minimized windows; and a ~30s background reconcile (`removeZombieWindows`).
+  Files: `ThumbnailCache.swift`, `BackgroundThumbnailRefresher.swift`,
+  `events/WindowCaptureEvents.swift`. Details in `ARCHITECTURE.md`.
+- The `THUMBCACHE` perf-level log line reports `liveSurfaces`; it must stay near
+  `bgThumbnailHotTierSize` and NOT grow with the number of open windows. A rising
+  `liveSurfaces` over a long run means the leak regressed.
+- The concurrent `screenshotsQueue` must NOT read main-thread-owned state
+  (`Windows.list`, `Window.size`/`.screenId`, `cachedSCWindows`): snapshot per-window
+  state on the main thread first (`CaptureRequest`); `cachedSCWindows` is lock-guarded
+  (REL-101).
+- Every `bgThumbnail*` (and any) flag must agree between `Preferences.defaultValues`
+  (registered into UserDefaults, and it WINS) and its `RuntimeFlags` accessor default.
+  A mismatch silently ignores your intended value.
 
 # Per-window focus behavior (NEVER REGRESS)
 - AltTab must focus only the *selected* window of an app, not all of its windows. This is the entire reason AltTab exists vs. system Cmd-Tab.
