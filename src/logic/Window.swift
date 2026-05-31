@@ -1303,7 +1303,21 @@ class Window {
     }
 
     private func scheduleFrontmostRepoke(delayMs: Int, generation: Int64, targetPid: pid_t, targetWid: CGWindowID) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) {
+        // Parallels Coherence wraps the entire Windows app as a single
+        // Mac wid (the shim window). SLPS(.noWindows) for that shim is
+        // translated by Coherence to "activate the Windows app" on the
+        // guest side, which raises the main app window above any
+        // just-opened popup/child dialog — dismissing it. Native macOS
+        // apps don't have this issue (SLPS.noWindows really is "no
+        // windows"), but for Coherence we must skip repoke entirely.
+        // Karabiner/NSWorkspace cache will refresh on the next genuine
+        // user input.
+        let isCoherence = application.isParallelsCoherence
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
+            if isCoherence {
+                Diagnostics.log("FRONTMOSTSET", "+\(delayMs)ms repoke skipped Coherence app (would dismiss child popups) pid=\(targetPid) wid=\(targetWid)")
+                return
+            }
             guard Windows.isCurrentZOrderFocusGeneration(generation) else {
                 Diagnostics.log("FRONTMOSTSET", "+\(delayMs)ms repoke skipped stale generation pid=\(targetPid) wid=\(targetWid)")
                 return
@@ -1321,6 +1335,7 @@ class Window {
             GetProcessForPID(targetPid, &psn)
             _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.noWindows.rawValue)
             Diagnostics.log("FRONTMOSTSET", "+\(delayMs)ms repoke SLPS(noWin) pid=\(targetPid) wid=\(targetWid) wasFrontPid=\(frontPid ?? -1) for Karabiner/NSWorkspace cache")
+            _ = self // silence weak self warning
         }
     }
 

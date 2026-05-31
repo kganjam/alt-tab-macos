@@ -6,7 +6,13 @@ import Cocoa
  Location: Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/PrivateFrameworks/SkyLight.framework
  */
 
-let CGS_CONNECTION = CGSMainConnectionID()
+// Computed (not a stored `let`) so it re-resolves on every use. A cached
+// connection id goes stale when WindowServer is reborn (e.g. after a crash),
+// silently breaking every CGS* capture/query call until AltTab is relaunched.
+// `CGSMainConnectionID()` returns the process's current main connection, so
+// reading it per-call self-heals across a WindowServer restart. The call is a
+// cheap per-process accessor, so the lack of caching is not a concern.
+var CGS_CONNECTION: CGSConnectionID { CGSMainConnectionID() }
 
 typealias CGSConnectionID = UInt32
 typealias CGSSpaceID = UInt64
@@ -34,7 +40,7 @@ func CGSMainConnectionID() -> CGSConnectionID
 /// * offscreen content: no
 /// * macOS 10.10+
 @_silgen_name("CGSHWCaptureWindowList")
-func CGSHWCaptureWindowList(_ cid: CGSConnectionID, _ windowList: UnsafeMutablePointer<CGWindowID>, _ windowCount: UInt32, _ options: CGSWindowCaptureOptions) -> Unmanaged<CFArray>
+func CGSHWCaptureWindowList(_ cid: CGSConnectionID, _ windowList: UnsafeMutablePointer<CGWindowID>, _ windowCount: UInt32, _ options: CGSWindowCaptureOptions) -> Unmanaged<CFArray>?
 
 /// returns an array of displays (as NSDictionary) -> each having an array of spaces (as NSDictionary) at the "Spaces" key; each having a space ID (as UInt64) at the "id64" key
 /// * macOS 10.10+

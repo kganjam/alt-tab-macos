@@ -2194,6 +2194,18 @@ class Windows {
         if skippedCount > 0 && source == .refreshOnlyThumbnailsAfterShowUi {
             Diagnostics.log("CAPTURE", "thumbnail eligible source=\(source) requested=\(windows.count) eligible=\(eligibleWindows.count) skipped=\(skippedCount)")
         }
+        // Background captures mark each window in-flight in ThumbnailCache (via popDue). A window
+        // filtered out here (windowless, invalid wid, or Coherence with captures disabled) never
+        // reaches a capture callback, so clear its in-flight state now — otherwise it stays stuck
+        // until the 15s watchdog instead of rescheduling at its normal cadence.
+        if source == .backgroundPeriodic, skippedCount > 0 {
+            let eligibleWids = Set(eligibleWindows.compactMap { $0.cgWindowId })
+            for window in windows {
+                if let wid = window.cgWindowId, !eligibleWids.contains(wid) {
+                    ThumbnailCache.shared.clearInFlight(wid: wid)
+                }
+            }
+        }
         guard (!eligibleWindows.isEmpty || windowRemoved) else { return }
         // Split eligible windows by capture method.
         // ScreenCaptureKit (macOS 14+) sees the macOS-side view of each
@@ -2570,11 +2582,15 @@ class Windows {
     /// with topmost windows first.
     static func sortByLevel(_ shortcutIndex: Int = App.shortcutIndex) {
         let cgWindowIds = Spaces.windowsInSpaces(Spaces.visibleSpaces)
-        guard Preferences.windowOrder[shortcutIndex] == .recentlyFocused else {
+        let order = Preferences.windowOrder[shortcutIndex]
+        Diagnostics.log("ORDER", "sortByLevel called shortcutIndex=\(shortcutIndex) windowOrder=\(order) listCount=\(list.count)")
+        guard order == .recentlyFocused else {
+            Diagnostics.log("ORDER", "sortByLevel taking assignLastFocusOrderByLevel branch (not recentlyFocused)")
             assignLastFocusOrderByLevel(cgWindowIds)
             return
         }
         if restorePersistedFocusOrderIfNeeded() { return }
+        Diagnostics.log("ORDER", "sortByLevel falling through to assignClusterSafeLastFocusOrderByLevel")
         assignClusterSafeLastFocusOrderByLevel(cgWindowIds)
     }
 
@@ -2601,7 +2617,10 @@ class Windows {
         guard !didRestorePersistedFocusOrder else { return false }
         didRestorePersistedFocusOrder = true
         let stored = loadPersistedFocusOrder()
-        guard !stored.isEmpty else { return false }
+        guard !stored.isEmpty else {
+            Diagnostics.log("ORDER", "restore skipped: no persisted data (loadPersistedFocusOrder returned empty)")
+            return false
+        }
 
         // Build lookup tables for the current window list. Each window is
         // matchable by wid OR (bundleId, title) OR (bundleId, geometric
@@ -2664,7 +2683,10 @@ class Windows {
             }
         }
 
-        guard !ordered.isEmpty else { return false }
+        guard !ordered.isEmpty else {
+            Diagnostics.log("ORDER", "restore skipped: 0 matches out of \(stored.count) stored entries; listCount=\(list.count) firstStored=(wid=\(stored.first?.wid ?? -1) bundle=\(stored.first?.bundleId ?? "nil") title=\((stored.first?.title ?? "nil").prefix(40))) firstListWid=\(list.first?.cgWindowId ?? 0) firstListBundle=\(list.first?.application.bundleIdentifier ?? "nil")")
+            return false
+        }
         let remaining = list
             .filter { !seen.contains(ObjectIdentifier($0)) }
             .sorted { $0.lastFocusOrder < $1.lastFocusOrder }
@@ -2672,7 +2694,7 @@ class Windows {
         for (index, window) in list.enumerated() {
             window.lastFocusOrder = index
         }
-        Diagnostics.log("RECENCY", "restored persisted focus order matched=\(ordered.count)/\(stored.count) total=\(list.count) tier1Wid=\(matchTier[1] ?? 0) tier2Title=\(matchTier[2] ?? 0) tier3Geom=\(matchTier[3] ?? 0)")
+        Diagnostics.log("ORDER", "restored persisted focus order matched=\(ordered.count)/\(stored.count) total=\(list.count) tier1Wid=\(matchTier[1] ?? 0) tier2Title=\(matchTier[2] ?? 0) tier3Geom=\(matchTier[3] ?? 0)")
         return true
     }
 
@@ -2692,6 +2714,22 @@ class Windows {
     }
 
     private static func persistFocusOrder() {
+        // CRITICAL: don't write to UserDefaults before the previous-session
+        // restoration has had a chance to read what's there. Early callers
+        // (syncFocusOrderWithLiveFrontmostWindow → updateLastFocusOrder, and
+        // normalizeFocusOrderAtSessionStart) fire BEFORE sortByLevel calls
+        // restorePersistedFocusOrderIfNeeded. Without this guard, the
+        // current-session discovery/normalize order overwrites the prior
+        // session's data, and restoration then "restores" the
+        // already-overwritten current order — which is exactly what the
+        // user complained about ("alt tab order was again very wrong on
+        // restart"). The didRestorePersistedFocusOrder flag is set at the
+        // start of restorePersistedFocusOrderIfNeeded so a single restore
+        // attempt (success or failure) unblocks subsequent persists.
+        guard didRestorePersistedFocusOrder else {
+            Diagnostics.log("ORDER", "persistFocusOrder skipped (restore hasn't run yet — would clobber prior session data)")
+            return
+        }
         let keys: [PersistedWindowKey] = list
             .sorted { $0.lastFocusOrder < $1.lastFocusOrder }
             .prefix(300)

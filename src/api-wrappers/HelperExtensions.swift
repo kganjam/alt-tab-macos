@@ -251,14 +251,25 @@ extension CGImage {
               let provider = dataProvider, let data = provider.data, let ptr = CFDataGetBytePtr(data)
         else { return false }
         // Assumes: kCGImageAlphaPremultipliedFirst | kCGImageByteOrder32Little
-        // Layout: [B, G, R, A]
+        // Layout: [B, G, R, A]. Iterate per row using `bytesPerRow`: a CGImage's
+        // rows may be padded (bytesPerRow > width*4) — e.g. images produced by
+        // CGContext.makeImage() during thumbnail detaching — so a flat stride-4
+        // walk would drift off the alpha lane after the first row and misreport.
         let length = CFDataGetLength(data)
-        var i = 3
-        while i < length {
-            if ptr[i] != 0 {
-                return false
+        let stride = bytesPerRow
+        var row = 0
+        while row < height {
+            let rowStart = row * stride
+            var x = 0
+            while x < width {
+                let i = rowStart + x * 4 + 3
+                if i >= length { return true }
+                if ptr[i] != 0 {
+                    return false
+                }
+                x += 1
             }
-            i += 4
+            row += 1
         }
         return true
     }

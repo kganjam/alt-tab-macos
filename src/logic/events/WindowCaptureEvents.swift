@@ -3,15 +3,32 @@ import ScreenCaptureKit
 
 @available(macOS 14.0, *)
 class WindowCaptureScreenshots {
-    // SCShareableContent.getExcludingDesktopWindows is expensive for the OS; we cache as much as possible
-    static var cachedSCWindows = [SCWindow]()
+    // SCShareableContent.getExcludingDesktopWindows is expensive for the OS; we cache as much as
+    // possible. This cache is touched from the (concurrent, 2-wide) screenshotsQueue, from the main
+    // thread (screen-change invalidation via ScreensEvents), and from the permission-check path — so
+    // every access goes through `cacheLock`. A plain `static var` here is a data race (Array CoW
+    // corruption / crash), most likely during display reconfiguration when capture traffic is heavy.
+    private static let cacheLock = NSLock()
+    private static var cachedSCWindows = [SCWindow]()
+
+    static func setCachedWindows(_ windows: [SCWindow]) {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        cachedSCWindows = windows
+    }
 
     static func invalidateCache() {
+        cacheLock.lock(); defer { cacheLock.unlock() }
         cachedSCWindows.removeAll(keepingCapacity: true)
     }
 
     private static func invalidateCache(_ wid: CGWindowID) {
+        cacheLock.lock(); defer { cacheLock.unlock() }
         cachedSCWindows.removeAll { $0.windowID == wid }
+    }
+
+    private static func lookupCachedWindow(_ wid: CGWindowID) -> SCWindow? {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        return cachedSCWindows.first { $0.windowID == wid }
     }
 
     static func oneTimeScreenshots(_ windowsToScreenshot: [Window], _ source: RefreshCausedBy) {
@@ -44,10 +61,10 @@ class WindowCaptureScreenshots {
             // this callback is executed on an undetermined queue; we move execution to main-thread
             BackgroundWork.screenshotsQueue.addOperation {
                 guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
-                cachedSCWindows = shareableContent.windows
+                setCachedWindows(shareableContent.windows)
                 guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
                 for notCachedWindow in notCachedWindows {
-                    if let cachedWindow = (cachedSCWindows.first { $0.windowID == notCachedWindow }) {
+                    if let cachedWindow = lookupCachedWindow(notCachedWindow) {
                         oneTimeCapture(cachedWindow, source)
                     } else {
                         Logger.debug { "wid:\(notCachedWindow) was not found in SCShareableContent windows" }
@@ -61,7 +78,7 @@ class WindowCaptureScreenshots {
         var cachedWindows = [SCWindow]()
         var notCachedWindows = [CGWindowID]()
         for window in windows {
-            if let cachedWindow = (cachedSCWindows.first { $0.windowID == window }) {
+            if let cachedWindow = lookupCachedWindow(window) {
                 cachedWindows.append(cachedWindow)
             } else {
                 notCachedWindows.append(window)
@@ -75,9 +92,9 @@ class WindowCaptureScreenshots {
         guard !App.isTerminating, let window = (Windows.list.first { $0.cgWindowId == scWindow.windowID }), window.size != nil else { return }
         let config = SCStreamConfiguration.forWindow(scWindow, window, false)
         let filter = SCContentFilter(desktopIndependentWindow: scWindow)
-        ActiveWindowCaptures.increment()
+        let captureToken = ActiveWindowCaptures.begin()
         SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { sampleBuffer, error in
-            ActiveWindowCaptures.decrement()
+            ActiveWindowCaptures.end(captureToken)
             guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
             guard let sampleBuffer, error == nil else {
                 Logger.error { "\(window.debugId) \(sampleBuffer == nil) \(error)" }
@@ -90,11 +107,21 @@ class WindowCaptureScreenshots {
             guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
             let pixelBuffer: CVPixelBuffer? = sampleBuffer.pixelBuffer() ?? sampleBuffer.imageBuffer
             guard let pixelBuffer else { Logger.error { "\(window.debugId) no pixelBuffer" }; return }
+            // For non-hot background captures, detach into a malloc-backed
+            // bitmap here (off the main thread) so the WindowServer capture
+            // IOSurface is released rather than retained live in the cache.
+            let contents: CALayerContents
+            if ThumbnailBitmap.shouldDetach(source, wid: scWindow.windowID),
+               let detached = ThumbnailBitmap.detachedCopy(of: pixelBuffer) {
+                contents = .cgImage(detached)
+            } else {
+                contents = .pixelBuffer(pixelBuffer)
+            }
             DispatchQueue.main.async {
                 guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
                 guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
                 if let window = (Windows.list.first { $0.cgWindowId == scWindow.windowID }) {
-                    window.refreshThumbnail(.pixelBuffer(pixelBuffer))
+                    window.refreshThumbnail(contents)
                 }
             }
         }
@@ -111,10 +138,19 @@ class WindowCaptureScreenshotsPrivateApi {
                 guard let wid = window?.cgWindowId, let cgImage = oneTimeCapture(wid, source) else { return }
                 guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
                 guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
+                // Detach non-hot background captures off-main so the HW capture
+                // IOSurface (CGSHWCaptureWindowList output) is released.
+                let contents: CALayerContents
+                if ThumbnailBitmap.shouldDetach(source, wid: wid),
+                   let detached = ThumbnailBitmap.detachedCopy(of: cgImage) {
+                    contents = .cgImage(detached)
+                } else {
+                    contents = .cgImage(cgImage)
+                }
                 DispatchQueue.main.async { [weak window] in
                     guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
                     guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
-                    window?.refreshThumbnail(.cgImage(cgImage))
+                    window?.refreshThumbnail(contents)
                 }
             }
         }
@@ -125,10 +161,14 @@ class WindowCaptureScreenshotsPrivateApi {
         guard !App.isTerminating else { return nil }
         // we use CGSHWCaptureWindowList because it can screenshot minimized windows, which CGWindowListCreateImage can't
         var windowId_ = wid
-        ActiveWindowCaptures.increment()
-        let list = CGSHWCaptureWindowList(CGS_CONNECTION, &windowId_, 1, [.ignoreGlobalClipShape, .bestResolution, .fullSize]).takeRetainedValue() as! [CGImage]
-        ActiveWindowCaptures.decrement()
-        return list.first
+        let captureToken = ActiveWindowCaptures.begin()
+        defer { ActiveWindowCaptures.end(captureToken) }
+        // CGSHWCaptureWindowList can return NULL (window vanished, or a Coherence/offscreen window
+        // WindowServer can't capture) and is not guaranteed to box CGImages — guard instead of
+        // force-unwrapping `.takeRetainedValue()` / force-casting `as!`, both of which would crash.
+        guard let captured = CGSHWCaptureWindowList(CGS_CONNECTION, &windowId_, 1, [.ignoreGlobalClipShape, .bestResolution, .fullSize])?.takeRetainedValue(),
+              let images = captured as? [CGImage] else { return nil }
+        return images.first
     }
 }
 
@@ -332,10 +372,85 @@ extension CMSampleBuffer {
     }
 }
 
+/// Tracks in-flight captures for the refresher's back-pressure gate.
+/// Token-based with a watchdog: `value()` prunes tokens older than
+/// `timeoutSec` before returning the count, so a capture whose completion
+/// never fires (e.g. WindowServer wedged after a crash) can't permanently
+/// jam back-pressure. The previous raw atomic counter had no expiry — a
+/// single never-firing SCK completion would leak the count and block all
+/// background thumbnails until AltTab was relaunched.
 class ActiveWindowCaptures {
-    private static var _count: Int32 = 0
+    private static let lock = NSLock()
+    private static var inFlight = [UInt64: CFAbsoluteTime]()
+    private static var counter: UInt64 = 0
+    private static let timeoutSec: CFAbsoluteTime = 20
 
-    static func increment() { OSAtomicIncrement32(&_count) }
-    static func decrement() { OSAtomicDecrement32(&_count) }
-    static func value() -> Int { Int(OSAtomicAdd32(0, &_count)) }
+    @discardableResult
+    static func begin() -> UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        counter &+= 1
+        inFlight[counter] = CFAbsoluteTimeGetCurrent()
+        return counter
+    }
+
+    static func end(_ token: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        inFlight.removeValue(forKey: token)
+    }
+
+    static func value() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        if !inFlight.isEmpty {
+            let cutoff = CFAbsoluteTimeGetCurrent() - timeoutSec
+            inFlight = inFlight.filter { $0.value > cutoff }
+        }
+        return inFlight.count
+    }
+}
+
+/// Copies a captured image into a detached, malloc-backed `CGImage` so the
+/// WindowServer capture IOSurface backing the original can be released. Used
+/// for non-hot-tier background captures to bound the count of outstanding
+/// capture surfaces — WindowServer aborts (crashing the whole session) when a
+/// client exceeds its IOSurface tally (`WSIOSurfaceDebugTallyAndAbort`).
+enum ThumbnailBitmap {
+    private static let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+
+    /// Detach an (often IOSurface-backed) CGImage by drawing it into a
+    /// malloc-backed bitmap context and snapshotting that.
+    static func detachedCopy(of cgImage: CGImage) -> CGImage? {
+        let width = cgImage.width, height = cgImage.height
+        guard width > 0, height > 0,
+              let ctx = CGContext(data: nil, width: width, height: height,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: bitmapInfo) else { return nil }
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return ctx.makeImage()
+    }
+
+    /// Detach an IOSurface-backed `CVPixelBuffer` (SCK output, 32BGRA) into a
+    /// CGImage. `makeImage()` snapshots the locked bytes into an independent
+    /// copy, so the pixel buffer (and its surface) can be released afterwards.
+    static func detachedCopy(of pixelBuffer: CVPixelBuffer) -> CGImage? {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        guard width > 0, height > 0,
+              let base = CVPixelBufferGetBaseAddress(pixelBuffer),
+              let ctx = CGContext(data: base, width: width, height: height,
+                                  bitsPerComponent: 8,
+                                  bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: bitmapInfo) else { return nil }
+        return ctx.makeImage()
+    }
+
+    /// Keep the live surface for hot-tier (and all non-background) captures;
+    /// detach warm/cold background captures. Safe to call from any thread.
+    static func shouldDetach(_ source: RefreshCausedBy, wid: CGWindowID) -> Bool {
+        guard RuntimeFlags.bgThumbnailDetachNonHotTier, source == .backgroundPeriodic else { return false }
+        return ThumbnailCache.shared.tier(wid: wid) != .hot
+    }
 }

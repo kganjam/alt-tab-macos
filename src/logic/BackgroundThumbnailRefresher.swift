@@ -23,6 +23,15 @@ final class BackgroundThumbnailRefresher {
     private let queue = DispatchQueue(label: "altTab.bgThumbnailRefresher", qos: .utility)
     private var timer: DispatchSourceTimer?
     private var tierRecomputeCounter = 0
+    private var reconcileCounter = 0
+    /// Hot-tier wids from the last `recomputeTiers`, reused by `register` so
+    /// new-window registration doesn't re-sort the whole window list each time
+    /// (O(n log n) per window → O(n² log n) during a discovery burst). Touched
+    /// only on the main thread (recomputeTiers' main hop + register via
+    /// appendWindow). Empty until the first recompute, which just means newly
+    /// discovered windows start at warm/cold and are promoted within one
+    /// recompute cycle (~4s) — harmless.
+    private var cachedHotWids = Set<CGWindowID>()
 
     /// Start the timer. Idempotent. Must be called once the app has
     /// permissions and `Windows.list` is being populated.
@@ -60,8 +69,10 @@ final class BackgroundThumbnailRefresher {
         ThumbnailCache.shared.configure(ThumbnailCache.Schedule(
             hotIntervalSec: Double(RuntimeFlags.bgThumbnailHotIntervalMs) / 1000,
             warmIntervalSec: Double(RuntimeFlags.bgThumbnailWarmIntervalMs) / 1000,
+            coldIntervalSec: Double(RuntimeFlags.bgThumbnailColdIntervalMs) / 1000,
             hotJitterSec: Double(RuntimeFlags.bgThumbnailHotJitterMs) / 1000,
-            warmJitterSec: Double(RuntimeFlags.bgThumbnailWarmJitterMs) / 1000
+            warmJitterSec: Double(RuntimeFlags.bgThumbnailWarmJitterMs) / 1000,
+            coldJitterSec: Double(RuntimeFlags.bgThumbnailColdJitterMs) / 1000
         ))
     }
 
@@ -72,7 +83,7 @@ final class BackgroundThumbnailRefresher {
         guard RuntimeFlags.bgThumbnailRefreshEnabled else { return }
         guard let wid = window.cgWindowId else { return }
         let initialDelay = Double.random(in: 0...Double(RuntimeFlags.bgThumbnailInitialMaxDelayMs) / 1000)
-        let tier = tier(for: wid)
+        let tier = tierFor(window, hotWids: cachedHotWids)
         ThumbnailCache.shared.register(wid: wid, tier: tier, initialDelay: initialDelay)
     }
 
@@ -85,6 +96,12 @@ final class BackgroundThumbnailRefresher {
 
     private func tick() {
         let now = CFAbsoluteTimeGetCurrent()
+
+        // Reconcile against the live window list on a steady cadence so
+        // thumbnails (and their IOSurfaces) for windows that closed without
+        // an AX-destroyed event are released even if the user never opens
+        // the switcher. Runs regardless of the capture gating below.
+        maybeReconcile()
 
         // Panel-open: the in-panel `visibleThumbnailRefreshTimer` (1200ms
         // default) takes over. Skip to avoid double-refreshing.
@@ -124,13 +141,22 @@ final class BackgroundThumbnailRefresher {
                 }
             )
             for item in due {
-                if let window = widToWindow[item.wid] {
-                    Windows.refreshThumbnailsAsync([window], .backgroundPeriodic)
-                } else {
+                guard let window = widToWindow[item.wid] else {
                     // Window disappeared between popDue and main-thread
                     // dispatch. Reset in-flight so we don't leak it.
                     ThumbnailCache.shared.clearInFlight(wid: item.wid)
+                    continue
                 }
+                // Minimized windows have frozen content and can't be captured
+                // by SCK (which would force the costly CGSHWCaptureWindowList
+                // fallback that feeds WindowServer's surface tally). Skip them
+                // in the background entirely; the in-panel refresh populates
+                // their thumbnail when the switcher is actually shown.
+                if window.isMinimized {
+                    ThumbnailCache.shared.clearInFlight(wid: item.wid)
+                    continue
+                }
+                Windows.refreshThumbnailsAsync([window], .backgroundPeriodic)
             }
         }
     }
@@ -142,30 +168,58 @@ final class BackgroundThumbnailRefresher {
     private func recomputeTiers() {
         DispatchQueue.main.async {
             let hotWids = self.currentHotWids()
+            self.cachedHotWids = hotWids
+            let now = CFAbsoluteTimeGetCurrent()
+            let hotInterval = Double(RuntimeFlags.bgThumbnailHotIntervalMs) / 1000
             for w in Windows.list {
                 guard let wid = w.cgWindowId else { continue }
-                ThumbnailCache.shared.setTier(
-                    wid: wid,
-                    tier: hotWids.contains(wid) ? .hot : .warm
-                )
+                let tier = self.tierFor(w, hotWids: hotWids)
+                ThumbnailCache.shared.setTier(wid: wid, tier: tier)
+                // On promotion to hot, pull the next refresh forward so the
+                // window enters the fast cadence promptly rather than waiting
+                // out a stale warm/cold deadline (up to 5 min). bumpUp is a
+                // no-op when the existing deadline is already sooner, so this
+                // costs nothing for already-hot windows.
+                if tier == .hot {
+                    ThumbnailCache.shared.bumpUp(wid: wid, to: now + hotInterval)
+                }
             }
         }
+    }
+
+    /// Reconcile our window list with the live system window list, releasing
+    /// thumbnails for windows that vanished without an AX-destroyed event.
+    /// Cheap (one WindowServer query off-main) and runs on its own cadence
+    /// independent of capture gating.
+    private func maybeReconcile() {
+        let tickMs = max(1, RuntimeFlags.bgThumbnailTickIntervalMs)
+        let everyTicks = max(1, RuntimeFlags.bgThumbnailReconcileMs / tickMs)
+        reconcileCounter += 1
+        guard reconcileCounter >= everyTicks else { return }
+        reconcileCounter = 0
+        DispatchQueue.main.async { Applications.removeZombieWindows() }
     }
 
     /// Compute hot-tier wids from `Windows.list`. MUST be called on main.
     private func currentHotWids() -> Set<CGWindowID> {
         let hotSize = max(0, RuntimeFlags.bgThumbnailHotTierSize)
         guard hotSize > 0 else { return [] }
-        let sorted = Windows.list.sorted { $0.lastFocusOrder > $1.lastFocusOrder }
+        let sorted = Windows.list
+            .filter { !$0.isMinimized && !$0.isWindowlessApp }
+            .sorted { $0.lastFocusOrder > $1.lastFocusOrder }
         return Set(sorted.prefix(hotSize).compactMap { $0.cgWindowId })
     }
 
-    /// Tier for a single wid. Best-effort lookup of current hot set; this
-    /// is called from `register(window:)` which may run off-main, but
-    /// `Windows.list` reads are safe-ish (we tolerate a stale snapshot
-    /// here since `recomputeTiers` will correct it within seconds).
-    private func tier(for wid: CGWindowID) -> ThumbnailCache.Tier {
-        let hotWids = currentHotWids()
-        return hotWids.contains(wid) ? .hot : .warm
+    /// Classify a window into a refresh tier. Reads `Window` state and
+    /// `Windows.list`, so it should be called on main (its callers —
+    /// `register` via `appendWindow`, and `recomputeTiers` — both are).
+    /// `hot` = recency top-N (live surfaces, fast cadence). `cold` =
+    /// minimized, or not shown in the switcher (very slow cadence; minimized
+    /// windows are additionally skipped at capture time). `warm` = the rest.
+    private func tierFor(_ window: Window, hotWids: Set<CGWindowID>) -> ThumbnailCache.Tier {
+        guard let wid = window.cgWindowId else { return .cold }
+        if window.isMinimized { return .cold }
+        if hotWids.contains(wid) { return .hot }
+        return window.shouldShowTheUser ? .warm : .cold
     }
 }

@@ -19,7 +19,12 @@ import Cocoa
 final class ThumbnailCache {
     static let shared = ThumbnailCache()
 
-    enum Tier { case hot, warm }
+    /// Refresh-cadence tiers. `hot` = top-N most-recently-focused (kept with
+    /// live IOSurfaces, fast cadence). `warm` = other windows the user would
+    /// see in the switcher (detached bitmaps, slow cadence). `cold` =
+    /// off-screen / hidden / minimized (detached bitmaps, very slow cadence;
+    /// minimized windows are skipped entirely by the refresher).
+    enum Tier { case hot, warm, cold }
 
     struct PoppedItem {
         let wid: CGWindowID
@@ -32,9 +37,11 @@ final class ThumbnailCache {
     /// `Preferences` from arbitrary threads.
     struct Schedule {
         var hotIntervalSec: TimeInterval = 5
-        var warmIntervalSec: TimeInterval = 10
+        var warmIntervalSec: TimeInterval = 60
+        var coldIntervalSec: TimeInterval = 300
         var hotJitterSec: TimeInterval = 1
-        var warmJitterSec: TimeInterval = 2
+        var warmJitterSec: TimeInterval = 5
+        var coldJitterSec: TimeInterval = 30
         /// If a captured window's `scheduleId` matches what we handed out
         /// in `popDue` for an in-flight capture, we push a new heap entry
         /// using the tier's interval ± jitter. If a capture takes longer
@@ -112,6 +119,14 @@ final class ThumbnailCache {
         return entries[wid]?.lastUpdatedAt ?? 0
     }
 
+    /// Current tier for a window, or nil if not registered. Used by the
+    /// capture completion to decide whether to keep a live IOSurface (hot)
+    /// or detach into a malloc-backed bitmap (warm/cold).
+    func tier(wid: CGWindowID) -> Tier? {
+        lock.lock(); defer { lock.unlock() }
+        return entries[wid]?.tier
+    }
+
     // MARK: - Write
 
     /// Store a captured thumbnail. If this corresponds to an in-flight BG
@@ -138,8 +153,7 @@ final class ThumbnailCache {
         guard wasBgInitiated, e.scheduleId == poppedScheduleId else { return }
         // Push the next BG deadline.
         let now = CFAbsoluteTimeGetCurrent()
-        let interval = e.tier == .hot ? schedule.hotIntervalSec : schedule.warmIntervalSec
-        let jitter = e.tier == .hot ? schedule.hotJitterSec : schedule.warmJitterSec
+        let (interval, jitter) = intervalAndJitter(e.tier)
         let deadline = now + interval + Double.random(in: -jitter...jitter)
         generation &+= 1
         e.nextRefreshAt = deadline
@@ -162,7 +176,7 @@ final class ThumbnailCache {
         entries[wid] = e
         guard e.scheduleId == poppedScheduleId else { return }
         let now = CFAbsoluteTimeGetCurrent()
-        let interval = e.tier == .hot ? schedule.hotIntervalSec : schedule.warmIntervalSec
+        let (interval, _) = intervalAndJitter(e.tier)
         generation &+= 1
         e.nextRefreshAt = now + interval
         e.scheduleId = generation
@@ -225,6 +239,15 @@ final class ThumbnailCache {
     }
 
     // MARK: - Internal
+
+    /// Per-tier refresh interval and jitter. Callers already hold `lock`.
+    private func intervalAndJitter(_ tier: Tier) -> (TimeInterval, TimeInterval) {
+        switch tier {
+        case .hot: return (schedule.hotIntervalSec, schedule.hotJitterSec)
+        case .warm: return (schedule.warmIntervalSec, schedule.warmJitterSec)
+        case .cold: return (schedule.coldIntervalSec, schedule.coldJitterSec)
+        }
+    }
 
     /// Reset entries whose in-flight capture leaked. Forces a new heap
     /// entry at now+1s so they're retried promptly. Cheap; runs once

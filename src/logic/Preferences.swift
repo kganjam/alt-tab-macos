@@ -25,8 +25,8 @@ class Preferences {
             "showTabsAsWindows": "false",
             "hideColoredCircles": "false",
             "windowDisplayDelay": "100",
-            "coherenceDisplayDelay": "300",
-            "parSameBoundaryDisplayDelayMs": "150",
+            "coherenceDisplayDelay": "0",
+            "parSameBoundaryDisplayDelayMs": "0",
             "appearanceStyle": AppearanceStylePreference.thumbnails.indexAsString,
             "appearanceSize": AppearanceSizePreference.auto.indexAsString,
             "appearanceTheme": AppearanceThemePreference.system.indexAsString,
@@ -59,9 +59,13 @@ class Preferences {
             "bgThumbnailRefreshEnabled": "true",
             "bgThumbnailHotTierSize": "10",
             "bgThumbnailHotIntervalMs": "5000",
-            "bgThumbnailWarmIntervalMs": "10000",
+            "bgThumbnailWarmIntervalMs": "60000",
+            "bgThumbnailColdIntervalMs": "300000",
             "bgThumbnailHotJitterMs": "1000",
-            "bgThumbnailWarmJitterMs": "2000",
+            "bgThumbnailWarmJitterMs": "5000",
+            "bgThumbnailColdJitterMs": "30000",
+            "bgThumbnailReconcileMs": "30000",
+            "bgThumbnailDetachNonHotTier": "true",
             "bgThumbnailInitialMaxDelayMs": "10000",
             "bgThumbnailTickIntervalMs": "500",
             "bgThumbnailMaxPerTick": "10",
@@ -116,7 +120,7 @@ class Preferences {
             "parTargetVisualReassertDelayMs": "450",
             "parTargetVisualReassertIntervalMs": "450",
             "parTargetVisualReassertMaxCount": "4",
-            "parTargetAbsoluteMaxDelayMs": "1800",
+            "parTargetAbsoluteMaxDelayMs": "600",
             "parToMacSyntheticClickEnabled": "true",
             "postAltTabFocusSuppressionMs": "2500",
             "protectNativeCommandBacktickShortcut": "false",
@@ -506,7 +510,7 @@ enum RuntimeFlags {
     static var parHideMaxDelayMs: Int { int("parHideMaxDelayMs", default: 1200) }
     static var parHidePollIntervalMs: Int { int("parHidePollIntervalMs", default: 25) }
     static var parHideStableMs: Int { int("parHideStableMs", default: 250) }
-    static var parSameBoundaryDisplayDelayMs: Int { int("parSameBoundaryDisplayDelayMs", default: 150) }
+    static var parSameBoundaryDisplayDelayMs: Int { int("parSameBoundaryDisplayDelayMs", default: 0) }
     static var parSameBoundaryHideStableMs: Int { int("parSameBoundaryHideStableMs", default: 250) }
     static var parSameBoundaryStackStableMs: Int { int("parSameBoundaryStackStableMs", default: 250) }
     static var parSameBoundaryStackStableWindowCount: Int { int("parSameBoundaryStackStableWindowCount", default: 8) }
@@ -517,7 +521,7 @@ enum RuntimeFlags {
     static var parTargetVisualReassertDelayMs: Int { int("parTargetVisualReassertDelayMs", default: 450) }
     static var parTargetVisualReassertIntervalMs: Int { int("parTargetVisualReassertIntervalMs", default: 450) }
     static var parTargetVisualReassertMaxCount: Int { int("parTargetVisualReassertMaxCount", default: 4) }
-    static var parTargetAbsoluteMaxDelayMs: Int { int("parTargetAbsoluteMaxDelayMs", default: 1800) }
+    static var parTargetAbsoluteMaxDelayMs: Int { int("parTargetAbsoluteMaxDelayMs", default: 600) }
     /// When host-side parHide evidence (target at z0, frontmost, stable) has
     /// held for at least this many ms past the required stable threshold,
     /// drop the guest.ready requirement and fire parHideNow. Mitigates the
@@ -540,9 +544,22 @@ enum RuntimeFlags {
     static var bgThumbnailRefreshEnabled: Bool { bool("bgThumbnailRefreshEnabled", default: true) }
     static var bgThumbnailHotTierSize: Int { int("bgThumbnailHotTierSize", default: 10) }
     static var bgThumbnailHotIntervalMs: Int { int("bgThumbnailHotIntervalMs", default: 5000) }
-    static var bgThumbnailWarmIntervalMs: Int { int("bgThumbnailWarmIntervalMs", default: 10000) }
+    static var bgThumbnailWarmIntervalMs: Int { int("bgThumbnailWarmIntervalMs", default: 60000) }
+    static var bgThumbnailColdIntervalMs: Int { int("bgThumbnailColdIntervalMs", default: 300000) }
     static var bgThumbnailHotJitterMs: Int { int("bgThumbnailHotJitterMs", default: 1000) }
-    static var bgThumbnailWarmJitterMs: Int { int("bgThumbnailWarmJitterMs", default: 2000) }
+    static var bgThumbnailWarmJitterMs: Int { int("bgThumbnailWarmJitterMs", default: 5000) }
+    static var bgThumbnailColdJitterMs: Int { int("bgThumbnailColdJitterMs", default: 30000) }
+    /// How often the background refresher reconciles its window list against
+    /// the live WindowServer window list (zombie GC), releasing thumbnails
+    /// (and their IOSurfaces) for windows that closed without an AX-destroyed
+    /// event. Previously this only ran on panel-show.
+    static var bgThumbnailReconcileMs: Int { int("bgThumbnailReconcileMs", default: 30000) }
+    /// When true, background captures for non-hot-tier windows are copied into
+    /// detached malloc-backed bitmaps and the WindowServer capture IOSurface is
+    /// released immediately, instead of being retained live. This bounds the
+    /// count of outstanding capture surfaces (which WindowServer aborts on if a
+    /// client exceeds its tally). Hot-tier windows keep live surfaces.
+    static var bgThumbnailDetachNonHotTier: Bool { bool("bgThumbnailDetachNonHotTier", default: true) }
     static var bgThumbnailInitialMaxDelayMs: Int { int("bgThumbnailInitialMaxDelayMs", default: 10000) }
     static var bgThumbnailTickIntervalMs: Int { int("bgThumbnailTickIntervalMs", default: 500) }
     static var bgThumbnailMaxPerTick: Int { int("bgThumbnailMaxPerTick", default: 10) }
