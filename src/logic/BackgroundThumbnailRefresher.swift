@@ -197,6 +197,12 @@ final class BackgroundThumbnailRefresher {
         reconcileCounter += 1
         guard reconcileCounter >= everyTicks else { return }
         reconcileCounter = 0
+        // Emit the thumbnail-cache/IOSurface profiler line (perf level) so leak regressions are
+        // visible in profiling runs. Gate the (locked) cache walk behind shouldLog so default-level
+        // runs don't pay for it.
+        if Diagnostics.shouldLog("THUMBCACHE") {
+            Diagnostics.log("THUMBCACHE", "\(ThumbnailCache.shared.statsLine()) activeCaptures=\(ActiveWindowCaptures.value()) panelOpen=\(App.appIsBeingUsed)")
+        }
         DispatchQueue.main.async { Applications.removeZombieWindows() }
     }
 

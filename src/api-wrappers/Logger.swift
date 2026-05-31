@@ -193,6 +193,9 @@ class Diagnostics {
         "ORDER": .perf,
         "AXFOCUS": .perf,
         "LOGCOST": .perf,
+        // perf — thumbnail cache / IOSurface leak tracking (liveSurfaces is the metric that drove
+        // the WSIOSurfaceDebugTallyAndAbort WindowServer crash; it must stay ~hotTierSize, not grow)
+        "THUMBCACHE": .perf,
         // trace — z-order/focus mechanics
         "AXPREWARM": .trace,
         "AXRAISE": .trace,

@@ -31,41 +31,66 @@ class WindowCaptureScreenshots {
         return cachedSCWindows.first { $0.windowID == wid }
     }
 
+    /// Per-window state snapshotted on the main thread before the (concurrent) screenshots queue runs.
+    struct CaptureRequest {
+        let window: Window
+        let size: CGSize
+        let scaleFactor: CGFloat
+    }
+
+    /// MUST be called on the main thread. We snapshot Window.size / scale factor / the Window ref here
+    /// before hopping to the concurrent screenshotsQueue. Window.size, Window.screenId, Screens.all and
+    /// NSScreen.preferred are main-thread-owned; reading them from the screenshots queue races with
+    /// main-thread mutation and can corrupt the heap (the crash class upstream lwouis fixed in f4a54c8f,
+    /// which our own audit independently flagged). Size is fixed at call time, so a window resized between
+    /// snapshot and capture is captured at the old size and corrected on the next refresh.
     static func oneTimeScreenshots(_ windowsToScreenshot: [Window], _ source: RefreshCausedBy) {
         guard RuntimeFlags.thumbnailCaptureEnabled, App.thumbnailCaptureAllowed(source) else { return }
-        let windows = windowsToScreenshot.compactMap { $0.cgWindowId }
-        guard !windows.isEmpty else { return }
+        var requests = [CGWindowID: CaptureRequest]()
+        for window in windowsToScreenshot {
+            guard let wid = window.cgWindowId, let size = window.size else { continue }
+            let scaleFactor: CGFloat
+            if let screenId = window.screenId, let screen = Screens.all[screenId] {
+                scaleFactor = screen.backingScaleFactor
+            } else {
+                scaleFactor = NSScreen.preferred.backingScaleFactor
+            }
+            requests[wid] = CaptureRequest(window: window, size: size, scaleFactor: scaleFactor)
+        }
+        guard !requests.isEmpty else { return }
         BackgroundWork.screenshotsQueue.addOperation {
             guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
             guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
-            let (cachedWindows, notCachedWindows) = sortCachedAndNotCached(windows)
+            let (cachedWindows, notCachedWindows) = sortCachedAndNotCached(Array(requests.keys))
             Logger.debug { "cached:\(cachedWindows.map { $0.windowID }) notCached:\(notCachedWindows)" }
-            handleCachedWindows(cachedWindows, source)
-            handleNotCachedWindows(notCachedWindows, source)
+            handleCachedWindows(cachedWindows, requests, source)
+            handleNotCachedWindows(notCachedWindows, requests, source)
         }
     }
 
-    private static func handleCachedWindows(_ cachedWindows: [SCWindow], _ source: RefreshCausedBy) {
+    private static func handleCachedWindows(_ cachedWindows: [SCWindow], _ requests: [CGWindowID: CaptureRequest], _ source: RefreshCausedBy) {
         guard !cachedWindows.isEmpty else { return }
         for cachedWindow in cachedWindows {
-            oneTimeCapture(cachedWindow, source)
+            guard let request = requests[cachedWindow.windowID] else { continue }
+            oneTimeCapture(cachedWindow, request, source)
         }
     }
 
-    private static func handleNotCachedWindows(_ notCachedWindows: [CGWindowID], _ source: RefreshCausedBy) {
+    private static func handleNotCachedWindows(_ notCachedWindows: [CGWindowID], _ requests: [CGWindowID: CaptureRequest], _ source: RefreshCausedBy) {
         guard !notCachedWindows.isEmpty else { return }
         SCShareableContent.getExcludingDesktopWindows(true, onScreenWindowsOnly: false) { shareableContent, error in
             guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
             guard let shareableContent, error == nil else { Logger.error { "\(shareableContent == nil) \(error)" }; return }
             guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
-            // this callback is executed on an undetermined queue; we move execution to main-thread
+            // this callback runs on an undetermined queue; hop to screenshotsQueue to mutate the cache
             BackgroundWork.screenshotsQueue.addOperation {
                 guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
                 setCachedWindows(shareableContent.windows)
                 guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
                 for notCachedWindow in notCachedWindows {
+                    guard let request = requests[notCachedWindow] else { continue }
                     if let cachedWindow = lookupCachedWindow(notCachedWindow) {
-                        oneTimeCapture(cachedWindow, source)
+                        oneTimeCapture(cachedWindow, request, source)
                     } else {
                         Logger.debug { "wid:\(notCachedWindow) was not found in SCShareableContent windows" }
                     }
@@ -87,10 +112,13 @@ class WindowCaptureScreenshots {
         return (cachedWindows, notCachedWindows)
     }
 
-    private static func oneTimeCapture(_ scWindow: SCWindow, _ source: RefreshCausedBy) {
+    private static func oneTimeCapture(_ scWindow: SCWindow, _ request: CaptureRequest, _ source: RefreshCausedBy) {
         guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
-        guard !App.isTerminating, let window = (Windows.list.first { $0.cgWindowId == scWindow.windowID }), window.size != nil else { return }
-        let config = SCStreamConfiguration.forWindow(scWindow, window, false)
+        guard !App.isTerminating else { return }
+        // window/size/scaleFactor came from the main-thread snapshot (CaptureRequest) — no Windows.list
+        // or Window.size reads here on the concurrent screenshots queue.
+        let window = request.window
+        let config = SCStreamConfiguration.forWindow(size: request.size, scaleFactor: request.scaleFactor, false)
         let filter = SCContentFilter(desktopIndependentWindow: scWindow)
         let captureToken = ActiveWindowCaptures.begin()
         SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { sampleBuffer, error in
@@ -298,9 +326,9 @@ class WindowCaptureScreenshotsPrivateApi {
 
 @available(macOS 12.3, *)
 extension SCStreamConfiguration {
-    static func forWindow(_ scWindow: SCWindow, _ window: Window, _ video: Bool) -> SCStreamConfiguration {
+    static func forWindow(size: CGSize, scaleFactor: CGFloat, _ video: Bool) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
-        config.setWindowSize(scWindow, window)
+        config.setWindowSize(size: size, scaleFactor: scaleFactor)
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.showsCursor = false
         // if video {
@@ -316,19 +344,10 @@ extension SCStreamConfiguration {
         return config
     }
 
-    private func windowScaleFactor(_ window: Window) -> CGFloat {
-        if let screenId = window.screenId,
-           let screen = Screens.all[screenId] {
-            return screen.backingScaleFactor
-        }
-        return NSScreen.preferred.backingScaleFactor
-    }
-
-    private func setWindowSize(_ scWindow: SCWindow, _ window: Window) {
-        let scaleFactor = windowScaleFactor(window)
-        // we use window.size and not scWindow.frame, as scWindow is cached thus its size can be stale. window.size is always up-to-date
-        let size = window.size! // we checked non-nil earlier, up the stack
-        // window.size shows logical size. It doesn't change when the scaleFactor changes. We need to correct for this as we need to capture more and less pixels depending on DPI
+    private func setWindowSize(size: CGSize, scaleFactor: CGFloat) {
+        // size (logical) and scaleFactor were snapshotted on the main thread by the caller. We use the
+        // window's logical size (not scWindow.frame, which is cached/stale) corrected for DPI so we
+        // capture the right pixel count.
         let originalSize = NSSize(width: size.width * scaleFactor, height: size.height * scaleFactor)
         guard originalSize.width > 0, originalSize.height > 0 else { return }
         if Preferences.previewSelectedWindow {

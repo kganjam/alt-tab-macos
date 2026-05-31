@@ -238,6 +238,24 @@ final class ThumbnailCache {
         return (entries.count, heap.count, nextDue)
     }
 
+    /// One-line profiler/leak-tracking summary. `liveSurfaces` counts entries still holding an
+    /// IOSurface-backed pixel buffer — the windows that count against WindowServer's per-client
+    /// surface tally (the metric behind the WSIOSurfaceDebugTallyAndAbort crash). With the
+    /// detach-non-hot-tier fix it should hover around `bgThumbnailHotTierSize` and NOT grow with the
+    /// number of open windows; a rising `liveSurfaces` over a long session means the leak regressed.
+    func statsLine() -> String {
+        lock.lock(); defer { lock.unlock() }
+        var hot = 0, warm = 0, cold = 0, inFlight = 0, withBitmap = 0, liveSurfaces = 0
+        for (_, e) in entries {
+            switch e.tier { case .hot: hot += 1; case .warm: warm += 1; case .cold: cold += 1 }
+            if e.inFlight { inFlight += 1 }
+            if e.thumbnail != nil { withBitmap += 1 }
+            if case .pixelBuffer? = e.thumbnail { liveSurfaces += 1 }
+        }
+        let nextDueMs = heap.peek().map { Int(($0.deadline - CFAbsoluteTimeGetCurrent()) * 1000) } ?? -1
+        return "entries=\(entries.count) hot=\(hot) warm=\(warm) cold=\(cold) liveSurfaces=\(liveSurfaces) withBitmap=\(withBitmap) inFlight=\(inFlight) heap=\(heap.count) nextDueMs=\(nextDueMs)"
+    }
+
     // MARK: - Internal
 
     /// Per-tier refresh interval and jitter. Callers already hold `lock`.
