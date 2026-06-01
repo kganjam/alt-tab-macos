@@ -1,4 +1,5 @@
 import Cocoa
+import QuartzCore
 import Darwin
 import LetsMove
 import ShortcutRecorder
@@ -66,6 +67,9 @@ class App: AppCenterApplication {
     static var lastAltTabFocusTargetWid: CGWindowID?
     static var lastAltTabFocusSourceWid: CGWindowID?
     static var lastAltTabFocusAt: CFAbsoluteTime = 0
+    /// When the current show/cycle interaction began (≈ keypress). Used to measure the
+    /// user-perceived "time to see the list" up to the panel's first rendered frame.
+    static var lastShowStartedAt: CFAbsoluteTime = 0
     static var altTabFocusSourceInvalidated = true
     private static let thumbnailCaptureGateLock = NSLock()
     private static var thumbnailCaptureGateToken: UInt64 = 0
@@ -1090,6 +1094,7 @@ class App: AppCenterApplication {
 
     static func showUiOrCycleSelection(_ shortcutIndex: Int, _ forceDoNothingOnRelease_: Bool) {
         let showStartedAt = CFAbsoluteTimeGetCurrent()
+        lastShowStartedAt = showStartedAt
         cancelPendingParHide()
         clearFocusTargetSuppression()
         forceDoNothingOnRelease = forceDoNothingOnRelease_
@@ -1240,6 +1245,11 @@ class App: AppCenterApplication {
         refreshUi()
         guard appIsBeingUsed else { return }
         Diagnostics.log("PANEL", "showPanel (window count=\(Windows.list.count))")
+        // `showPanel` above marks the orderFront; the panel isn't actually on screen until the next
+        // CoreAnimation commit renders the tiles. Capture references so the completion block below can
+        // log the true render-complete time (a quick-tap focus handoff can starve this commit for seconds).
+        let buildStartedAt = CFAbsoluteTimeGetCurrent()
+        let showStartRef = lastShowStartedAt
         TilesPanel.shared.show()
         // Enable the scroll-wheel CGEventTap while the panel is up. Without
         // this, mouse-wheel scroll events leak through to whichever app sits
@@ -1257,6 +1267,15 @@ class App: AppCenterApplication {
         KeyRepeatTimer.startRepeatingKeyNextWindow()
         TilesView.refreshVisibleThumbnailsIfNeeded("show", force: true)
         TilesView.startVisibleThumbnailRefreshTimer()
+        // Fires when the current CoreAnimation transaction (this panel show + tile layout) finishes
+        // compositing — i.e. when the list is actually visible. `sinceShowStart` is the user-perceived
+        // latency from keypress; `build+render` isolates the build/first-frame cost from any
+        // pre-show scheduling delay (visible as showPanel-time minus show-prep-time in the log).
+        CATransaction.setCompletionBlock {
+            let now = CFAbsoluteTimeGetCurrent()
+            let sinceShow = showStartRef > 0 ? (now - showStartRef) * 1000 : -1
+            Diagnostics.log("PANEL", String(format: "panel render complete: sinceShowStart=%.0fms build+render=%.0fms windows=%d panelActive=%@", sinceShow, (now - buildStartedAt) * 1000, Windows.list.count, appIsBeingUsed ? "true" : "false"))
+        }
         let prioritized = Set(TilesView.visibleWindowsForThumbnailRefresh().compactMap { $0.cgWindowId })
         let deferred = Windows.list.filter { window in
             guard let wid = window.cgWindowId else { return false }

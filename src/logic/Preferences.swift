@@ -24,7 +24,7 @@ class Preferences {
             "cursorFollowFocus": CursorFollowFocus.never.indexAsString,
             "showTabsAsWindows": "false",
             "hideColoredCircles": "false",
-            "windowDisplayDelay": "100",
+            "windowDisplayDelay": "0",
             "coherenceDisplayDelay": "0",
             "parSameBoundaryDisplayDelayMs": "0",
             "appearanceStyle": AppearanceStylePreference.thumbnails.indexAsString,
