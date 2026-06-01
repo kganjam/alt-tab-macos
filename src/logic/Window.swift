@@ -1153,8 +1153,19 @@ class Window {
         } else if RuntimeFlags.parToMacSyntheticClickEnabled {
             Diagnostics.markSwitchPhase("skyLightClickSkipped", extra: "parToMac unsafe bundle=\(application.bundleIdentifier ?? "?") wid=\(targetWid)")
         }
-        _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
-        Diagnostics.markSwitchPhase("slpsDone", extra: "parToMac")
+        // Per-window mode (like the native path): `.noWindows` makes the target
+        // app frontmost with `targetWid` as key WITHOUT raising the app's other
+        // windows, so a multi-window Mac target (Outlook, Safari, …) focused out
+        // of Coherence raises ONLY the target — the same SAMEAPP>1 / recency fix
+        // as shouldUsePerWindowNativeFocus. `.userGenerated` (which raises the
+        // app's windows) stays the fallback when per-window focus is disabled.
+        // makeKeyWindow stays omitted; armNativeFocusZOrderIntent +
+        // retryNativeFocusTargetIfNeeded below re-assert the target if Parallels
+        // re-raises its Coherence window.
+        let perWindowParToMac = shouldUsePerWindowNativeFocus()
+        let parToMacSlpsMode: SLPSMode = perWindowParToMac ? .noWindows : .userGenerated
+        _SLPSSetFrontProcessWithOptions(&psn, targetWid, parToMacSlpsMode.rawValue)
+        Diagnostics.markSwitchPhase("slpsDone", extra: "parToMac mode=\(perWindowParToMac ? "noWindows" : "userGenerated")")
         try? axUiElement?.focusWindow()
         Diagnostics.markSwitchPhase("axSyncDone", extra: "parToMac wid=\(targetWid)")
         let orderErr = CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, 0)
