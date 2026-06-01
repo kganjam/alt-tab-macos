@@ -43,17 +43,15 @@ class ScrollwheelEvents {
     private static let handleEvent: CGEventTapCallBack = { _, type, cgEvent, _ in
         if type.rawValue == NSEvent.EventType.scrollWheel.rawValue {
             App.noteInputCaptureActivity("scrollwheel-tap")
-            let isContinuous = cgEvent.getIntegerValueField(.scrollWheelEventIsContinuous) != 0
-            // Block continuous (trackpad two-finger) scrolling unconditionally —
-            // trackpad gesture detector handles tile navigation instead.
-            if isContinuous { return nil }
-            // Discrete (mouse wheel): when the AltTab panel is open and the
-            // cursor is NOT over the panel, eat the event. Without this, the
-            // scroll routes to whatever app is under the cursor; some apps
-            // raise themselves on scroll, AltTab observes the external focus
-            // and dismisses the panel mid-navigation. When the cursor IS over
-            // the panel, pass through so TilesView.scrollWheel can scroll the
-            // tile grid.
+            // When the AltTab panel is open and the cursor is NOT over the panel, eat the
+            // event: otherwise it routes to whatever app is under the cursor, and some apps
+            // raise themselves on scroll, which AltTab observes as external focus and
+            // dismisses the panel mid-navigation. When the cursor IS over the panel, pass it
+            // through so TilesView.scrollWheel scrolls the tile grid. This applies equally to
+            // mouse wheel (discrete) and trackpad two-finger (continuous) scroll — previously
+            // continuous scroll was blocked unconditionally, so two-finger trackpad scrolling
+            // over the list never scrolled it. (3/4-finger swipe navigation is a separate
+            // gesture event handled by TrackpadEvents and is unaffected.)
             if App.appIsBeingUsed && !isPointerInsidePanel() { return nil }
             return Unmanaged.passUnretained(cgEvent)
         }

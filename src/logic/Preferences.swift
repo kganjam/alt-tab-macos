@@ -24,9 +24,9 @@ class Preferences {
             "cursorFollowFocus": CursorFollowFocus.never.indexAsString,
             "showTabsAsWindows": "false",
             "hideColoredCircles": "false",
-            "windowDisplayDelay": "0",
-            "coherenceDisplayDelay": "0",
-            "parSameBoundaryDisplayDelayMs": "0",
+            "windowDisplayDelay": "100",
+            "coherenceDisplayDelay": "300",
+            "parSameBoundaryDisplayDelayMs": "150",
             "appearanceStyle": AppearanceStylePreference.thumbnails.indexAsString,
             "appearanceSize": AppearanceSizePreference.auto.indexAsString,
             "appearanceTheme": AppearanceThemePreference.system.indexAsString,
@@ -510,7 +510,7 @@ enum RuntimeFlags {
     static var parHideMaxDelayMs: Int { int("parHideMaxDelayMs", default: 1200) }
     static var parHidePollIntervalMs: Int { int("parHidePollIntervalMs", default: 25) }
     static var parHideStableMs: Int { int("parHideStableMs", default: 250) }
-    static var parSameBoundaryDisplayDelayMs: Int { int("parSameBoundaryDisplayDelayMs", default: 0) }
+    static var parSameBoundaryDisplayDelayMs: Int { int("parSameBoundaryDisplayDelayMs", default: 150) }
     static var parSameBoundaryHideStableMs: Int { int("parSameBoundaryHideStableMs", default: 250) }
     static var parSameBoundaryStackStableMs: Int { int("parSameBoundaryStackStableMs", default: 250) }
     static var parSameBoundaryStackStableWindowCount: Int { int("parSameBoundaryStackStableWindowCount", default: 8) }
