@@ -20,6 +20,25 @@ This is the release-gate reference for the AltTab focus/z-order work. Before shi
 
 ## Current Build Audit
 
+Date: 2026-06-01 — autonomous idle-authorized test pass.
+
+Candidate: `parallels-coherence-focus-fix` @ `c66622bc`, dev dylib cdhash `af563a08`, one `/Applications` PID (PPID 1). Defaults: `diagnosticsLevel=perf`, `thumbnailCaptureEnabled=1`, `thumbnailUseScreenCaptureKit` unset (private-API capture → IOSurface-backed `cgImage`), `bgThumbnailDetachNonHotTier=false` (IOSurface thumbnails), `windowDisplayDelay=100`, `coherenceDisplayDelay=300`, `parSameBoundaryDisplayDelayMs=150`, `nativeFocusMode=original`, `zOrderFixesEnabled=1`. Desktop: 164 windows (46 Parallels Coherence). Artifacts: `/tmp/alttab-focus-suite-testpass-20260601-013731/`.
+
+Result: PASS for everything exercised; no correctness regression from the thumbnail/IOSurface/display-delay/scroll work. NOT a full release sign-off (display-topology, sleep/wake, and some manual classes were not exercised this run).
+
+- Per-window focus invariant (REL-001/003/052/098): HOLDS. `eval-focus-regression-suite` ×3 + 60s built-in profiler: `same_app_above_after_z0_max=0` everywhere; profiler 20/20 (100%) success at every checkpoint (≥10ms), avg first-success 5ms, parToPar/parToMac/macToPar/macToMac + all apps 100% stable @2s, 0 flicker, 0 post-success bounces.
+- Native Safari↔Terminal latency (REL-005): Safari→Terminal visual-z0 412ms (pass); Terminal→Safari 1050–1242ms — marginally over the 1000ms eval threshold but a CORRECT switch (invariant=0, final front/AX state correct). info-vs-perf logging A/B showed `info` slightly slower (1242 vs 1050ms) → intrinsic Safari-to-front latency on a 164-window desktop, NOT logging overhead or a code regression.
+- Thumbnail IOSurface tally / leak (REL-100): NO leak. 18-min soak held `surfaces=158` (= live windows) and RSS ~580MB flat; no new WindowServer abort. Long-tail soak ongoing.
+- Cold-show after idle: IOSurface `build+render` ~493ms (3× @90s idle: 345/629/504ms) vs detached-bitmap ~1.3–3.4s at the same idle → IOSurface ~7× faster cold; the prior intermittent 2–3s "slow to show the list" is resolved.
+- Capture-path races / null crash (REL-101): no anomalies (`cachedSCWindows` lock + main-thread `CaptureRequest` snapshot + nullable `CGSHWCaptureWindowList`).
+- Thumbnail coverage (REL-019/020): `displayable=45 fresh=45 ratio=1.00` (every visible window fresh ≤10s).
+- Minimized order (REL-037): minimized windows form a suffix (`firstMinimized=157`).
+- Anti-flash display delays: 100/300/150ms restored and active (`display delay: 100ms (normal)` / `300ms (coherence)` in log); render-complete instrument added (`panel render complete sinceShowStart=/build+render=`).
+- Trackpad scroll of the list: fix (continuous scroll no longer unconditionally eaten by the scroll tap) verified by inspection; needs a MANUAL two-finger-scroll confirmation (no scroll events occurred during the idle run).
+- Intermittent (pre-existing, not regressions): `rapid_overlap` 2/3 and `external_outlook_open` 1/3 missed the timing checkpoint (REL-008/031, flaky); benign `CGSOrderWindow err=1000` warnings throughout (REL-043).
+
+---
+
 Date: 2026-05-19.
 
 Candidate checked:
