@@ -64,11 +64,16 @@ Design that keeps us under budget:
   500ms tick, pops due windows, skips minimized (frozen content), runs a ~30s
   **reconcile** (`removeZombieWindows`) so closed-without-AX-event windows release
   their surfaces, and emits the `THUMBCACHE` profiler line.
-- **Detach for non-hot tiers** (`WindowCaptureEvents.swift` `ThumbnailBitmap`):
-  warm/cold captures are copied into a **detached malloc bitmap** and the
-  WindowServer IOSurface is released immediately. Only the bounded hot tier keeps
-  live surfaces, so outstanding surfaces ≈ `bgThumbnailHotTierSize`, independent
-  of how many windows are open.
+- **IOSurface-backed thumbnails, bounded not detached** (default): thumbnails are kept
+  as live IOSurface-backed bitmaps (GPU-resident → fast first paint after idle; malloc
+  bitmaps get memory-compressed while idle and are slow to fault+re-upload cold). The
+  surface budget is bounded by the *lifecycle* fixes — unregister-on-close, the ~30s
+  zombie-GC reconcile, the in-flight watchdog — so held surfaces track the live-window
+  count rather than growing unbounded. (Unbounded growth — leaked surfaces for windows
+  that closed without an AX event, over a multi-day session — is what crashed
+  WindowServer, **not** the per-window surface.) `ThumbnailBitmap` in
+  `WindowCaptureEvents.swift` + `bgThumbnailDetachNonHotTier` (default **off**) is a
+  fallback that detaches non-hot captures into malloc bitmaps if the count ever creeps up.
 - **Main-thread state snapshot** (`CaptureRequest`): per-window `size`/`scaleFactor`
   are snapshotted on the main thread before the concurrent `screenshotsQueue`
   runs, so the queue never reads main-owned `Windows.list`/`Window.size` (heap-race
@@ -77,10 +82,12 @@ Design that keeps us under budget:
   token+watchdog counter; **`CGS_CONNECTION`** is computed (self-heals after a
   WindowServer restart).
 
-**Leak watch:** the `THUMBCACHE` log line (perf level, ~every 30s) reports
-`liveSurfaces`. It must hover near `bgThumbnailHotTierSize` and **not grow** with
-the number of open windows. A rising `liveSurfaces` over a long session = the
-leak regressed. Tunables: `bgThumbnail*` in `src/logic/Preferences.swift`.
+**Surface watch:** the `THUMBCACHE` log line (perf level, ~every 30s) reports
+`windows=` (tracked/live windows) and `surfaces=` (held IOSurface-backed thumbnails).
+`surfaces` should track `windows` and **not grow** unbounded over a long session; a
+rising `surfaces` decoupled from `windows` means a surface leak regressed. If it ever
+creeps toward the WindowServer per-client tally, flip `bgThumbnailDetachNonHotTier` on.
+Tunables: `bgThumbnail*` in `src/logic/Preferences.swift`.
 
 Full incident write-up and the other capture-path fixes: `experiments/release-issue-monitor.md`
 (REL-100/REL-101) and `experiments/release-risk-code-review.md` (Thumbnail/capture row).

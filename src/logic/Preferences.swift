@@ -65,7 +65,7 @@ class Preferences {
             "bgThumbnailWarmJitterMs": "5000",
             "bgThumbnailColdJitterMs": "30000",
             "bgThumbnailReconcileMs": "30000",
-            "bgThumbnailDetachNonHotTier": "true",
+            "bgThumbnailDetachNonHotTier": "false",
             "bgThumbnailInitialMaxDelayMs": "10000",
             "bgThumbnailTickIntervalMs": "500",
             "bgThumbnailMaxPerTick": "10",
@@ -554,12 +554,16 @@ enum RuntimeFlags {
     /// (and their IOSurfaces) for windows that closed without an AX-destroyed
     /// event. Previously this only ran on panel-show.
     static var bgThumbnailReconcileMs: Int { int("bgThumbnailReconcileMs", default: 30000) }
-    /// When true, background captures for non-hot-tier windows are copied into
-    /// detached malloc-backed bitmaps and the WindowServer capture IOSurface is
-    /// released immediately, instead of being retained live. This bounds the
-    /// count of outstanding capture surfaces (which WindowServer aborts on if a
-    /// client exceeds its tally). Hot-tier windows keep live surfaces.
-    static var bgThumbnailDetachNonHotTier: Bool { bool("bgThumbnailDetachNonHotTier", default: true) }
+    /// Default OFF: thumbnails are kept as live IOSurface-backed bitmaps (GPU-resident, so the
+    /// first paint after idle is fast — malloc bitmaps get memory-compressed while idle and are
+    /// slow to fault+re-upload cold). The IOSurface budget is instead bounded by the lifecycle
+    /// fixes (unregister-on-close, the 30s zombie-GC reconcile, the in-flight watchdog), so the
+    /// surface count tracks the live-window count rather than growing unbounded — that unbounded
+    /// growth (leaked surfaces for closed windows over a multi-day session), not the per-window
+    /// surface, is what crashed WindowServer. Watch the `surfaces`/`windows` counts in the
+    /// THUMBCACHE log. Set true to fall back to detaching non-hot captures into malloc bitmaps
+    /// (releases the IOSurface immediately) if the surface count ever creeps up.
+    static var bgThumbnailDetachNonHotTier: Bool { bool("bgThumbnailDetachNonHotTier", default: false) }
     static var bgThumbnailInitialMaxDelayMs: Int { int("bgThumbnailInitialMaxDelayMs", default: 10000) }
     static var bgThumbnailTickIntervalMs: Int { int("bgThumbnailTickIntervalMs", default: 500) }
     static var bgThumbnailMaxPerTick: Int { int("bgThumbnailMaxPerTick", default: 10) }

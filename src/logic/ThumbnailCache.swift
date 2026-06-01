@@ -245,15 +245,22 @@ final class ThumbnailCache {
     /// number of open windows; a rising `liveSurfaces` over a long session means the leak regressed.
     func statsLine() -> String {
         lock.lock(); defer { lock.unlock() }
-        var hot = 0, warm = 0, cold = 0, inFlight = 0, withBitmap = 0, liveSurfaces = 0
+        var hot = 0, warm = 0, cold = 0, inFlight = 0, pixelBuffer = 0, cgImage = 0
         for (_, e) in entries {
             switch e.tier { case .hot: hot += 1; case .warm: warm += 1; case .cold: cold += 1 }
             if e.inFlight { inFlight += 1 }
-            if e.thumbnail != nil { withBitmap += 1 }
-            if case .pixelBuffer? = e.thumbnail { liveSurfaces += 1 }
+            switch e.thumbnail {
+            case .pixelBuffer?: pixelBuffer += 1
+            case .cgImage?: cgImage += 1
+            default: break
+            }
         }
+        // With detach off, every held thumbnail is IOSurface-backed (SCK pixelBuffer or
+        // CGSHWCaptureWindowList cgImage), so `surfaces` is the count of WindowServer-mapped
+        // capture surfaces we're holding — the metric to watch against the per-client tally.
+        let surfaces = pixelBuffer + cgImage
         let nextDueMs = heap.peek().map { Int(($0.deadline - CFAbsoluteTimeGetCurrent()) * 1000) } ?? -1
-        return "entries=\(entries.count) hot=\(hot) warm=\(warm) cold=\(cold) liveSurfaces=\(liveSurfaces) withBitmap=\(withBitmap) inFlight=\(inFlight) heap=\(heap.count) nextDueMs=\(nextDueMs)"
+        return "entries=\(entries.count) surfaces=\(surfaces) pixelBuffer=\(pixelBuffer) cgImage=\(cgImage) hot=\(hot) warm=\(warm) cold=\(cold) inFlight=\(inFlight) heap=\(heap.count) nextDueMs=\(nextDueMs)"
     }
 
     // MARK: - Internal

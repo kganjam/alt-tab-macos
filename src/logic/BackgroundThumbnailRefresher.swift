@@ -197,13 +197,16 @@ final class BackgroundThumbnailRefresher {
         reconcileCounter += 1
         guard reconcileCounter >= everyTicks else { return }
         reconcileCounter = 0
-        // Emit the thumbnail-cache/IOSurface profiler line (perf level) so leak regressions are
-        // visible in profiling runs. Gate the (locked) cache walk behind shouldLog so default-level
-        // runs don't pay for it.
-        if Diagnostics.shouldLog("THUMBCACHE") {
-            Diagnostics.log("THUMBCACHE", "\(ThumbnailCache.shared.statsLine()) activeCaptures=\(ActiveWindowCaptures.value()) panelOpen=\(App.appIsBeingUsed)")
+        // Emit the thumbnail-cache/IOSurface profiler line and reconcile on main: `windows` is the
+        // tracked/live window count (Windows.list, main-thread-only) and `surfaces` is the count of
+        // held IOSurface-backed thumbnails. Both must stay bounded (≈ live windows) and NOT grow over
+        // a long session — that's the regression signal for the WindowServer surface-tally crash.
+        DispatchQueue.main.async {
+            if Diagnostics.shouldLog("THUMBCACHE") {
+                Diagnostics.log("THUMBCACHE", "windows=\(Windows.list.count) \(ThumbnailCache.shared.statsLine()) activeCaptures=\(ActiveWindowCaptures.value()) panelOpen=\(App.appIsBeingUsed)")
+            }
+            Applications.removeZombieWindows()
         }
-        DispatchQueue.main.async { Applications.removeZombieWindows() }
     }
 
     /// Compute hot-tier wids from `Windows.list`. MUST be called on main.

@@ -220,15 +220,17 @@ If you need to think harder about this, see memory note
   (`WSIOSurfaceDebugTallyAndAbort`, killing the whole graphics session) if a client
   holds too many. A background refresher retaining one live IOSurface per window
   forever crashed WindowServer over a multi-day session (REL-100).
-- The budget is bounded by: detaching non-hot-tier captures into malloc bitmaps
-  (releasing the IOSurface) so only the bounded hot tier (`bgThumbnailHotTierSize`,
-  default 10) holds live surfaces; a 3-tier cadence (hot/warm/cold = 5s/60s/300s);
-  skipping minimized windows; and a ~30s background reconcile (`removeZombieWindows`).
-  Files: `ThumbnailCache.swift`, `BackgroundThumbnailRefresher.swift`,
-  `events/WindowCaptureEvents.swift`. Details in `ARCHITECTURE.md`.
-- The `THUMBCACHE` perf-level log line reports `liveSurfaces`; it must stay near
-  `bgThumbnailHotTierSize` and NOT grow with the number of open windows. A rising
-  `liveSurfaces` over a long run means the leak regressed.
+- The budget is bounded by *lifecycle*, not by detaching: thumbnails stay IOSurface-backed
+  (GPU-resident → fast cold paint), and held surfaces track the live-window count via
+  unregister-on-close, the ~30s zombie-GC reconcile (`removeZombieWindows`), and the
+  in-flight watchdog. The 3-tier cadence (hot/warm/cold = 5s/60s/300s) + minimized-skip cut
+  capture volume. Files: `ThumbnailCache.swift`, `BackgroundThumbnailRefresher.swift`,
+  `events/WindowCaptureEvents.swift`. `bgThumbnailDetachNonHotTier` (default off) detaches
+  non-hot captures to malloc bitmaps as a fallback. Details in `ARCHITECTURE.md`.
+- The `THUMBCACHE` perf-level log line reports `windows=` (tracked/live windows) and
+  `surfaces=` (held IOSurface thumbnails); `surfaces` must track `windows` and NOT grow
+  unbounded over a long run — a rising `surfaces` decoupled from `windows` is the leak
+  regressing. Flip `bgThumbnailDetachNonHotTier` on if it approaches the tally limit.
 - The concurrent `screenshotsQueue` must NOT read main-thread-owned state
   (`Windows.list`, `Window.size`/`.screenId`, `cachedSCWindows`): snapshot per-window
   state on the main thread first (`CaptureRequest`); `cachedSCWindows` is lock-guarded
