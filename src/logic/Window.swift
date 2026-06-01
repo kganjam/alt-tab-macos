@@ -350,7 +350,7 @@ class Window {
         let enqueuedAt = CFAbsoluteTimeGetCurrent()
         guard let targetWid = cgWindowId else { return }
         let preZ = Windows.zOrderSnapshotForFocus()
-        if shouldUseNoWindowsNativeFocus() {
+        if shouldUsePerWindowNativeFocus() {
             var psn = ProcessSerialNumber()
             GetProcessForPID(application.pid, &psn)
             focusNativeMultiWindow(&psn, targetWid, preZ)
@@ -813,6 +813,24 @@ class Window {
         guard RuntimeFlags.nativeNoWindowsFocusEnabled else { return false }
         guard let bundleIdentifier = application.bundleIdentifier else { return false }
         return ["com.apple.Terminal", "com.googlecode.iterm2"].contains(bundleIdentifier)
+    }
+
+    /// Whether to focus via the per-window `noWindows` SLPS path (raises ONLY
+    /// the target window) instead of the app-activating `.userGenerated`
+    /// original path. Broadened from the Terminal/iTerm2-only
+    /// `shouldUseNoWindowsNativeFocus()` allowlist to every native window, so
+    /// multi-window apps (Outlook, Safari, …) stop raising all their windows
+    /// on focus — the cause of the `SAMEAPP`>1 z-order / recency corruption.
+    ///
+    /// The synchronous-AX (`shouldSynchronouslyFocusNativeWindow`) and AX
+    /// prewarm decisions intentionally stay on the narrow terminal allowlist:
+    /// non-terminal apps therefore take `focusNativeMultiWindowUserGenerated`
+    /// (which *also* uses noWindows SLPS — no sibling raise — but focuses via
+    /// async AX), so a slow AX app like Outlook never blocks the main thread.
+    private func shouldUsePerWindowNativeFocus() -> Bool {
+        guard RuntimeFlags.nativeNoWindowsFocusEnabled else { return false }
+        guard cgWindowId != nil, !isWindowlessApp, !isParallelsCoherenceWindow else { return false }
+        return application.bundleIdentifier != nil
     }
 
     private func shouldSynchronouslyFocusNativeWindow() -> Bool {

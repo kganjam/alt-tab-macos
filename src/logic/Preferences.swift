@@ -94,7 +94,7 @@ class Preferences {
             "skipCoherenceThumbnailsDuringPanel": "true",
             "parGuestPrefocusHostDelayMs": "20",
             "parGuestPrefocusMaxAgeMs": "220",
-            "nativeNoWindowsFocusEnabled": "false",
+            "nativeNoWindowsFocusEnabled": "true",
             "nativeExperimentalFocusModesEnabled": "false",
             "zOrderEnforcementMs": "2500",
             "diagnosticsBasicPerfOnly": "false",
@@ -496,7 +496,7 @@ enum RuntimeFlags {
     static var skipCoherenceThumbnailsDuringPanel: Bool { bool("skipCoherenceThumbnailsDuringPanel", default: true) }
     static var parGuestPrefocusHostDelayMs: Int { int("parGuestPrefocusHostDelayMs", default: 20) }
     static var parGuestPrefocusMaxAgeMs: Int { int("parGuestPrefocusMaxAgeMs", default: 220) }
-    static var nativeNoWindowsFocusEnabled: Bool { bool("nativeNoWindowsFocusEnabled", default: false) }
+    static var nativeNoWindowsFocusEnabled: Bool { bool("nativeNoWindowsFocusEnabled", default: true) }
     static var nativeExperimentalFocusModesEnabled: Bool { bool("nativeExperimentalFocusModesEnabled", default: false) }
     static var zOrderEnforcementMs: Int { int("zOrderEnforcementMs", default: 2500) }
     static var syncRefreshCoherenceTitlesBeforeShowing: Bool { bool("syncRefreshCoherenceTitlesBeforeShowing", default: false) }
