@@ -51,6 +51,14 @@ final class ThumbnailCache {
 
     private struct Entry {
         var thumbnail: CALayerContents?
+        /// True iff `thumbnail` is backed by a live WindowServer capture
+        /// IOSurface (SCK pixelBuffer, or a non-detached CGSHWCaptureWindowList
+        /// CGImage). False for malloc-backed detached copies. This is what
+        /// counts against WindowServer's per-client IOSurface tally — detached
+        /// copies do not. Distinguishing the two is the only way to verify the
+        /// detach mitigation, since both live and detached results are stored
+        /// as `.cgImage` when SCK is off.
+        var isLiveSurface: Bool = false
         var lastUpdatedAt: CFAbsoluteTime = 0
         var nextRefreshAt: CFAbsoluteTime
         var scheduleId: UInt64
@@ -138,11 +146,12 @@ final class ThumbnailCache {
     /// In-panel captures (`refreshVisibleThumbnailsAfterShowUi` source)
     /// don't set `inFlightScheduleId` (they didn't go through `popDue`), so
     /// they only store the bitmap and don't perturb BG scheduling.
-    func writeCapture(wid: CGWindowID, image: CALayerContents) {
+    func writeCapture(wid: CGWindowID, image: CALayerContents, liveSurface: Bool = true) {
         lock.lock(); defer { lock.unlock() }
         guard entries[wid] != nil else { return }
         var e = entries[wid]!
         e.thumbnail = image
+        e.isLiveSurface = liveSurface
         e.lastUpdatedAt = CFAbsoluteTimeGetCurrent()
         let wasBgInitiated = e.inFlight
         let poppedScheduleId = e.inFlightScheduleId
@@ -204,6 +213,7 @@ final class ThumbnailCache {
         lock.lock(); defer { lock.unlock() }
         guard entries[wid] != nil else { return }
         entries[wid]!.thumbnail = nil
+        entries[wid]!.isLiveSurface = false
         entries[wid]!.lastUpdatedAt = 0
     }
 
@@ -246,6 +256,7 @@ final class ThumbnailCache {
     func statsLine() -> String {
         lock.lock(); defer { lock.unlock() }
         var hot = 0, warm = 0, cold = 0, inFlight = 0, pixelBuffer = 0, cgImage = 0
+        var liveSurfaces = 0, detached = 0
         for (_, e) in entries {
             switch e.tier { case .hot: hot += 1; case .warm: warm += 1; case .cold: cold += 1 }
             if e.inFlight { inFlight += 1 }
@@ -254,13 +265,19 @@ final class ThumbnailCache {
             case .cgImage?: cgImage += 1
             default: break
             }
+            if e.thumbnail != nil {
+                if e.isLiveSurface { liveSurfaces += 1 } else { detached += 1 }
+            }
         }
-        // With detach off, every held thumbnail is IOSurface-backed (SCK pixelBuffer or
-        // CGSHWCaptureWindowList cgImage), so `surfaces` is the count of WindowServer-mapped
-        // capture surfaces we're holding — the metric to watch against the per-client tally.
+        // `liveSurfaces` = thumbnails backed by a live WindowServer capture IOSurface — the metric that
+        // counts against the per-client tally behind WSIOSurfaceDebugTallyAndAbort. With the detach
+        // mitigation on it should stay ≈ hot-tier size and NOT grow with window count. `detached` are
+        // malloc-backed copies that cost no WindowServer surface. `pixelBuffer`/`cgImage` are only the
+        // raw storage split and do NOT distinguish live from detached (a detached copy is still .cgImage),
+        // so `surfaces` (their sum) overcounts when detach is on — watch `liveSurfaces`, not `surfaces`.
         let surfaces = pixelBuffer + cgImage
         let nextDueMs = heap.peek().map { Int(($0.deadline - CFAbsoluteTimeGetCurrent()) * 1000) } ?? -1
-        return "entries=\(entries.count) surfaces=\(surfaces) pixelBuffer=\(pixelBuffer) cgImage=\(cgImage) hot=\(hot) warm=\(warm) cold=\(cold) inFlight=\(inFlight) heap=\(heap.count) nextDueMs=\(nextDueMs)"
+        return "entries=\(entries.count) liveSurfaces=\(liveSurfaces) detached=\(detached) surfaces=\(surfaces) pixelBuffer=\(pixelBuffer) cgImage=\(cgImage) hot=\(hot) warm=\(warm) cold=\(cold) inFlight=\(inFlight) heap=\(heap.count) nextDueMs=\(nextDueMs)"
     }
 
     // MARK: - Internal

@@ -139,17 +139,20 @@ class WindowCaptureScreenshots {
             // bitmap here (off the main thread) so the WindowServer capture
             // IOSurface is released rather than retained live in the cache.
             let contents: CALayerContents
+            let liveSurface: Bool
             if ThumbnailBitmap.shouldDetach(source, wid: scWindow.windowID),
                let detached = ThumbnailBitmap.detachedCopy(of: pixelBuffer) {
                 contents = .cgImage(detached)
+                liveSurface = false // malloc-backed copy; the WindowServer IOSurface was released
             } else {
                 contents = .pixelBuffer(pixelBuffer)
+                liveSurface = true // IOSurface-backed pixel buffer kept live in the cache
             }
             DispatchQueue.main.async {
                 guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
                 guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
                 if let window = (Windows.list.first { $0.cgWindowId == scWindow.windowID }) {
-                    window.refreshThumbnail(contents)
+                    window.refreshThumbnail(contents, liveSurface: liveSurface)
                 }
             }
         }
@@ -169,16 +172,19 @@ class WindowCaptureScreenshotsPrivateApi {
                 // Detach non-hot background captures off-main so the HW capture
                 // IOSurface (CGSHWCaptureWindowList output) is released.
                 let contents: CALayerContents
+                let liveSurface: Bool
                 if ThumbnailBitmap.shouldDetach(source, wid: wid),
                    let detached = ThumbnailBitmap.detachedCopy(of: cgImage) {
                     contents = .cgImage(detached)
+                    liveSurface = false // malloc-backed copy; the HW-capture IOSurface was released
                 } else {
                     contents = .cgImage(cgImage)
+                    liveSurface = true // IOSurface-backed CGImage (CGSHWCaptureWindowList output) kept live
                 }
                 DispatchQueue.main.async { [weak window] in
                     guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
                     guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
-                    window?.refreshThumbnail(contents)
+                    window?.refreshThumbnail(contents, liveSurface: liveSurface)
                 }
             }
         }

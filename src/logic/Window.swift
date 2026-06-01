@@ -184,9 +184,9 @@ class Window {
         CFRunLoopAddSource(BackgroundWork.accessibilityEventsThread.runLoop, AXObserverGetRunLoopSource(axObserver), .commonModes)
     }
 
-    func refreshThumbnail(_ screenshot: CALayerContents) {
+    func refreshThumbnail(_ screenshot: CALayerContents, liveSurface: Bool = true) {
         if let wid = cgWindowId {
-            ThumbnailCache.shared.writeCapture(wid: wid, image: screenshot)
+            ThumbnailCache.shared.writeCapture(wid: wid, image: screenshot, liveSurface: liveSurface)
         }
         thumbnailUpdateCount += 1
         if !App.appIsBeingUsed || !shouldShowTheUser { return }
