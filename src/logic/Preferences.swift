@@ -65,7 +65,7 @@ class Preferences {
             "bgThumbnailWarmJitterMs": "5000",
             "bgThumbnailColdJitterMs": "30000",
             "bgThumbnailReconcileMs": "30000",
-            "bgThumbnailDetachNonHotTier": "false",
+            "bgThumbnailDetachNonHotTier": "true",
             "bgThumbnailInitialMaxDelayMs": "10000",
             "bgThumbnailTickIntervalMs": "500",
             "bgThumbnailMaxPerTick": "10",
@@ -554,16 +554,17 @@ enum RuntimeFlags {
     /// (and their IOSurfaces) for windows that closed without an AX-destroyed
     /// event. Previously this only ran on panel-show.
     static var bgThumbnailReconcileMs: Int { int("bgThumbnailReconcileMs", default: 30000) }
-    /// Default OFF: thumbnails are kept as live IOSurface-backed bitmaps (GPU-resident, so the
-    /// first paint after idle is fast — malloc bitmaps get memory-compressed while idle and are
-    /// slow to fault+re-upload cold). The IOSurface budget is instead bounded by the lifecycle
-    /// fixes (unregister-on-close, the 30s zombie-GC reconcile, the in-flight watchdog), so the
-    /// surface count tracks the live-window count rather than growing unbounded — that unbounded
-    /// growth (leaked surfaces for closed windows over a multi-day session), not the per-window
-    /// surface, is what crashed WindowServer. Watch the `surfaces`/`windows` counts in the
-    /// THUMBCACHE log. Set true to fall back to detaching non-hot captures into malloc bitmaps
-    /// (releases the IOSurface immediately) if the surface count ever creeps up.
-    static var bgThumbnailDetachNonHotTier: Bool { bool("bgThumbnailDetachNonHotTier", default: false) }
+    /// Default ON: only the hot tier (top-N recently-focused) keeps live IOSurface-backed
+    /// thumbnails; warm/cold background captures are detached into malloc bitmaps so their
+    /// WindowServer capture IOSurface is released immediately. Bounding live surfaces to
+    /// ~hotTierSize was the only thing that actually held: the "lifecycle bounding is enough"
+    /// hypothesis was falsified — with detach off, live surfaces track the *window* count
+    /// (~160 on a busy multi-monitor session, ~16x hotTierSize) and WindowServer still aborted
+    /// via WSIOSurfaceDebugTallyAndAbort. Watch `liveSurfaces=` (NOT `surfaces=`, which counts
+    /// detached malloc copies too) in the THUMBCACHE log; with this on it stays ~hotTierSize.
+    /// Trade-off: warm/cold thumbnails fault+re-upload from compressed malloc on first paint
+    /// after idle (slightly slower cold) instead of staying GPU-resident.
+    static var bgThumbnailDetachNonHotTier: Bool { bool("bgThumbnailDetachNonHotTier", default: true) }
     static var bgThumbnailInitialMaxDelayMs: Int { int("bgThumbnailInitialMaxDelayMs", default: 10000) }
     static var bgThumbnailTickIntervalMs: Int { int("bgThumbnailTickIntervalMs", default: 500) }
     static var bgThumbnailMaxPerTick: Int { int("bgThumbnailMaxPerTick", default: 10) }
