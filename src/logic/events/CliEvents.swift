@@ -90,11 +90,31 @@ class CliServer {
             return noOutput
         }
         if rawValue.hasPrefix("--focus="),
-           let id = CGWindowID(rawValue.dropFirst("--focus=".count)), let window = (Windows.list.first { $0.cgWindowId == id }) {
+           let id = CGWindowID(rawValue.dropFirst("--focus=".count)) {
             Diagnostics.startSwitchTiming("cli-focus")
             App.hideUi(true)
-            window.focus()
+            // Focuses immediately if known; otherwise discovers the window
+            // on-demand (no wait for the throttled windowCreated scan), so a
+            // just-created window passed straight from CGWindowList focuses fast.
+            Windows.focusWindowByIdOnDemand(id)
             return noOutput
+        }
+        if rawValue.hasPrefix("--focus-newest=") {
+            // Focus the newest window of an app bundle, discovering it on-demand.
+            // Lets a "open a new window" helper do: create window -> one CLI call,
+            // with no polling — AltTab finds the just-created window itself and
+            // reports the app that was frontmost (so the caller can restore it
+            // when the new window closes).
+            let bundleId = String(rawValue.dropFirst("--focus-newest=".count))
+            guard let pid = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundleId })?.processIdentifier,
+                  let newWid = Windows.newestWindowId(forPid: pid) else {
+                return error
+            }
+            let prevBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
+            Diagnostics.startSwitchTiming("cli-focus-newest")
+            App.hideUi(true)
+            Windows.focusWindowByIdOnDemand(newWid)
+            return JsonScratchFocus(newWindowId: newWid, previousFrontmostBundleId: prevBundle)
         }
         if rawValue.hasPrefix("--focusUsingLastFocusOrder="),
            let lastFocusOrder = Int(rawValue.dropFirst("--focusUsingLastFocusOrder=".count)), let window = (Windows.list.first { $0.lastFocusOrder == lastFocusOrder }) {
@@ -148,6 +168,11 @@ class CliServer {
         )
     }
 
+    private struct JsonScratchFocus: Codable {
+        var newWindowId: CGWindowID
+        var previousFrontmostBundleId: String
+    }
+
     private struct JsonWindowList: Codable {
         var windows: [JsonWindow]
     }
@@ -199,7 +224,7 @@ class CliClient {
     static func detectCommand() -> String? {
         let args = CommandLine.arguments
         if args.count == 2 && !args[1].starts(with: "--logs=") {
-            if args[1] == "--list" || args[1] == "--detailed-list" || args[1] == "--selection-state" || args[1] == "--hide" || args[1] == "--focus-target" || args[1].hasPrefix("--select=") || args[1].hasPrefix("--select-index=") || args[1].hasPrefix("--select-and-focus=") || args[1].hasPrefix("--focus=") || args[1].hasPrefix("--focusUsingLastFocusOrder=") || args[1].hasPrefix("--show=") {
+            if args[1] == "--list" || args[1] == "--detailed-list" || args[1] == "--selection-state" || args[1] == "--hide" || args[1] == "--focus-target" || args[1].hasPrefix("--select=") || args[1].hasPrefix("--select-index=") || args[1].hasPrefix("--select-and-focus=") || args[1].hasPrefix("--focus=") || args[1].hasPrefix("--focus-newest=") || args[1].hasPrefix("--focusUsingLastFocusOrder=") || args[1].hasPrefix("--show=") {
                 return args[1]
             }
         }

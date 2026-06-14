@@ -2944,6 +2944,73 @@ class Windows {
         BackgroundThumbnailRefresher.shared.register(window: window)
     }
 
+    /// Focus a window by CGWindowID, discovering it on-demand if AltTab hasn't
+    /// catalogued it yet (e.g. a window created milliseconds ago). The CLI
+    /// `--focus=` uses this so a just-created window can be focused immediately
+    /// instead of waiting for the throttled (200ms) windowCreated discovery to
+    /// catch up — the caller passes the wid straight from CGWindowList. Does not
+    /// block: it forces an un-throttled scan of the owning app and focuses the
+    /// target the instant it appears in `list`.
+    static func focusWindowByIdOnDemand(_ wid: CGWindowID) {
+        if let window = list.first(where: { $0.cgWindowId == wid }) {
+            // Async so a synchronous CLI caller (executeCommandAndSendReponse runs
+            // on main.sync) gets its response immediately instead of blocking on
+            // window.focus()'s AX calls, which can be slow for a busy app.
+            DispatchQueue.main.async { window.focus() }
+            return
+        }
+        if let pid = ownerPidForCGWindow(wid), let app = Applications.findOrCreate(pid, false) {
+            Applications.manuallyUpdateWindows(app)  // direct call bypasses appListUpdateThrottler
+        }
+        retryFocusWindowById(wid, attemptsLeft: 24)  // ~24 × 25ms ≈ 600ms ceiling
+    }
+
+    private static func retryFocusWindowById(_ wid: CGWindowID, attemptsLeft: Int) {
+        if let window = list.first(where: { $0.cgWindowId == wid }) {
+            Diagnostics.log("CLI", "on-demand focus wid=#\(wid) (after \(24 - attemptsLeft) retries)")
+            window.focus()
+            return
+        }
+        guard attemptsLeft > 0 else {
+            Diagnostics.log("CLI", "on-demand focus gave up: wid=#\(wid) never discovered")
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(25)) {
+            retryFocusWindowById(wid, attemptsLeft: attemptsLeft - 1)
+        }
+    }
+
+    private static func ownerPidForCGWindow(_ wid: CGWindowID) -> pid_t? {
+        guard let info = CGWindowListCopyWindowInfo([.optionIncludingWindow], wid) as? [[String: Any]],
+              let pid = info.first?[kCGWindowOwnerPID as String] as? pid_t else { return nil }
+        return pid
+    }
+
+    /// The CGWindowID of the just-created window of `pid` — its highest on-screen
+    /// wid (CGWindowIDs are monotonic, so the newest window has the largest).
+    /// Read straight from CGWindowList (the window-server truth), so it's
+    /// available the moment the window exists — no wait for AltTab's throttled AX
+    /// discovery. A short retry absorbs the few-ms lag between creating a window
+    /// and it appearing in CGWindowList. Used by the CLI `--focus-newest=`.
+    static func newestWindowId(forPid pid: pid_t) -> CGWindowID? {
+        for _ in 0..<8 {  // ceiling ~96ms; normally returns on the first query
+            if let maxWid = onScreenWindowIds(forPid: pid).max(), maxWid != 0 { return maxWid }
+            usleep(12_000)
+        }
+        return nil
+    }
+
+    private static func onScreenWindowIds(forPid pid: pid_t) -> [CGWindowID] {
+        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let info = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return [] }
+        return info.compactMap { w in
+            guard (w[kCGWindowLayer as String] as? Int) == 0,
+                  (w[kCGWindowOwnerPID as String] as? pid_t) == pid,
+                  let wid = w[kCGWindowNumber as String] as? CGWindowID, wid != 0 else { return nil }
+            return wid
+        }
+    }
+
     static func removeWindows(_ windows: [Window], _ addWindowlessWindowIfNeeded: Bool) {
         for w in windows {
             BackgroundThumbnailRefresher.shared.unregister(window: w)
