@@ -1170,7 +1170,7 @@ class Window {
         Diagnostics.markSwitchPhase("axSyncDone", extra: "parToMac wid=\(targetWid)")
         let orderErr = CGSOrderWindow(CGS_CONNECTION, targetWid, CGSWindowOrderingMode.above.rawValue, 0)
         Diagnostics.markSwitchPhase("cgsOrderDone", extra: "parToMac err=\(orderErr.rawValue)")
-        Diagnostics.log("FOCUS", "Par→mac: SLPS(userGenerated)+AX focus(wid=\(targetWid)) done")
+        Diagnostics.log("FOCUS", "Par→mac: SLPS(\(perWindowParToMac ? "noWindows" : "userGenerated"))+AX focus(wid=\(targetWid)) done")
         Windows.armNativeFocusZOrderIntent(for: self, preZ: preZ)
         Windows.retryNativeFocusTargetIfNeeded(targetWid: targetWid, targetPid: application.pid, delayMs: 40)
         snapshotTopWindowsForParMac(label: "Par→mac+0ms", targetWid: targetWid)
