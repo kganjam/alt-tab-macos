@@ -66,7 +66,7 @@ class Preferences {
             "bgThumbnailColdJitterMs": "30000",
             "bgThumbnailReconcileMs": "30000",
             "bgThumbnailDetachNonHotTier": "true",
-            "bgThumbnailInitialMaxDelayMs": "10000",
+            "bgThumbnailInitialMaxDelayMs": "3000",
             "bgThumbnailTickIntervalMs": "500",
             "bgThumbnailMaxPerTick": "10",
             "bgThumbnailMaxConcurrent": "4",
@@ -565,7 +565,7 @@ enum RuntimeFlags {
     /// Trade-off: warm/cold thumbnails fault+re-upload from compressed malloc on first paint
     /// after idle (slightly slower cold) instead of staying GPU-resident.
     static var bgThumbnailDetachNonHotTier: Bool { bool("bgThumbnailDetachNonHotTier", default: true) }
-    static var bgThumbnailInitialMaxDelayMs: Int { int("bgThumbnailInitialMaxDelayMs", default: 10000) }
+    static var bgThumbnailInitialMaxDelayMs: Int { int("bgThumbnailInitialMaxDelayMs", default: 3000) }
     static var bgThumbnailTickIntervalMs: Int { int("bgThumbnailTickIntervalMs", default: 500) }
     static var bgThumbnailMaxPerTick: Int { int("bgThumbnailMaxPerTick", default: 10) }
     static var bgThumbnailMaxConcurrent: Int { int("bgThumbnailMaxConcurrent", default: 4) }

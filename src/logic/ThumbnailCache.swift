@@ -127,6 +127,28 @@ final class ThumbnailCache {
         return entries[wid]?.lastUpdatedAt ?? 0
     }
 
+    /// Read every cached thumbnail's pixels so macOS keeps the (downscaled,
+    /// <1MB) bitmaps resident — out of the memory compressor — while AltTab sits
+    /// idle. A cold panel show then composites them directly instead of faulting
+    /// ~130 compressed bitmaps in the first frame (the ~500ms cold-paint cost).
+    /// MUST be called off the main thread; reads are serial with an autorelease
+    /// pool so transient copies don't accumulate. No manual memory / mlock — just
+    /// touches the pages so the LRU keeps them hot. Cheap (~1ms each).
+    func touchForResidency() {
+        lock.lock()
+        let images: [CGImage] = entries.values.compactMap {
+            if case let .cgImage(img)? = $0.thumbnail { return img }
+            return nil
+        }
+        lock.unlock()
+        guard !images.isEmpty else { return }
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        for img in images {
+            autoreleasepool { _ = img.dataProvider?.data }
+        }
+        Diagnostics.log("RESIDENCY", String(format: "touched %d thumbnails in %.0fms", images.count, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000))
+    }
+
     /// Current tier for a window, or nil if not registered. Used by the
     /// capture completion to decide whether to keep a live IOSurface (hot)
     /// or detach into a malloc-backed bitmap (warm/cold).

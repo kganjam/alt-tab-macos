@@ -24,6 +24,7 @@ final class BackgroundThumbnailRefresher {
     private var timer: DispatchSourceTimer?
     private var tierRecomputeCounter = 0
     private var reconcileCounter = 0
+    private var residencyTouchCounter = 0
     /// Hot-tier wids from the last `recomputeTiers`, reused by `register` so
     /// new-window registration doesn't re-sort the whole window list each time
     /// (O(n log n) per window → O(n² log n) during a discovery burst). Touched
@@ -106,6 +107,17 @@ final class BackgroundThumbnailRefresher {
         // Panel-open: the in-panel `visibleThumbnailRefreshTimer` (1200ms
         // default) takes over. Skip to avoid double-refreshing.
         if App.appIsBeingUsed { return }
+
+        // Keep the small downscaled thumbnails resident while idle so a cold
+        // panel show composites them directly instead of faulting ~130
+        // memory-compressed bitmaps in the first frame (the ~500ms cold cost).
+        // Every ~15s, dispatched off this serial queue so the read (~130ms)
+        // doesn't delay the capture cadence.
+        residencyTouchCounter += 1
+        if residencyTouchCounter >= 30 {
+            residencyTouchCounter = 0
+            DispatchQueue.global(qos: .utility).async { ThumbnailCache.shared.touchForResidency() }
+        }
 
         // Post-selection pause: catches the case where the user has
         // committed an alt-tab choice but the OS is still settling the
