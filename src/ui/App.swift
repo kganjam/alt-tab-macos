@@ -804,11 +804,16 @@ class App: AppCenterApplication {
                 FocusOverlay.dismiss()
             }
         }
-        // For Parallels-involved transitions: raise the target FIRST
-        // while the switcher panel (L101) acts as a "curtain" covering
-        // everything. The target renders underneath. Then dismiss the
-        // panel after a short delay — target is already in place.
+        // For Parallels-involved transitions: dismiss the panel immediately
+        // (no curtain — the user prefers an instant hide even if the guest
+        // flashes briefly while it renders) and raise the target. The
+        // scheduleParHideUi settle-loop below still runs: it keeps
+        // re-asserting the guest z-order and tears the session down once the
+        // handoff is stable. We only flip the panel from a visible curtain to
+        // invisible — appIsBeingUsed stays true through the settle exactly as
+        // before, so the re-assertion logic is unchanged.
         if isParInvolved {
+            hideTilesPanelWithoutChangingKeyWindow()
             if MissionControl.state() == .inactive || MissionControl.state() == .showDesktop {
                 Diagnostics.markSwitchPhase("preFocus", extra: "par=true")
                 selectedWindow.focus()
