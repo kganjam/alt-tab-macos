@@ -354,6 +354,16 @@ class Windows {
         windowBirthsByWid = windowBirthsByWid.filter { now - $0.value.createdAt < 30 }
     }
 
+    /// True iff `pid` created at least one window at or after `since`. Used to
+    /// tell a click that legitimately opened a new window in another (Parallels
+    /// Coherence) process from a genuine click-misroute: the former must NOT be
+    /// "repaired" by stealing focus back to the clicked window, or the
+    /// brand-new window vanishes behind it within <1s.
+    static func pidCreatedWindowSince(_ pid: pid_t, since: CFAbsoluteTime) -> Bool {
+        windowBirthLock.lock(); defer { windowBirthLock.unlock() }
+        return windowBirthsByWid.contains { $0.value.pid == pid && $0.value.createdAt >= since }
+    }
+
     private static func windowBirth(wid: CGWindowID) -> WindowBirth? {
         windowBirthLock.lock()
         let birth = windowBirthsByWid[wid]
@@ -1978,6 +1988,22 @@ class Windows {
               let target = list.first(where: { $0.cgWindowId == targetWid }),
               target.application.pid != app.pid else { return false }
         guard recentZOrderIntents.last?.wid == targetWid else { return false }
+        // A recent user click in a Parallels Coherence window means this
+        // activation is most likely a NEW window the click opened in another
+        // guest proxy pid (Parallels hosts a freshly-opened Windows window in a
+        // different process), not a stale spontaneous re-raise. Countering it
+        // would steal focus back to the alt-tab target and bury the brand-new
+        // window within <1s. Genuine stale re-raises follow a keyboard alt-tab
+        // with no recent click. We key off the click, not the window birth,
+        // because COUNTER fires on the activation event — before the zOrderCache
+        // poll has recorded the new window (the birth lands ~1ms too late here).
+        if now - lastMouseClickTime < 1.5,
+           lastMouseClickPid != app.pid,
+           let clicked = list.first(where: { $0.cgWindowId == lastMouseClickWid }),
+           clicked.application.isParallelsCoherence {
+            Diagnostics.log("COUNTER", "suppressed: recent click in Coherence wid=#\(lastMouseClickWid) pid=\(lastMouseClickPid) → activation pid=\(app.pid) is a user-opened new window, not a stale re-raise")
+            return false
+        }
         guard counterRaiseCount < maxCounterRaises else {
             Diagnostics.log("COUNTER", "stale Parallels \(reason) suppressed after limit pid=\(app.pid) wid=#\(wid ?? 0) target=\(target.debugId ?? "?")")
             return true

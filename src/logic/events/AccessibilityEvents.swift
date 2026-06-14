@@ -149,6 +149,17 @@ class AccessibilityEvents {
         Diagnostics.log("XPROC", "click-misroute (+\(Int(dt*1000))ms): clicked wid=\(Windows.lastMouseClickWid) pid=\(Windows.lastMouseClickPid) (\(Windows.lastMouseClickOwner)) but activated pid=\(activatedPid) (\(activatedApp.bundleIdentifier?.suffix(40) ?? "?"))")
         guard let clickedWindow = Windows.list.first(where: { $0.cgWindowId == Windows.lastMouseClickWid }),
               clickedWindow.application.isParallelsCoherence else { return }
+        // If the activated process opened a NEW window since the click, the
+        // click legitimately spawned that window (e.g. opening a dialog out of
+        // Windows Settings, which Parallels hosts in a different guest-proxy
+        // pid) — this is not a misroute. Restoring focus to the clicked window
+        // here would steal focus from, and bury, the brand-new window, making
+        // it vanish within <1s. Only repair genuine render-hang misroutes,
+        // where the activated app brings an EXISTING window forward.
+        if Windows.pidCreatedWindowSince(activatedPid, since: Windows.lastMouseClickTime - 0.3) {
+            Diagnostics.log("XPROC", "click-misroute repair suppressed: activated pid=\(activatedPid) opened a new window since the click (legitimate new window, not a misroute)")
+            return
+        }
         Windows.restoreFrontmostToTarget(targetWid: Windows.lastMouseClickWid, targetPid: Windows.lastMouseClickPid, frontPid: activatedPid, source: "XPROC", bypassThrottle: true)
     }
 
