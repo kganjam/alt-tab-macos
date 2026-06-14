@@ -2962,12 +2962,15 @@ class Windows {
         if let pid = ownerPidForCGWindow(wid), let app = Applications.findOrCreate(pid, false) {
             Applications.manuallyUpdateWindows(app)  // direct call bypasses appListUpdateThrottler
         }
-        retryFocusWindowById(wid, attemptsLeft: 24)  // ~24 × 25ms ≈ 600ms ceiling
+        // Generous ceiling: a many-window app (e.g. ~90-window Safari) can take
+        // longer than half a second to finish discovery; giving up early left
+        // the new window unfocused.
+        retryFocusWindowById(wid, attemptsLeft: 80)  // ~80 × 25ms ≈ 2s ceiling
     }
 
     private static func retryFocusWindowById(_ wid: CGWindowID, attemptsLeft: Int) {
         if let window = list.first(where: { $0.cgWindowId == wid }) {
-            Diagnostics.log("CLI", "on-demand focus wid=#\(wid) (after \(24 - attemptsLeft) retries)")
+            Diagnostics.log("CLI", "on-demand focus wid=#\(wid) (after \(80 - attemptsLeft) retries)")
             window.focus()
             return
         }
