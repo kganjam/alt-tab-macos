@@ -206,12 +206,18 @@ class TileView: FlippedView {
         )
         if !thumbnail.isHidden {
             if let screenshot = element.thumbnail {
-                let thumbnailSize = TileView.thumbnailSize(element.size, false)
-                thumbnail.updateContents(screenshot, thumbnailSize)
+                // Render the cached thumbnail directly. It was decompressed
+                // off-main during the display delay (`preDecompressForShow`), so
+                // it's resident → cheap to composite even after a long idle.
+                thumbnail.updateContents(screenshot, TileView.thumbnailSize(element.size, false))
             } else {
-                // if no thumbnail, show appIcon instead
-                let thumbnailSize = TileView.thumbnailSize(element.icon?.size(), true)
-                thumbnail.updateContents(.cgImage(element.icon), thumbnailSize)
+                // No thumbnail captured yet: app icon, sized to the window's
+                // thumbnail dimensions (when known) so the tile keeps its size and
+                // doesn't resize/shift/overlap when the real screenshot lands.
+                let size = element.size != nil
+                    ? TileView.thumbnailSize(element.size, false)
+                    : TileView.thumbnailSize(element.icon?.size(), true)
+                thumbnail.updateContents(.cgImage(element.icon), size)
             }
         }
         let title = getAppOrAndWindowTitle()

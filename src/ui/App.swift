@@ -822,27 +822,27 @@ class App: AppCenterApplication {
             }
             scheduleParHideUi(targetWid: targetWid, targetPid: selectedWindow.application.pid, targetTitle: selectedWindow.title, sourceIsPar: sourceIsPar, targetIsPar: targetIsPar, captureToken: focusCaptureToken)
         } else {
-            // Non-Parallels: focus FIRST, then dismiss the panel. Prior
-            // order called hideUi(true) synchronously (~25-75ms on the
-            // event-tap teardown path), so SLPS didn't fire until after
-            // the panel had already disappeared and the previous frontmost
-            // briefly re-rendered. Reordering pushes SLPS to t=0, hides
-            // the panel afterward — the popUpMenu-level TilesPanel keeps
-            // the visual curtain up while the target raises beneath it.
-            // Same logic the Parallels branch above already relies on.
+            // Non-Parallels, NO curtain: dismiss the panel immediately, then
+            // focus the target on the next runloop tick (after the order-out has
+            // composited) so the disappearance is instant. Trade-off: the previous
+            // frontmost may show for the brief moment before the target raises —
+            // the "curtain" used to cover that, but it cost ~100-170ms of
+            // perceived hide latency, which the user prefers to avoid.
+            Diagnostics.markSwitchPhase("preHideUi")
+            hideUi(true)
             if MissionControl.state() == .inactive || MissionControl.state() == .showDesktop {
-                Diagnostics.markSwitchPhase("preFocus", extra: "par=false")
-                selectedWindow.focus()
-                Diagnostics.scheduleFocusInvariantChecks(target: selectedWindow, sourceWid: sessionSourceWid, generation: Windows.currentZOrderFocusGeneration(), label: "post-focus native")
-                if Preferences.cursorFollowFocus == .always || (
-                    Preferences.cursorFollowFocus == .differentScreen && (Spaces.screenSpacesMap.first { $0.value.contains { space in selectedWindow.spaceIds.contains(space) } })?.key != NSScreen.active()?.cachedUuid()) {
-                    moveCursorToSelectedWindow(selectedWindow)
+                DispatchQueue.main.async {
+                    Diagnostics.markSwitchPhase("preFocus", extra: "par=false")
+                    selectedWindow.focus()
+                    Diagnostics.scheduleFocusInvariantChecks(target: selectedWindow, sourceWid: sessionSourceWid, generation: Windows.currentZOrderFocusGeneration(), label: "post-focus native")
+                    if Preferences.cursorFollowFocus == .always || (
+                        Preferences.cursorFollowFocus == .differentScreen && (Spaces.screenSpacesMap.first { $0.value.contains { space in selectedWindow.spaceIds.contains(space) } })?.key != NSScreen.active()?.cachedUuid()) {
+                        moveCursorToSelectedWindow(selectedWindow)
+                    }
                 }
             } else {
                 PreviewPanel.shared.orderOut(nil)
             }
-            Diagnostics.markSwitchPhase("preHideUi")
-            hideUi(true)
         }
     }
 

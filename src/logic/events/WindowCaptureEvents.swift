@@ -442,16 +442,40 @@ enum ThumbnailBitmap {
     private static let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
 
     /// Detach an (often IOSurface-backed) CGImage by drawing it into a
-    /// malloc-backed bitmap context and snapshotting that.
+    /// malloc-backed bitmap context and snapshotting that — DOWNSCALED to the
+    /// largest on-screen thumbnail size. The private CGSHWCaptureWindowList path
+    /// returns windows at native resolution (often several MB each), which is
+    /// what makes the cached bitmaps slow to fault/upload on a cold show and
+    /// heavy enough that macOS compresses them. Downscaling to display size cuts
+    /// each from ~MBs to ~100KB: cheap to decompress, small enough to keep
+    /// resident, with no visible quality loss (never shown larger than this).
     static func detachedCopy(of cgImage: CGImage) -> CGImage? {
-        let width = cgImage.width, height = cgImage.height
+        let (width, height) = displaySize(cgImage.width, cgImage.height)
         guard width > 0, height > 0,
               let ctx = CGContext(data: nil, width: width, height: height,
                                   bitsPerComponent: 8, bytesPerRow: 0,
                                   space: CGColorSpaceCreateDeviceRGB(),
                                   bitmapInfo: bitmapInfo) else { return nil }
+        ctx.interpolationQuality = .medium
         ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
         return ctx.makeImage()
+    }
+
+    /// Target pixel size for a stored thumbnail: the full-resolution capture
+    /// scaled to fit the largest on-screen thumbnail (points) at retina (2×),
+    /// preserving aspect. Reads `TilesPanel.maxPossibleThumbnailSize` (set on
+    /// main at layout; a stale read just yields a slightly different cap). Uses a
+    /// fixed 2× rather than `NSScreen` since this runs off the main thread.
+    private static func displaySize(_ srcW: Int, _ srcH: Int) -> (Int, Int) {
+        guard srcW > 0, srcH > 0 else { return (0, 0) }
+        // Cap at the on-screen thumbnail size (×2 for retina) AND an absolute
+        // 512px long edge, so a handful of large windows can't bloat the cache.
+        // 512×512×4 ≈ 1MB worst case per thumbnail; ~130 windows ≈ <150MB total.
+        let maxNS = TilesPanel.maxPossibleThumbnailSize
+        let maxW = min((maxNS.width > 1 ? maxNS.width : 256) * 2, 512)
+        let maxH = min((maxNS.height > 1 ? maxNS.height : 256) * 2, 512)
+        let ratio = min(1.0, maxW / CGFloat(srcW), maxH / CGFloat(srcH))
+        return (max(1, Int((CGFloat(srcW) * ratio).rounded())), max(1, Int((CGFloat(srcH) * ratio).rounded())))
     }
 
     /// Detach an IOSurface-backed `CVPixelBuffer` (SCK output, 32BGRA) into a
@@ -469,13 +493,19 @@ enum ThumbnailBitmap {
                                   bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
                                   space: CGColorSpaceCreateDeviceRGB(),
                                   bitmapInfo: bitmapInfo) else { return nil }
-        return ctx.makeImage()
+        // downscale to display size so SCK thumbnails are also small
+        return ctx.makeImage().flatMap { detachedCopy(of: $0) }
     }
 
     /// Keep the live surface for hot-tier (and all non-background) captures;
     /// detach warm/cold background captures. Safe to call from any thread.
     static func shouldDetach(_ source: RefreshCausedBy, wid: CGWindowID) -> Bool {
-        guard RuntimeFlags.bgThumbnailDetachNonHotTier, source == .backgroundPeriodic else { return false }
-        return ThumbnailCache.shared.tier(wid: wid) != .hot
+        // Always detach: every capture is immediately copied into a small,
+        // display-sized, wired (mlock'd) bitmap and the WindowServer capture
+        // IOSurface is released. This (a) means no live capture surfaces are ever
+        // held → no WSIOSurfaceDebugTallyAndAbort risk, (b) keeps memory tiny
+        // (~display-size × window-count instead of full-res), and (c) keeps the
+        // bitmap resident so the first frame after idle composites it instantly.
+        return true
     }
 }
