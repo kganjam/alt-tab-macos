@@ -1351,6 +1351,7 @@ class App: AppCenterApplication {
         Windows.startZOrderCache()
         SpacesEvents.observe()
         ScreensEvents.observe()
+        SleepWakeEvents.observe()
         SystemAppearanceEvents.observe()
         SystemScrollerStyleEvents.observe()
         InputSourceEvents.observe()
