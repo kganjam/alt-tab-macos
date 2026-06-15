@@ -115,6 +115,13 @@ if [ "$MODE" = "dev" ]; then
     mv "$APP_DIR/Contents/MacOS/AltTab" "$DEV_DYLIB"
     codesign --force --sign "$SIGN_ID" --options runtime --timestamp=none "$DEV_DYLIB"
     echo "  dev dylib cdhash: $(codesign -dvvv "$DEV_DYLIB" 2>&1 | awk -F= '/^CDHash=/{print $2; exit}')"
+    # The dylib has been extracted; the leftover .app shell in DerivedData is a
+    # broken bundle (no main Mach-O) that Spotlight/LaunchServices still indexes,
+    # cluttering search with a phantom AltTab. Remove it (install mode does the
+    # same via `rm -rf "$APP_DIR"`). The next build relinks it as needed.
+    LSREG=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
+    "$LSREG" -u "$APP_DIR" 2>/dev/null || true
+    rm -rf "$APP_DIR"
     # LaunchServices owns the long-running process. A direct background exec
     # from this script can receive SIGHUP/terminate when the wrapper exits,
     # leaving AltTab dead after a successful dev build. Use launchctl to pass
