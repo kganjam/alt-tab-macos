@@ -112,6 +112,13 @@ class Applications {
     /// Wall-clock of the last auto-recovery restart, to cap restarts to one per
     /// cooldown even if the bridge stays dead.
     private static var axLastRecoveryAt: CFAbsoluteTime = 0
+    /// Captured ~process-launch (first access is early in startup). A fresh
+    /// launch's AX connection can take a while to settle — especially right after
+    /// an install or a permission re-grant — so we don't run recovery until the
+    /// process has been up past this grace, to never mistake a slow settle for a
+    /// dead bridge.
+    private static let axArmedAt = CFAbsoluteTimeGetCurrent()
+    private static let axStartupGraceSec: CFAbsoluteTime = 120
 
     /// Detect and recover from a dead accessibility↔WindowServer bridge — the
     /// state a WindowServer crash leaves when it respawns WITHOUT tearing down the
@@ -126,6 +133,11 @@ class Applications {
     /// self-restart is the supported equivalent. Call on the main thread on a slow
     /// cadence (the 30s reconcile).
     static func recoverFromDeadAxBridgeIfNeeded() {
+        // Startup grace: don't mistake a fresh launch's still-settling AX
+        // connection (e.g. right after install / a permission re-grant) for a
+        // dead bridge. A genuine dead bridge persists indefinitely, so a 2-min
+        // delay costs nothing real.
+        guard CFAbsoluteTimeGetCurrent() - axArmedAt > axStartupGraceSec else { return }
         // Cheap early-out: if AltTab sees any real window, the bridge is alive.
         guard !Windows.list.contains(where: { !$0.isWindowlessApp }) else { axDeadBridgeChecks = 0; return }
         // Must be AX-trusted: otherwise this is a permissions problem (App.restart
@@ -151,6 +163,9 @@ class Applications {
         }
         axLastRecoveryAt = now
         axDeadBridgeChecks = 0
+        // Always-on log (not gated by the diagnostics flag) so an auto-restart is
+        // always auditable in the per-process log.
+        Logger.error { "dead AX bridge detected (kAXWindows empty for all windowed apps while AX trusted) — restarting AltTab to re-acquire a fresh session connection" }
         Diagnostics.log("AXHEALTH", "restarting AltTab to re-acquire a fresh AX/WindowServer session connection (dead-bridge recovery)")
         App.restart()
     }
