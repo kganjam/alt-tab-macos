@@ -13,12 +13,18 @@ class AboutTab {
         let appText = StackView([
             BoldLabel(App.name),
             NSTextField(wrappingLabelWithString: NSLocalizedString("Version", comment: "") + " " + App.version),
+            { () -> NSTextField in
+                let l = NSTextField(wrappingLabelWithString: App.loadedDylibInfo)
+                l.font = NSFont.monospacedSystemFont(ofSize: 9, weight: .regular)
+                l.textColor = .secondaryLabelColor
+                return l
+            }(),
             NSTextField(wrappingLabelWithString: App.licence),
             HyperlinkLabel(NSLocalizedString("Source code repository", comment: ""), App.repository),
             HyperlinkLabel(NSLocalizedString("Latest releases", comment: ""), App.repository + "/releases"),
         ], .vertical)
         appText.spacing = GridView.interPadding / 2
-        let rowToSeparate = 3
+        let rowToSeparate = 4
         appText.views[rowToSeparate].topAnchor.constraint(equalTo: appText.views[rowToSeparate - 1].bottomAnchor, constant: GridView.interPadding).isActive = true
         let appInfo = NSStackView(views: [appIcon, appText])
         appIcon.translatesAutoresizingMaskIntoConstraints = false

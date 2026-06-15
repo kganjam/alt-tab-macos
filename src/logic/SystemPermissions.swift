@@ -13,6 +13,25 @@ class SystemPermissions {
         setImmediateTimer()
         timer.resume()
         startStuckAuthPopupWatcher()
+        observeReactivationForScreenRecordingGrant()
+    }
+
+    /// Screen Recording can't go green live the way Accessibility does, because
+    /// `CGPreflightScreenCaptureAccess` is cached for the process lifetime — so
+    /// after the user grants it, AltTab keeps capture gated off and the user has
+    /// to quit/reopen. We can't fix that by polling (the prompting probe is what
+    /// produced the historical 50–90 stacked auth dialogs, which is why it's
+    /// cooldown-throttled). Instead, detect the grant event-driven: when AltTab
+    /// is re-activated — i.e. the user likely just came back from System Settings
+    /// — permit exactly ONE probe and run a check now. One probe per return trip,
+    /// never a storm. Once `status` flips to `.granted` the capture gate opens and
+    /// thumbnails resume without a restart.
+    private static func observeReactivationForScreenRecordingGrant() {
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+            guard ScreenRecordingPermission.status == .notGranted else { return }
+            ScreenRecordingPermission.allowOneProbeNow()
+            setImmediateTimer()
+        }
     }
 
     // MARK: - Stuck-popup watcher
@@ -209,6 +228,19 @@ class ScreenRecordingPermission {
     static var status = PermissionStatus.notGranted
     private static var lastKnownStatus = PermissionStatus.notGranted
     private static var nextPromptingProbeAt = CFAbsoluteTimeGetCurrent() + 300
+
+    /// Permit ONE prompting probe on the next permission tick, bypassing the
+    /// anti-storm cooldown. Called event-driven (on AltTab re-activation, i.e.
+    /// the user likely just returned from granting Screen Recording in System
+    /// Settings) so a fresh grant is picked up promptly — exactly one probe, not
+    /// the repeated polling that produced the historical 50–90 stacked auth
+    /// dialogs. `CGPreflightScreenCaptureAccess` is cached for the process
+    /// lifetime, so this re-probe (via SCShareableContent) is the only way to
+    /// notice a grant without a quit/reopen; once `status` flips to `.granted`
+    /// the capture gate opens and thumbnails resume.
+    static func allowOneProbeNow() {
+        nextPromptingProbeAt = CFAbsoluteTimeGetCurrent()
+    }
 
     @discardableResult
     static func update() -> PermissionStatus {

@@ -24,6 +24,34 @@ class App: AppCenterApplication {
         let buildDate = "BUILD_DATE_PLACEHOLDER" // updated by build script
         return "CUSTOM BUILD (\(buildDate)) — base:\(bundleVersion)"
     }()
+
+    /// Path of the actually-loaded AltTabCore.dylib and when it was built on
+    /// disk. With the dev-override mechanism (ALTTAB_DYLIB_OVERRIDE) the running
+    /// code can come from an external dylib rather than the one inside the
+    /// bundle — so a new build is picked up WITHOUT re-installing the bundle,
+    /// which means TCC (Accessibility / Screen Recording) is never re-prompted.
+    /// Shown under the version line in About so it's unambiguous which build is
+    /// live and from where. Kept separate from `version` (which is used for
+    /// version comparisons in PreferencesMigrations and must stay a bare value).
+    static let loadedDylibInfo: String = {
+        var dylibPath: String? = nil
+        for i in 0..<_dyld_image_count() {
+            if let c = _dyld_get_image_name(i) {
+                let p = String(cString: c)
+                if p.hasSuffix("AltTabCore.dylib") { dylibPath = p; break }
+            }
+        }
+        guard let dylibPath else { return "loaded dylib: (statically linked / unknown)" }
+        let isOverride = !(ProcessInfo.processInfo.environment["ALTTAB_DYLIB_OVERRIDE"] ?? "").isEmpty
+        var built = "?"
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: dylibPath),
+           let mtime = attrs[.modificationDate] as? Date {
+            let f = DateFormatter()
+            f.dateFormat = "yyyy-MM-dd HH:mm"
+            built = f.string(from: mtime)
+        }
+        return "loaded dylib (\(isOverride ? "external override" : "in-bundle"), built \(built)):\n\(dylibPath)"
+    }()
     static let licence = Bundle.main.object(forInfoDictionaryKey: "NSHumanReadableCopyright") as! String
     static let repository = "https://github.com/lwouis/alt-tab-macos"
     static let website = "https://alt-tab.app"
