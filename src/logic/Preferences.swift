@@ -53,7 +53,7 @@ class Preferences {
             "captureWindowsInBackground": "true",
             "thumbnailCaptureEnabled": "true",
             "thumbnailCaptureSettleGateEnabled": "true",
-            "thumbnailUseScreenCaptureKit": "false",
+            "thumbnailUseScreenCaptureKit": "true",
             "visibleThumbnailRefreshIntervalMs": "1200",
             "thumbnailCaptureFocusSettleGateMs": "3000",
             "bgThumbnailRefreshEnabled": "true",
@@ -471,7 +471,12 @@ enum RuntimeFlags {
     static var diagnosticsBasicPerfOnly: Bool { bool("diagnosticsBasicPerfOnly", default: false) }
     static var thumbnailCaptureEnabled: Bool { bool("thumbnailCaptureEnabled", default: true) }
     static var thumbnailCaptureSettleGateEnabled: Bool { bool("thumbnailCaptureSettleGateEnabled", default: true) }
-    static var thumbnailUseScreenCaptureKit: Bool { bool("thumbnailUseScreenCaptureKit", default: false) }
+    // Default ON: routes native-window thumbnail captures through ScreenCaptureKit
+    // instead of the private CGSHWCaptureWindowList API. CGS feeds WindowServer's
+    // per-client capture-IOSurface tally (WSIOSurfaceDebugTallyAndAbort self-abort);
+    // SCK uses a different server path that doesn't. Only Parallels Coherence and
+    // minimized windows still need CGS (see Windows.refreshThumbnailsAsync).
+    static var thumbnailUseScreenCaptureKit: Bool { bool("thumbnailUseScreenCaptureKit", default: true) }
     static var visibleThumbnailRefreshIntervalMs: Int { int("visibleThumbnailRefreshIntervalMs", default: 1200) }
     static var thumbnailCaptureFocusSettleGateMs: Int { int("thumbnailCaptureFocusSettleGateMs", default: 3000) }
     static var focusOverlayCaptureEnabled: Bool { bool("focusOverlayCaptureEnabled", default: true) }

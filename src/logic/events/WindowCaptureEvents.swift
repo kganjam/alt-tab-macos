@@ -120,6 +120,7 @@ class WindowCaptureScreenshots {
         let window = request.window
         let config = SCStreamConfiguration.forWindow(size: request.size, scaleFactor: request.scaleFactor, false)
         let filter = SCContentFilter(desktopIndependentWindow: scWindow)
+        CaptureBackendCounters.countSck()
         let captureToken = ActiveWindowCaptures.begin()
         SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { sampleBuffer, error in
             ActiveWindowCaptures.end(captureToken)
@@ -195,6 +196,7 @@ class WindowCaptureScreenshotsPrivateApi {
         guard !App.isTerminating else { return nil }
         // we use CGSHWCaptureWindowList because it can screenshot minimized windows, which CGWindowListCreateImage can't
         var windowId_ = wid
+        CaptureBackendCounters.countCgs()
         let captureToken = ActiveWindowCaptures.begin()
         defer { ActiveWindowCaptures.end(captureToken) }
         // CGSHWCaptureWindowList can return NULL (window vanished, or a Coherence/offscreen window
@@ -430,6 +432,26 @@ class ActiveWindowCaptures {
             inFlight = inFlight.filter { $0.value > cutoff }
         }
         return inFlight.count
+    }
+}
+
+/// Cumulative per-backend capture counters for the THUMBCACHE diagnostic line.
+/// The `cgs` count is the one that matters for the WindowServer crash: it's how
+/// many times AltTab has called the private CGSHWCaptureWindowList API, which
+/// feeds WindowServer's capture-IOSurface tally (WSIOSurfaceDebugTallyAndAbort).
+/// Watch its per-interval delta — with `thumbnailUseScreenCaptureKit` on it
+/// should be ~Coherence+minimized only, not the whole window set. A `cgs` rate
+/// that tracks the total window count means native captures are NOT going
+/// through ScreenCaptureKit (the SCK routing regressed).
+enum CaptureBackendCounters {
+    private static let lock = NSLock()
+    private static var cgs: UInt64 = 0
+    private static var sck: UInt64 = 0
+    static func countCgs() { lock.lock(); cgs &+= 1; lock.unlock() }
+    static func countSck() { lock.lock(); sck &+= 1; lock.unlock() }
+    static func snapshot() -> (cgs: UInt64, sck: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        return (cgs, sck)
     }
 }
 

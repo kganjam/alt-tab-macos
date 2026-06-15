@@ -215,7 +215,8 @@ final class BackgroundThumbnailRefresher {
         // a long session — that's the regression signal for the WindowServer surface-tally crash.
         DispatchQueue.main.async {
             if Diagnostics.shouldLog("THUMBCACHE") {
-                Diagnostics.log("THUMBCACHE", "windows=\(Windows.list.count) \(ThumbnailCache.shared.statsLine()) activeCaptures=\(ActiveWindowCaptures.value()) panelOpen=\(App.appIsBeingUsed)")
+                let captures = CaptureBackendCounters.snapshot()
+                Diagnostics.log("THUMBCACHE", "windows=\(Windows.list.count) \(ThumbnailCache.shared.statsLine()) activeCaptures=\(ActiveWindowCaptures.value()) cgsCaptures=\(captures.cgs) sckCaptures=\(captures.sck) panelOpen=\(App.appIsBeingUsed)")
             }
             Applications.removeZombieWindows()
         }

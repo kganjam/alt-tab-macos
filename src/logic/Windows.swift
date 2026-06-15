@@ -2246,17 +2246,30 @@ class Windows {
         // private API only for Parallels Coherence windows.
         let parallelsWindows = eligibleWindows.filter { $0.isParallelsCoherenceWindow }
         let nativeWindows = eligibleWindows.filter { !$0.isParallelsCoherenceWindow }
+        // `privateApiWindows` collects everything that must go through the
+        // private CGSHWCaptureWindowList API — the path that feeds WindowServer's
+        // capture-IOSurface tally (WSCaptureCreateIOSurfaceMachPortForWindowList →
+        // WSIOSurfaceDebugTallyAndAbort, the WindowServer self-abort crash). Keep
+        // this set as small as possible; everything else goes to ScreenCaptureKit,
+        // whose SCStream/replayd path does NOT hit that tally.
+        //   - Parallels Coherence: SCK sees only the empty shim NSWindow, not the
+        //     guest-rendered pixels, so it MUST use the private API.
+        //   - Minimized windows: frozen and off the macOS compositor, so SCK can't
+        //     capture them; fall back to the private API.
+        var privateApiWindows = parallelsWindows
         if !nativeWindows.isEmpty {
             if RuntimeFlags.thumbnailUseScreenCaptureKit, #available(macOS 14.0, *) {
-                WindowCaptureScreenshots.oneTimeScreenshots(nativeWindows, source)
+                let sckWindows = nativeWindows.filter { !$0.isMinimized }
+                privateApiWindows += nativeWindows.filter { $0.isMinimized }
+                if !sckWindows.isEmpty {
+                    WindowCaptureScreenshots.oneTimeScreenshots(sckWindows, source)
+                }
             } else {
-                WindowCaptureScreenshotsPrivateApi.oneTimeScreenshots(nativeWindows, source)
+                privateApiWindows += nativeWindows
             }
         }
-        if !parallelsWindows.isEmpty {
-            // Always private API for Parallels Coherence; SCK doesn't
-            // see the guest-rendered pixel content.
-            WindowCaptureScreenshotsPrivateApi.oneTimeScreenshots(parallelsWindows, source)
+        if !privateApiWindows.isEmpty {
+            WindowCaptureScreenshotsPrivateApi.oneTimeScreenshots(privateApiWindows, source)
         }
     }
 
