@@ -93,6 +93,23 @@ final class BackgroundThumbnailRefresher {
         ThumbnailCache.shared.unregister(wid: wid)
     }
 
+    /// Event-driven refresh for windows that just became active: a focus /
+    /// foreground change (alt-tab, click-to-focus, app activation). Pull each
+    /// window's next capture forward to now and promote it to the hot tier, so
+    /// the switcher shows a fresh image of what the user just used/left without
+    /// waiting out the periodic cadence. The actual capture still runs through
+    /// the tick's maxPerTick/maxConcurrent gate, so this can't burst the server.
+    /// Called with the focused window and the one it just displaced.
+    func noteRecentlyActive(_ windows: [Window]) {
+        guard RuntimeFlags.bgThumbnailRefreshEnabled else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        for window in windows {
+            guard let wid = window.cgWindowId else { continue }
+            ThumbnailCache.shared.setTier(wid: wid, tier: .hot)
+            ThumbnailCache.shared.bumpUp(wid: wid, to: now)
+        }
+    }
+
     // MARK: - Tick
 
     private func tick() {

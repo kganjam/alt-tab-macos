@@ -300,6 +300,10 @@ class AccessibilityEvents {
         App.noteObservedFocusedWindow(window.cgWindowId)
         if let windows = Windows.updateLastFocusOrder(window) {
             App.refreshOpenUiAfterExternalEvent(windows)
+            // Panel closed: refreshOpenUiAfterExternalEvent is a no-op, so pull a
+            // fresh background capture of the just-focused window (and the one it
+            // displaced) forward now instead of waiting out the periodic cadence.
+            BackgroundThumbnailRefresher.shared.noteRecentlyActive(windows)
         }
     }
 

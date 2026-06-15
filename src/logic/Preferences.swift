@@ -59,14 +59,14 @@ class Preferences {
             "bgThumbnailRefreshEnabled": "true",
             "bgThumbnailHotTierSize": "10",
             "bgThumbnailHotIntervalMs": "5000",
-            "bgThumbnailWarmIntervalMs": "60000",
+            "bgThumbnailWarmIntervalMs": "180000",
             "bgThumbnailColdIntervalMs": "300000",
             "bgThumbnailHotJitterMs": "1000",
             "bgThumbnailWarmJitterMs": "5000",
             "bgThumbnailColdJitterMs": "30000",
             "bgThumbnailReconcileMs": "30000",
             "bgThumbnailDetachNonHotTier": "true",
-            "bgThumbnailInitialMaxDelayMs": "3000",
+            "bgThumbnailInitialMaxDelayMs": "250",
             "bgThumbnailTickIntervalMs": "500",
             "bgThumbnailMaxPerTick": "10",
             "bgThumbnailMaxConcurrent": "4",
@@ -549,7 +549,11 @@ enum RuntimeFlags {
     static var bgThumbnailRefreshEnabled: Bool { bool("bgThumbnailRefreshEnabled", default: true) }
     static var bgThumbnailHotTierSize: Int { int("bgThumbnailHotTierSize", default: 10) }
     static var bgThumbnailHotIntervalMs: Int { int("bgThumbnailHotIntervalMs", default: 5000) }
-    static var bgThumbnailWarmIntervalMs: Int { int("bgThumbnailWarmIntervalMs", default: 60000) }
+    // Inactive (shown but not recently focused) windows refresh every 3 min. The
+    // in-panel timer refreshes whatever's visible on show, and recently-active
+    // windows are pulled forward event-driven (see noteRecentlyActive), so a slow
+    // background cadence here costs no visible staleness while cutting capture load.
+    static var bgThumbnailWarmIntervalMs: Int { int("bgThumbnailWarmIntervalMs", default: 180000) }
     static var bgThumbnailColdIntervalMs: Int { int("bgThumbnailColdIntervalMs", default: 300000) }
     static var bgThumbnailHotJitterMs: Int { int("bgThumbnailHotJitterMs", default: 1000) }
     static var bgThumbnailWarmJitterMs: Int { int("bgThumbnailWarmJitterMs", default: 5000) }
@@ -570,7 +574,11 @@ enum RuntimeFlags {
     /// Trade-off: warm/cold thumbnails fault+re-upload from compressed malloc on first paint
     /// after idle (slightly slower cold) instead of staying GPU-resident.
     static var bgThumbnailDetachNonHotTier: Bool { bool("bgThumbnailDetachNonHotTier", default: true) }
-    static var bgThumbnailInitialMaxDelayMs: Int { int("bgThumbnailInitialMaxDelayMs", default: 3000) }
+    // Near-immediate first capture: a newly discovered window gets its first
+    // thumbnail within ~this delay + one tick, so every window has at least one
+    // image ASAP. Kept small (not 0) only to spread a startup discovery burst;
+    // the tick's maxPerTick/maxConcurrent gate bounds it regardless.
+    static var bgThumbnailInitialMaxDelayMs: Int { int("bgThumbnailInitialMaxDelayMs", default: 250) }
     static var bgThumbnailTickIntervalMs: Int { int("bgThumbnailTickIntervalMs", default: 500) }
     static var bgThumbnailMaxPerTick: Int { int("bgThumbnailMaxPerTick", default: 10) }
     static var bgThumbnailMaxConcurrent: Int { int("bgThumbnailMaxConcurrent", default: 4) }
