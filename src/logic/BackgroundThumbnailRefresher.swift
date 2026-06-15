@@ -236,6 +236,9 @@ final class BackgroundThumbnailRefresher {
                 Diagnostics.log("THUMBCACHE", "windows=\(Windows.list.count) \(ThumbnailCache.shared.statsLine()) activeCaptures=\(ActiveWindowCaptures.value()) cgsCaptures=\(captures.cgs) sckCaptures=\(captures.sck) panelOpen=\(App.appIsBeingUsed)")
             }
             Applications.removeZombieWindows()
+            // Self-heal the AX↔WindowServer bridge if a WindowServer crash left it
+            // dead (every app's kAXWindows empty while windows demonstrably exist).
+            Applications.recoverFromDeadAxBridgeIfNeeded()
         }
     }
 

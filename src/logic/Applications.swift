@@ -103,6 +103,95 @@ class Applications {
         }
     }
 
+    // MARK: - Dead AX-bridge recovery
+
+    /// Consecutive 30s health checks that saw the dead-bridge fingerprint. We
+    /// require persistence so a transient empty Windows.list during startup can't
+    /// trigger a restart.
+    private static var axDeadBridgeChecks = 0
+    /// Wall-clock of the last auto-recovery restart, to cap restarts to one per
+    /// cooldown even if the bridge stays dead.
+    private static var axLastRecoveryAt: CFAbsoluteTime = 0
+
+    /// Detect and recover from a dead accessibility↔WindowServer bridge — the
+    /// state a WindowServer crash leaves when it respawns WITHOUT tearing down the
+    /// login session: every running process keeps a stale AX/CGS session
+    /// connection, so `kAXWindows` returns empty for ALL apps even though their
+    /// windows exist (CGWindowList still sees them) and Accessibility is granted.
+    /// AltTab's own window list goes empty as a result. The CGS side self-heals
+    /// (`CGS_CONNECTION` re-resolves per call); the AX side has no such hook, so
+    /// the only reliable fix is to relaunch — a fresh process gets a fresh session
+    /// connection (what a screen lock/unlock or logout does, but invisible). Lock/
+    /// unlock can't be automated (the unlock needs authentication), so a guarded
+    /// self-restart is the supported equivalent. Call on the main thread on a slow
+    /// cadence (the 30s reconcile).
+    static func recoverFromDeadAxBridgeIfNeeded() {
+        // Cheap early-out: if AltTab sees any real window, the bridge is alive.
+        guard !Windows.list.contains(where: { !$0.isWindowlessApp }) else { axDeadBridgeChecks = 0; return }
+        // Must be AX-trusted: otherwise this is a permissions problem (App.restart
+        // suppresses the respawn anyway), not a dead bridge.
+        guard AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeRetainedValue(): false] as CFDictionary) else {
+            axDeadBridgeChecks = 0; return
+        }
+        // The system must actually have windows for several regular apps — else
+        // "0 windows" is an empty desktop, not a broken bridge.
+        let windowedPids = regularAppPidsWithOnScreenWindows()
+        guard windowedPids.count >= 5 else { axDeadBridgeChecks = 0; return }
+        // Confirm the fingerprint directly: AX yields no windows for apps that
+        // demonstrably HAVE on-screen windows. One app returning 0 is normal, so
+        // require every probed app (capped, to bound cost) to be empty.
+        guard axReturnsNoWindowsForAllProbed(windowedPids) else { axDeadBridgeChecks = 0; return }
+        axDeadBridgeChecks += 1
+        Diagnostics.log("AXHEALTH", "dead-bridge suspected (\(axDeadBridgeChecks)): AltTab sees 0 windows; \(windowedPids.count) regular apps have on-screen windows but AX returns none for any probed")
+        guard axDeadBridgeChecks >= 2 else { return }  // ~60s of persistence
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - axLastRecoveryAt > 300 else {
+            Diagnostics.log("AXHEALTH", "dead-bridge persists but within 5-min cooldown — not restarting again")
+            return
+        }
+        axLastRecoveryAt = now
+        axDeadBridgeChecks = 0
+        Diagnostics.log("AXHEALTH", "restarting AltTab to re-acquire a fresh AX/WindowServer session connection (dead-bridge recovery)")
+        App.restart()
+    }
+
+    /// pids of regular (Dock-visible) apps that own ≥1 on-screen layer-0 window.
+    private static func regularAppPidsWithOnScreenWindows() -> Set<pid_t> {
+        let regularPids = Set(NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular }
+            .map { $0.processIdentifier })
+        guard !regularPids.isEmpty,
+              let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return [] }
+        var pids = Set<pid_t>()
+        for w in info {
+            guard (w[kCGWindowLayer as String] as? Int) == 0,
+                  let pid = w[kCGWindowOwnerPID as String] as? pid_t,
+                  regularPids.contains(pid) else { continue }
+            pids.insert(pid)
+        }
+        return pids
+    }
+
+    /// True iff every probed app (up to a small cap) returns an empty kAXWindows.
+    /// Short-circuits to false the moment any app's AX yields a window — that
+    /// proves the bridge is alive. Each probe uses a short messaging timeout so a
+    /// wedged bridge can't block the main thread for long.
+    private static func axReturnsNoWindowsForAllProbed(_ pids: Set<pid_t>) -> Bool {
+        var probed = 0
+        for pid in pids {
+            let appAx = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(appAx, 0.3)
+            var value: CFTypeRef?
+            let err = AXUIElementCopyAttributeValue(appAx, kAXWindowsAttribute as CFString, &value)
+            if err == .success, let windows = value as? [AXUIElement], !windows.isEmpty {
+                return false
+            }
+            probed += 1
+            if probed >= 5 { break }
+        }
+        return probed > 0
+    }
+
     /// we may not receive a window-destroyed event in some cases:
     /// * Sequoia bug: https://github.com/lwouis/alt-tab-macos/issues/3589
     /// * Logic Pro bug: https://github.com/lwouis/alt-tab-macos/issues/4924

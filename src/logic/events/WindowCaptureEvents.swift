@@ -123,37 +123,44 @@ class WindowCaptureScreenshots {
         CaptureBackendCounters.countSck()
         let captureToken = ActiveWindowCaptures.begin()
         SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { sampleBuffer, error in
-            ActiveWindowCaptures.end(captureToken)
-            guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
-            guard let sampleBuffer, error == nil else {
-                Logger.error { "\(window.debugId) \(sampleBuffer == nil) \(error)" }
-                BackgroundWork.screenshotsQueue.addOperation {
-                    invalidateCache(scWindow.windowID)
-                    WindowCaptureScreenshotsPrivateApi.oneTimeScreenshots([window], source)
-                }
-                return
-            }
-            guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
-            let pixelBuffer: CVPixelBuffer? = sampleBuffer.pixelBuffer() ?? sampleBuffer.imageBuffer
-            guard let pixelBuffer else { Logger.error { "\(window.debugId) no pixelBuffer" }; return }
-            // For non-hot background captures, detach into a malloc-backed
-            // bitmap here (off the main thread) so the WindowServer capture
-            // IOSurface is released rather than retained live in the cache.
-            let contents: CALayerContents
-            let liveSurface: Bool
-            if ThumbnailBitmap.shouldDetach(source, wid: scWindow.windowID),
-               let detached = ThumbnailBitmap.detachedCopy(of: pixelBuffer) {
-                contents = .cgImage(detached)
-                liveSurface = false // malloc-backed copy; the WindowServer IOSurface was released
-            } else {
-                contents = .pixelBuffer(pixelBuffer)
-                liveSurface = true // IOSurface-backed pixel buffer kept live in the cache
-            }
-            DispatchQueue.main.async {
+            // Drain the sample buffer / pixel buffer and its backing IOSurface at
+            // the end of this block. Dispatch/queue completion blocks don't reliably
+            // drain their autorelease pool per call, so without this the IOSurface
+            // lingers until the queue's pool happens to drain — the cumulative
+            // pressure behind WindowServer's IOSurface tally (and replayd growth).
+            autoreleasepool {
+                ActiveWindowCaptures.end(captureToken)
                 guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
+                guard let sampleBuffer, error == nil else {
+                    Logger.error { "\(window.debugId) \(sampleBuffer == nil) \(error)" }
+                    BackgroundWork.screenshotsQueue.addOperation {
+                        invalidateCache(scWindow.windowID)
+                        WindowCaptureScreenshotsPrivateApi.oneTimeScreenshots([window], source)
+                    }
+                    return
+                }
                 guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
-                if let window = (Windows.list.first { $0.cgWindowId == scWindow.windowID }) {
-                    window.refreshThumbnail(contents, liveSurface: liveSurface)
+                let pixelBuffer: CVPixelBuffer? = sampleBuffer.pixelBuffer() ?? sampleBuffer.imageBuffer
+                guard let pixelBuffer else { Logger.error { "\(window.debugId) no pixelBuffer" }; return }
+                // For non-hot background captures, detach into a malloc-backed
+                // bitmap here (off the main thread) so the WindowServer capture
+                // IOSurface is released rather than retained live in the cache.
+                let contents: CALayerContents
+                let liveSurface: Bool
+                if ThumbnailBitmap.shouldDetach(source, wid: scWindow.windowID),
+                   let detached = ThumbnailBitmap.detachedCopy(of: pixelBuffer) {
+                    contents = .cgImage(detached)
+                    liveSurface = false // malloc-backed copy; the WindowServer IOSurface was released
+                } else {
+                    contents = .pixelBuffer(pixelBuffer)
+                    liveSurface = true // IOSurface-backed pixel buffer kept live in the cache
+                }
+                DispatchQueue.main.async {
+                    guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
+                    guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
+                    if let window = (Windows.list.first { $0.cgWindowId == scWindow.windowID }) {
+                        window.refreshThumbnail(contents, liveSurface: liveSurface)
+                    }
                 }
             }
         }
@@ -165,27 +172,36 @@ class WindowCaptureScreenshotsPrivateApi {
         guard RuntimeFlags.thumbnailCaptureEnabled, App.thumbnailCaptureAllowed(source) else { return }
         for window in eligibleWindows {
             BackgroundWork.screenshotsQueue.addOperation { [weak window] in
-                guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
-                guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
-                guard let wid = window?.cgWindowId, let cgImage = oneTimeCapture(wid, source) else { return }
-                guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
-                guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
-                // Detach non-hot background captures off-main so the HW capture
-                // IOSurface (CGSHWCaptureWindowList output) is released.
-                let contents: CALayerContents
-                let liveSurface: Bool
-                if ThumbnailBitmap.shouldDetach(source, wid: wid),
-                   let detached = ThumbnailBitmap.detachedCopy(of: cgImage) {
-                    contents = .cgImage(detached)
-                    liveSurface = false // malloc-backed copy; the HW-capture IOSurface was released
-                } else {
-                    contents = .cgImage(cgImage)
-                    liveSurface = true // IOSurface-backed CGImage (CGSHWCaptureWindowList output) kept live
-                }
-                DispatchQueue.main.async { [weak window] in
+                // Drain the captured CGImage and its backing CGSHWCaptureWindowList
+                // IOSurface at the end of this block. OperationQueue blocks don't
+                // reliably drain their autorelease pool per call, so without this
+                // the IOSurface lingers (retained by the queue's pool) across many
+                // captures — the cumulative pressure behind WindowServer's
+                // WSIOSurfaceDebugTallyAndAbort. In the detached case the original
+                // surface is dead weight the moment detachedCopy returns.
+                autoreleasepool {
                     guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
                     guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
-                    window?.refreshThumbnail(contents, liveSurface: liveSurface)
+                    guard let wid = window?.cgWindowId, let cgImage = oneTimeCapture(wid, source) else { return }
+                    guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
+                    guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
+                    // Detach non-hot background captures off-main so the HW capture
+                    // IOSurface (CGSHWCaptureWindowList output) is released.
+                    let contents: CALayerContents
+                    let liveSurface: Bool
+                    if ThumbnailBitmap.shouldDetach(source, wid: wid),
+                       let detached = ThumbnailBitmap.detachedCopy(of: cgImage) {
+                        contents = .cgImage(detached)
+                        liveSurface = false // malloc-backed copy; the HW-capture IOSurface was released
+                    } else {
+                        contents = .cgImage(cgImage)
+                        liveSurface = true // IOSurface-backed CGImage (CGSHWCaptureWindowList output) kept live
+                    }
+                    DispatchQueue.main.async { [weak window] in
+                        guard App.thumbnailCaptureAllowed(source, logBlocked: false) else { return }
+                        guard !source.requiresOpenPanel || App.appIsBeingUsed else { return }
+                        window?.refreshThumbnail(contents, liveSurface: liveSurface)
+                    }
                 }
             }
         }
