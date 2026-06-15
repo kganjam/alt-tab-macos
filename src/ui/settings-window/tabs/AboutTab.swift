@@ -15,7 +15,7 @@ class AboutTab {
             NSTextField(wrappingLabelWithString: NSLocalizedString("Version", comment: "") + " " + App.version),
             { () -> NSTextField in
                 let l = NSTextField(wrappingLabelWithString: App.loadedDylibInfo)
-                l.font = NSFont.monospacedSystemFont(ofSize: 9, weight: .regular)
+                l.font = NSFont.userFixedPitchFont(ofSize: 9) ?? NSFont.systemFont(ofSize: 9)
                 l.textColor = .secondaryLabelColor
                 return l
             }(),
