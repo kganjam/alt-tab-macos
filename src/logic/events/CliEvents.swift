@@ -99,15 +99,32 @@ class CliServer {
             Windows.focusWindowByIdOnDemand(id)
             return noOutput
         }
+        if rawValue.hasPrefix("--newest-wid=") {
+            // Current highest on-screen wid of an app bundle (no focus). A scratch
+            // helper reads this as a baseline BEFORE creating a window, then passes
+            // it to --focus-newest=<bundle>:<wid>.
+            let bundleId = String(rawValue.dropFirst("--newest-wid=".count))
+            guard let pid = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundleId })?.processIdentifier else {
+                return error
+            }
+            return JsonNewestWid(newestWindowId: Windows.currentNewestWindowId(forPid: pid))
+        }
         if rawValue.hasPrefix("--focus-newest=") {
             // Focus the newest window of an app bundle, discovering it on-demand.
             // Lets a "open a new window" helper do: create window -> one CLI call,
             // with no polling — AltTab finds the just-created window itself and
             // reports the app that was frontmost (so the caller can restore it
             // when the new window closes).
-            let bundleId = String(rawValue.dropFirst("--focus-newest=".count))
+            // Optional ":<minWid>" baseline (captured via --newest-wid BEFORE the
+            // window is created) makes AltTab wait for a window strictly newer than
+            // minWid, so a slow-to-register window (e.g. Finder, ~50ms) is fronted
+            // the instant it appears, never a pre-existing one — no caller sleep.
+            let arg = String(rawValue.dropFirst("--focus-newest=".count))
+            let parts = arg.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+            let bundleId = String(parts[0])
+            let minWid = parts.count > 1 ? (CGWindowID(String(parts[1])) ?? 0) : 0
             guard let pid = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundleId })?.processIdentifier,
-                  let newWid = Windows.newestWindowId(forPid: pid) else {
+                  let newWid = Windows.newestWindowId(forPid: pid, newerThan: minWid) else {
                 return error
             }
             let prevBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
@@ -173,6 +190,10 @@ class CliServer {
         var previousFrontmostBundleId: String
     }
 
+    private struct JsonNewestWid: Codable {
+        var newestWindowId: CGWindowID
+    }
+
     private struct JsonWindowList: Codable {
         var windows: [JsonWindow]
     }
@@ -224,7 +245,7 @@ class CliClient {
     static func detectCommand() -> String? {
         let args = CommandLine.arguments
         if args.count == 2 && !args[1].starts(with: "--logs=") {
-            if args[1] == "--list" || args[1] == "--detailed-list" || args[1] == "--selection-state" || args[1] == "--hide" || args[1] == "--focus-target" || args[1].hasPrefix("--select=") || args[1].hasPrefix("--select-index=") || args[1].hasPrefix("--select-and-focus=") || args[1].hasPrefix("--focus=") || args[1].hasPrefix("--focus-newest=") || args[1].hasPrefix("--focusUsingLastFocusOrder=") || args[1].hasPrefix("--show=") {
+            if args[1] == "--list" || args[1] == "--detailed-list" || args[1] == "--selection-state" || args[1] == "--hide" || args[1] == "--focus-target" || args[1].hasPrefix("--select=") || args[1].hasPrefix("--select-index=") || args[1].hasPrefix("--select-and-focus=") || args[1].hasPrefix("--focus=") || args[1].hasPrefix("--focus-newest=") || args[1].hasPrefix("--newest-wid=") || args[1].hasPrefix("--focusUsingLastFocusOrder=") || args[1].hasPrefix("--show=") {
                 return args[1]
             }
         }

@@ -3012,17 +3012,28 @@ class Windows {
     }
 
     /// The CGWindowID of the just-created window of `pid` — its highest on-screen
-    /// wid (CGWindowIDs are monotonic, so the newest window has the largest).
-    /// Read straight from CGWindowList (the window-server truth), so it's
-    /// available the moment the window exists — no wait for AltTab's throttled AX
-    /// discovery. A short retry absorbs the few-ms lag between creating a window
-    /// and it appearing in CGWindowList. Used by the CLI `--focus-newest=`.
-    static func newestWindowId(forPid pid: pid_t) -> CGWindowID? {
-        for _ in 0..<8 {  // ceiling ~96ms; normally returns on the first query
-            if let maxWid = onScreenWindowIds(forPid: pid).max(), maxWid != 0 { return maxWid }
+    /// wid strictly greater than `minWid` (CGWindowIDs are monotonic, so the
+    /// newest window has the largest). Read straight from CGWindowList (the
+    /// window-server truth), so it's available the moment the window exists — no
+    /// wait for AltTab's throttled AX discovery. The retry absorbs the lag between
+    /// creating a window and it appearing in CGWindowList (Finder lags ~50ms).
+    /// Passing `minWid` (a baseline captured BEFORE creation, see
+    /// `currentNewestWindowId`) makes this wait for the genuinely new window
+    /// instead of returning a pre-existing one. Used by the CLI `--focus-newest=`.
+    static func newestWindowId(forPid pid: pid_t, newerThan minWid: CGWindowID = 0) -> CGWindowID? {
+        for _ in 0..<25 {  // ceiling ~300ms; normally returns on the first query
+            if let newer = onScreenWindowIds(forPid: pid).filter({ $0 > minWid }).max() { return newer }
             usleep(12_000)
         }
-        return nil
+        return onScreenWindowIds(forPid: pid).max()  // nothing newer registered; fall back to current newest
+    }
+
+    /// Current highest on-screen wid for `pid` (one read, no wait); 0 if none.
+    /// A caller captures this as a baseline BEFORE creating a window, then passes
+    /// it to `newestWindowId(forPid:newerThan:)` so the genuinely new window is
+    /// fronted the instant it registers, never a pre-existing one (no fixed sleep).
+    static func currentNewestWindowId(forPid pid: pid_t) -> CGWindowID {
+        return onScreenWindowIds(forPid: pid).max() ?? 0
     }
 
     private static func onScreenWindowIds(forPid pid: pid_t) -> [CGWindowID] {
