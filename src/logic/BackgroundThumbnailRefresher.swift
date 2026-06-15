@@ -233,7 +233,7 @@ final class BackgroundThumbnailRefresher {
         DispatchQueue.main.async {
             if Diagnostics.shouldLog("THUMBCACHE") {
                 let captures = CaptureBackendCounters.snapshot()
-                Diagnostics.log("THUMBCACHE", "windows=\(Windows.list.count) \(ThumbnailCache.shared.statsLine()) activeCaptures=\(ActiveWindowCaptures.value()) cgsCaptures=\(captures.cgs) sckCaptures=\(captures.sck) panelOpen=\(App.appIsBeingUsed)")
+                Diagnostics.log("THUMBCACHE", "windows=\(Windows.list.count) \(ThumbnailCache.shared.statsLine()) activeCaptures=\(ActiveWindowCaptures.value()) cgsCaptures=\(captures.cgs) sckCaptures=\(captures.sck) selfRss=\(selfResidentMB())MB panelOpen=\(App.appIsBeingUsed)")
             }
             Applications.removeZombieWindows()
             // Self-heal the AX↔WindowServer bridge if a WindowServer crash left it
@@ -264,4 +264,18 @@ final class BackgroundThumbnailRefresher {
         if hotWids.contains(wid) { return .hot }
         return window.shouldShowTheUser ? .warm : .cold
     }
+}
+
+/// Resident memory of THIS process (AltTab), in MB, via proc_pidinfo — logged in
+/// the THUMBCACHE line so AltTab's own footprint is always tracked next to the
+/// capture metrics (it's a real signal: ~905MB on SCK vs ~303MB on CGS).
+/// WindowServer's footprint — the metric behind the 30GB watchdog hang — can NOT
+/// be read in-process: it runs as uid 88 and proc_pidinfo is blocked cross-user
+/// (verified). The com.kganjam.ws-mem-watch LaunchAgent samples WindowServer via
+/// `ps` instead.
+private func selfResidentMB() -> Int {
+    var ti = proc_taskinfo()
+    let sz = Int32(MemoryLayout<proc_taskinfo>.size)
+    guard proc_pidinfo(getpid(), PROC_PIDTASKINFO, 0, &ti, sz) == sz else { return -1 }
+    return Int(ti.pti_resident_size / 1024 / 1024)
 }
