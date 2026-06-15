@@ -21,7 +21,7 @@ class App: AppCenterApplication {
     /// local build wrapper script.
     static let version: String = {
         let bundleVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String) ?? "unknown"
-        let buildDate = "2026-05-19 12:53 dev" // updated by build script
+        let buildDate = "BUILD_DATE_PLACEHOLDER" // updated by build script
         return "CUSTOM BUILD (\(buildDate)) — base:\(bundleVersion)"
     }()
     static let licence = Bundle.main.object(forInfoDictionaryKey: "NSHumanReadableCopyright") as! String
