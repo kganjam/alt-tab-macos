@@ -320,6 +320,10 @@ class AccessibilityEvents {
             Windows.moveWindowToEndOfFocusOrder(window, reason: type)
         } else if type == kAXWindowDeminiaturizedNotification {
             window.isMinimized = false
+            // Restored: its frozen thumbnail is now stale and it's capturable
+            // again (no longer minimized) — pull a fresh capture forward now
+            // instead of waiting out the tier cadence.
+            BackgroundThumbnailRefresher.shared.noteRecentlyActive([window])
         }
         Windows.requestZOrderReview(reason: type, wid: window.cgWindowId ?? 0, invalidate: true, fullDelayMs: 500)
         App.refreshOpenUiAfterExternalEvent([window])

@@ -2213,6 +2213,15 @@ class Windows {
         for window in windows {
             if !window.isWindowlessApp, let cgWindowId = window.cgWindowId, cgWindowId != CGWindowID(bitPattern: -1) {
                 if skipCoherence && window.application.isParallelsCoherence { continue }
+                // A minimized window's pixels are frozen, and it can only be
+                // captured via the private CGSHWCaptureWindowList path (SCK can't
+                // see off-compositor content) — the path that feeds WindowServer's
+                // IOSurface tally. So capture it ONCE and skip re-captures while it
+                // stays minimized: a switcher full of minimized windows (e.g. 90
+                // minimized Safari windows) otherwise re-hits CGS on every show for
+                // images that can't change. Deminiaturizing clears isMinimized, so
+                // it becomes eligible again and refreshes on restore.
+                if window.isMinimized && window.thumbnail != nil { continue }
                 eligibleWindows.append(window)
             }
         }
