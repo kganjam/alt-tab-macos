@@ -13,6 +13,10 @@ class ScreensEvents {
         // screen notifications often arrive in groups (e.g. 2 in a row in a short time)
         throttler.throttleOrProceed {
             Logger.debug { notification.name.rawValue }
+            // A display add/remove/resolution change makes WindowServer recomposite
+            // every window; pause captures so we don't pile HW-capture work on top
+            // (this often coincides with an AC plug/unplug — the freeze trigger).
+            SleepWakeEvents.onPowerDisplayTransition("screen-reconfig")
             let before = lastScreenSnapshot
             Spaces.refresh()
             Screens.refresh()

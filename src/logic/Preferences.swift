@@ -53,7 +53,7 @@ class Preferences {
             "captureWindowsInBackground": "true",
             "thumbnailCaptureEnabled": "true",
             "thumbnailCaptureSettleGateEnabled": "true",
-            "thumbnailUseScreenCaptureKit": "true",
+            "thumbnailUseScreenCaptureKit": "false",
             "visibleThumbnailRefreshIntervalMs": "1200",
             "thumbnailCaptureFocusSettleGateMs": "3000",
             "bgThumbnailRefreshEnabled": "true",
@@ -71,6 +71,7 @@ class Preferences {
             "bgThumbnailMaxPerTick": "10",
             "bgThumbnailMaxConcurrent": "4",
             "bgThumbnailPostSelectionPauseMs": "3000",
+            "bgThumbnailTransitionPauseMs": "6000",
             "bgThumbnailCoherenceEnabled": "true",
             "focusOverlayCaptureEnabled": "true",
             "zOrderCacheEnabled": "true",
@@ -471,12 +472,17 @@ enum RuntimeFlags {
     static var diagnosticsBasicPerfOnly: Bool { bool("diagnosticsBasicPerfOnly", default: false) }
     static var thumbnailCaptureEnabled: Bool { bool("thumbnailCaptureEnabled", default: true) }
     static var thumbnailCaptureSettleGateEnabled: Bool { bool("thumbnailCaptureSettleGateEnabled", default: true) }
-    // Default ON: routes native-window thumbnail captures through ScreenCaptureKit
-    // instead of the private CGSHWCaptureWindowList API. CGS feeds WindowServer's
-    // per-client capture-IOSurface tally (WSIOSurfaceDebugTallyAndAbort self-abort);
-    // SCK uses a different server path that doesn't. Only Parallels Coherence and
-    // minimized windows still need CGS (see Windows.refreshThumbnailsAsync).
-    static var thumbnailUseScreenCaptureKit: Bool { bool("thumbnailUseScreenCaptureKit", default: true) }
+    // Default OFF (reverted 2026-06-15): SCK routes captures through replayd as a
+    // "screen-capture session" — each one toggles the global display-sharing /
+    // recording-indicator state (a replayd + ControlCenter + NotificationCenter
+    // storm at the capture rate) AND accumulates server-side in replayd/SkyLight
+    // that our client-side autoreleasepool can't reclaim (replayd crashed in the
+    // SCK screenshot path during the 2026-06-15 WindowServer 30GB watchdog hang).
+    // The private CGSHWCaptureWindowList path sits below all that; with detach +
+    // per-capture autoreleasepool + minimized-capture-once + 180s cadence its
+    // IOSurface-tally footprint is a fraction of the build that originally aborted.
+    // Flag kept for A/B; default to our own managed captures.
+    static var thumbnailUseScreenCaptureKit: Bool { bool("thumbnailUseScreenCaptureKit", default: false) }
     static var visibleThumbnailRefreshIntervalMs: Int { int("visibleThumbnailRefreshIntervalMs", default: 1200) }
     static var thumbnailCaptureFocusSettleGateMs: Int { int("thumbnailCaptureFocusSettleGateMs", default: 3000) }
     static var focusOverlayCaptureEnabled: Bool { bool("focusOverlayCaptureEnabled", default: true) }
@@ -583,6 +589,12 @@ enum RuntimeFlags {
     static var bgThumbnailMaxPerTick: Int { int("bgThumbnailMaxPerTick", default: 10) }
     static var bgThumbnailMaxConcurrent: Int { int("bgThumbnailMaxConcurrent", default: 4) }
     static var bgThumbnailPostSelectionPauseMs: Int { int("bgThumbnailPostSelectionPauseMs", default: 3000) }
+    // Pause ALL thumbnail captures for this long after a display reconfiguration,
+    // power-source (AC<->battery) change, or wake — WindowServer recomposites
+    // every window then, and piling CGSHWCaptureWindowList work on top is the
+    // observed trigger for the unresponsive-WindowServer freeze on AC plug/unplug
+    // + external-display connect.
+    static var bgThumbnailTransitionPauseMs: Int { int("bgThumbnailTransitionPauseMs", default: 6000) }
     static var bgThumbnailCoherenceEnabled: Bool { bool("bgThumbnailCoherenceEnabled", default: true) }
 
     private static func bool(_ key: String, default defaultValue: Bool) -> Bool {
