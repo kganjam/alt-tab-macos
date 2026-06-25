@@ -73,6 +73,7 @@ class Preferences {
             "bgThumbnailPostSelectionPauseMs": "3000",
             "bgThumbnailTransitionPauseMs": "6000",
             "bgThumbnailCoherenceEnabled": "true",
+            "axWindowGeometryThrottleMs": "500",
             "focusOverlayCaptureEnabled": "true",
             "zOrderCacheEnabled": "true",
             "zOrderFixesEnabled": "true",
@@ -596,6 +597,15 @@ enum RuntimeFlags {
     // + external-display connect.
     static var bgThumbnailTransitionPauseMs: Int { int("bgThumbnailTransitionPauseMs", default: 6000) }
     static var bgThumbnailCoherenceEnabled: Bool { bool("bgThumbnailCoherenceEnabled", default: true) }
+    // Trailing-edge coalescing interval for the high-frequency AX window
+    // move/resize notification storm (a live drag/resize fires these at the
+    // event rate — tens to >100/sec, each otherwise costing pid()/cgWindowId()/
+    // attributes() AX IPC round-trips, which are especially slow for Parallels
+    // guest windows). We only care about the FINAL geometry, so we run the
+    // first event immediately (leading edge) and coalesce the rest into one
+    // trailing call per interval. The event is still queued (the trailing call
+    // re-reads live geometry) — just not processed at high frequency.
+    static var axWindowGeometryThrottleMs: Int { int("axWindowGeometryThrottleMs", default: 500) }
 
     private static func bool(_ key: String, default defaultValue: Bool) -> Bool {
         guard let value = UserDefaults.standard.object(forKey: key) else { return defaultValue }

@@ -3,9 +3,32 @@ import ApplicationServices.HIServices.AXUIElement
 import ApplicationServices.HIServices.AXNotificationConstants
 
 class AccessibilityEvents {
+    // Coalesces the high-frequency window move/resize notification storm a live
+    // drag/resize produces. Keyed per-element (CFHash, no IPC) so distinct
+    // windows throttle independently; the interval is `axWindowGeometryThrottleMs`.
+    // A rare CFHash collision between two simultaneously-dragged windows only
+    // delays one window's intermediate update by up to the interval — never drops
+    // the final state, since the trailing call re-reads live geometry.
+    private static let windowGeometryEventThrottler = ThrottlerWithKey(delayInMs: RuntimeFlags.axWindowGeometryThrottleMs)
+
     static let axObserverCallback: AXObserverCallback = { _, element, notificationName, _ in
         let type = notificationName as String
         Logger.debug { type }
+        // Throttle ONLY move/resize (the drag/resize storm). All other AX
+        // notifications (focus/created/destroyed/miniaturized) are discrete and
+        // low-frequency — they must not be delayed, so they bypass the throttle.
+        // We keep queuing geometry events (leading edge runs now, a single
+        // trailing edge runs the final state) but cap them to ~1/interval.
+        if type == kAXWindowMovedNotification || type == kAXWindowResizedNotification {
+            windowGeometryEventThrottler.throttleOrProceed(key: "\(type)-\(CFHash(element))") {
+                submitHandleEvent(type, element)
+            }
+            return
+        }
+        submitHandleEvent(type, element)
+    }
+
+    private static func submitHandleEvent(_ type: String, _ element: AXUIElement) {
         AXCallScheduler.shared.submit {
             do { try handleEvent(type, element) }
             catch { Logger.debug { "handleEvent threw for \(type): stale element" } }
