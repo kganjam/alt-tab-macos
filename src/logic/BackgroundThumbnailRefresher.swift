@@ -73,7 +73,8 @@ final class BackgroundThumbnailRefresher {
             coldIntervalSec: Double(RuntimeFlags.bgThumbnailColdIntervalMs) / 1000,
             hotJitterSec: Double(RuntimeFlags.bgThumbnailHotJitterMs) / 1000,
             warmJitterSec: Double(RuntimeFlags.bgThumbnailWarmJitterMs) / 1000,
-            coldJitterSec: Double(RuntimeFlags.bgThumbnailColdJitterMs) / 1000
+            coldJitterSec: Double(RuntimeFlags.bgThumbnailColdJitterMs) / 1000,
+            firstThumbnailRetrySec: Double(RuntimeFlags.bgThumbnailFirstRetryMs) / 1000
         ))
     }
 

@@ -47,6 +47,13 @@ final class ThumbnailCache {
         /// using the tier's interval ± jitter. If a capture takes longer
         /// than this, the watchdog resets it.
         var inFlightTimeoutSec: TimeInterval = 15
+        /// Retry cadence for a shown (hot/warm) window that still has NO
+        /// thumbnail after a failed/skipped capture — kept short so every
+        /// visible window gets a first image quickly, independent of the long
+        /// steady-state tier intervals. Cold (minimized/hidden) windows are
+        /// excluded: they can't be captured until shown, so they keep the slow
+        /// cold cadence rather than spinning here.
+        var firstThumbnailRetrySec: TimeInterval = 3
     }
 
     private struct Entry {
@@ -208,8 +215,15 @@ final class ThumbnailCache {
         guard e.scheduleId == poppedScheduleId else { return }
         let now = CFAbsoluteTimeGetCurrent()
         let (interval, _) = intervalAndJitter(e.tier)
+        // A shown window with no thumbnail yet (failed/skipped first capture)
+        // retries fast so it always ends up with at least one image; once it
+        // has a thumbnail it falls back to the slow tier cadence. Cold windows
+        // (minimized/hidden, not shown in the switcher) keep the long interval.
+        let retry = (e.thumbnail == nil && e.tier != .cold)
+            ? Swift.min(interval, schedule.firstThumbnailRetrySec)
+            : interval
         generation &+= 1
-        e.nextRefreshAt = now + interval
+        e.nextRefreshAt = now + retry
         e.scheduleId = generation
         entries[wid] = e
         heap.push(HeapEntry(deadline: e.nextRefreshAt, wid: wid, scheduleId: generation))

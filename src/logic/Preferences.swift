@@ -58,12 +58,13 @@ class Preferences {
             "thumbnailCaptureFocusSettleGateMs": "3000",
             "bgThumbnailRefreshEnabled": "true",
             "bgThumbnailHotTierSize": "10",
-            "bgThumbnailHotIntervalMs": "5000",
-            "bgThumbnailWarmIntervalMs": "180000",
-            "bgThumbnailColdIntervalMs": "300000",
-            "bgThumbnailHotJitterMs": "1000",
-            "bgThumbnailWarmJitterMs": "5000",
-            "bgThumbnailColdJitterMs": "30000",
+            "bgThumbnailHotIntervalMs": "60000",
+            "bgThumbnailWarmIntervalMs": "300000",
+            "bgThumbnailColdIntervalMs": "600000",
+            "bgThumbnailHotJitterMs": "10000",
+            "bgThumbnailWarmJitterMs": "30000",
+            "bgThumbnailColdJitterMs": "60000",
+            "bgThumbnailFirstRetryMs": "3000",
             "bgThumbnailReconcileMs": "30000",
             "bgThumbnailDetachNonHotTier": "true",
             "bgThumbnailInitialMaxDelayMs": "250",
@@ -555,16 +556,25 @@ enum RuntimeFlags {
     static var protectNativeCommandNumberShortcuts: Bool { bool("protectNativeCommandNumberShortcuts", default: true) }
     static var bgThumbnailRefreshEnabled: Bool { bool("bgThumbnailRefreshEnabled", default: true) }
     static var bgThumbnailHotTierSize: Int { int("bgThumbnailHotTierSize", default: 10) }
-    static var bgThumbnailHotIntervalMs: Int { int("bgThumbnailHotIntervalMs", default: 5000) }
-    // Inactive (shown but not recently focused) windows refresh every 3 min. The
-    // in-panel timer refreshes whatever's visible on show, and recently-active
-    // windows are pulled forward event-driven (see noteRecentlyActive), so a slow
-    // background cadence here costs no visible staleness while cutting capture load.
-    static var bgThumbnailWarmIntervalMs: Int { int("bgThumbnailWarmIntervalMs", default: 180000) }
-    static var bgThumbnailColdIntervalMs: Int { int("bgThumbnailColdIntervalMs", default: 300000) }
-    static var bgThumbnailHotJitterMs: Int { int("bgThumbnailHotJitterMs", default: 1000) }
-    static var bgThumbnailWarmJitterMs: Int { int("bgThumbnailWarmJitterMs", default: 5000) }
-    static var bgThumbnailColdJitterMs: Int { int("bgThumbnailColdJitterMs", default: 30000) }
+    // The periodic background cadence is deliberately slow: the freshness that
+    // matters is driven by events, not polling. Every window gets a thumbnail
+    // once on discovery (register), the in-panel timer refreshes whatever's
+    // visible on show, and a window is pulled forward to a fresh capture the
+    // moment it comes to the foreground (noteRecentlyActive). So the periodic
+    // refresh only exists to catch silent background content changes, which
+    // don't need a fast cadence — hence 60s hot / 5min warm / 10min cold. This
+    // is the main lever for AltTab's idle CPU (was 5s hot ≈ 2 captures/sec).
+    static var bgThumbnailHotIntervalMs: Int { int("bgThumbnailHotIntervalMs", default: 60000) }
+    static var bgThumbnailWarmIntervalMs: Int { int("bgThumbnailWarmIntervalMs", default: 300000) }
+    static var bgThumbnailColdIntervalMs: Int { int("bgThumbnailColdIntervalMs", default: 600000) }
+    static var bgThumbnailHotJitterMs: Int { int("bgThumbnailHotJitterMs", default: 10000) }
+    static var bgThumbnailWarmJitterMs: Int { int("bgThumbnailWarmJitterMs", default: 30000) }
+    static var bgThumbnailColdJitterMs: Int { int("bgThumbnailColdJitterMs", default: 60000) }
+    // A shown window (hot/warm) that has NO thumbnail yet — e.g. its first
+    // capture failed — is retried at this short cadence (not the long tier
+    // interval) until it has at least one image. Guarantees every visible
+    // window always has a thumbnail without making the steady-state cadence fast.
+    static var bgThumbnailFirstRetryMs: Int { int("bgThumbnailFirstRetryMs", default: 3000) }
     /// How often the background refresher reconciles its window list against
     /// the live WindowServer window list (zombie GC), releasing thumbnails
     /// (and their IOSurfaces) for windows that closed without an AX-destroyed
