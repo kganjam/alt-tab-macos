@@ -9,6 +9,7 @@ class CursorEvents {
     private static var outsideMouseDownPassedThroughButton: String?
     static var deadZoneInitialPosition: CGPoint?
     static var isAllowedToMouseHover = true
+    private static var hoverPollTimer: Timer?
 
     static func observe() {
         observe_()
@@ -24,6 +25,34 @@ class CursorEvents {
         if let eventTap {
             CGEvent.tapEnable(tap: eventTap, enable: enabled)
         }
+        toggleHoverPoll(enabled)
+    }
+
+    /// Poll the live cursor position while the panel is open and re-run hover
+    /// detection, independent of the mouseMoved event stream.
+    ///
+    /// The mouseMoved tap runs on the main runloop; when the main thread is busy
+    /// (e.g. WindowServer under load) macOS coalesces and drops mouseMoved
+    /// events — including, on a fast flick, the final event at the resting
+    /// position — so `updateHover` never runs for the tile actually under the
+    /// cursor and the highlight sticks on the previous tile. This poll reads the
+    /// cursor directly (`CGEvent(source:)`, same Quartz coordinate space as the
+    /// tap, so the dead-zone arming stays consistent), so a fast move always
+    /// resolves to the correct tile. `updateHover` early-returns when the target
+    /// is unchanged, so an idle tick is just a cheap rect test.
+    private static func toggleHoverPoll(_ enabled: Bool) {
+        hoverPollTimer?.invalidate()
+        hoverPollTimer = nil
+        guard enabled else { return }
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { _ in
+            let location = CGEvent(source: nil)?.location ?? .zero
+            if isAllowedToReactToPointerMovement(location) {
+                TilesView.thumbnailOverView.updateHover()
+            }
+        }
+        timer.tolerance = 1.0 / 120.0
+        RunLoop.main.add(timer, forMode: .common)
+        hoverPollTimer = timer
     }
 
     static func reEnableTapIfNeeded() {
