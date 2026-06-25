@@ -110,14 +110,29 @@ class TileOverView: FlippedView {
 
     func findTarget(_ location: NSPoint) -> TileView? {
         guard let documentView = superview else { return nil }
+        // The mouse target for each tile is its FULL cell, with the inter-cell
+        // gaps filled so there are no dead zones between thumbnails. We first
+        // match a tile's exact frame (fast, unambiguous when the cursor is on a
+        // tile); otherwise we expand each frame by the inter-cell padding and
+        // pick the nearest tile by center distance. Two neighbors both claim the
+        // gap between them, so the nearest-center tie-break splits it down the
+        // middle — every point in/around the grid maps to a thumbnail.
+        let pad = Appearance.interCellPadding
+        var best: TileView? = nil
+        var bestDistance = CGFloat.greatestFiniteMagnitude
         for case let view as TileView in documentView.subviews {
             let frame = view.frame
-            let expandedFrame = CGRect(x: frame.minX - (App.shared.userInterfaceLayoutDirection == .leftToRight ? 0 : 1), y: frame.minY, width: frame.width + 1, height: frame.height + 1)
-            if expandedFrame.contains(location) {
-                return view
+            guard frame.width > 0, frame.height > 0 else { continue } // skip hidden/recycled tiles
+            if frame.contains(location) { return view }
+            if frame.insetBy(dx: -pad, dy: -pad).contains(location) {
+                let distance = hypot(location.x - frame.midX, location.y - frame.midY)
+                if distance < bestDistance {
+                    bestDistance = distance
+                    best = view
+                }
             }
         }
-        return nil
+        return best
     }
 
     func resetHoveredWindow() {
