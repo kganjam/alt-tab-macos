@@ -54,7 +54,7 @@ class Preferences {
             "thumbnailCaptureEnabled": "true",
             "thumbnailCaptureSettleGateEnabled": "true",
             "thumbnailUseScreenCaptureKit": "false",
-            "visibleThumbnailRefreshIntervalMs": "1200",
+            "visibleThumbnailRefreshIntervalMs": "4000",
             "thumbnailCaptureFocusSettleGateMs": "3000",
             "bgThumbnailRefreshEnabled": "true",
             "bgThumbnailHotTierSize": "10",
@@ -485,7 +485,13 @@ enum RuntimeFlags {
     // IOSurface-tally footprint is a fraction of the build that originally aborted.
     // Flag kept for A/B; default to our own managed captures.
     static var thumbnailUseScreenCaptureKit: Bool { bool("thumbnailUseScreenCaptureKit", default: false) }
-    static var visibleThumbnailRefreshIntervalMs: Int { int("visibleThumbnailRefreshIntervalMs", default: 1200) }
+    // While the switcher is OPEN, re-capture visible thumbnails on this timer.
+    // The on-show capture (and scroll-end/scroll-wheel) already refresh what
+    // you're looking at, so this repeating timer only catches live content
+    // changing under your gaze — it doesn't need 1.2s. At ~50 visible tiles a
+    // 1.2s timer was ~40 captures/sec while open (the dominant in-panel CPU);
+    // 4s cuts that ~3x with no practical staleness.
+    static var visibleThumbnailRefreshIntervalMs: Int { int("visibleThumbnailRefreshIntervalMs", default: 4000) }
     static var thumbnailCaptureFocusSettleGateMs: Int { int("thumbnailCaptureFocusSettleGateMs", default: 3000) }
     static var focusOverlayCaptureEnabled: Bool { bool("focusOverlayCaptureEnabled", default: true) }
     static var zOrderCacheEnabled: Bool { bool("zOrderCacheEnabled", default: true) }
