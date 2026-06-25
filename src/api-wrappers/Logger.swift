@@ -2464,10 +2464,19 @@ public class WinSide {
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr insertAfter, int x, int y, int cx, int cy, UInt32 flags);
   [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr h, bool altTab);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, IntPtr pvParam, uint fWinIni);
   public delegate bool EnumProc(IntPtr h, IntPtr lp);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lp);
 }
 "@
+
+# Disable this guest session's foreground-lock timeout so SetForegroundWindow
+# from the (non-foreground) winside helper is permitted. SPI_SETFOREGROUNDLOCKTIMEOUT
+# = 0x2001; pvParam = 0 means "no lock". Best-effort — AttachThreadInput in
+# Do-SetForeground is the primary, per-call bypass.
+try { [WinSide]::SystemParametersInfo(0x2001, 0, [IntPtr]::Zero, 0) | Out-Null } catch {}
 
 function Get-PrimaryIPv4 {
     $candidates = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
@@ -2520,10 +2529,31 @@ function Do-SetForeground {
     } else {
         [WinSide]::ShowWindowAsync($h, 5) | Out-Null
     }
+    # Bypass Windows foreground-stealing prevention WITHOUT synthetic input:
+    # briefly attach our input queue to the current foreground thread (and the
+    # target window's thread), which makes SetForegroundWindow permitted. No
+    # keypress is sent, so there is no risk of activating the menu (Alt) or any
+    # other key side effect. We always detach in reverse order.
+    $pidOut = [uint32]0
+    $curThread = [WinSide]::GetCurrentThreadId()
+    $targetThread = [WinSide]::GetWindowThreadProcessId($h, [ref]$pidOut)
+    $fgWin = [WinSide]::GetForegroundWindow()
+    $fgThread = [uint32]0
+    if ($fgWin -ne [IntPtr]::Zero) { $fgThread = [WinSide]::GetWindowThreadProcessId($fgWin, [ref]$pidOut) }
+    $attFg = $false
+    $attTgt = $false
+    if ($fgThread -ne 0 -and $fgThread -ne $curThread) {
+        $attFg = [WinSide]::AttachThreadInput($curThread, $fgThread, $true)
+    }
+    if ($targetThread -ne 0 -and $targetThread -ne $curThread -and $targetThread -ne $fgThread) {
+        $attTgt = [WinSide]::AttachThreadInput($curThread, $targetThread, $true)
+    }
     $pos = [WinSide]::SetWindowPos($h, $HWND_TOP, 0, 0, 0, 0, $SWP_FLAGS)
     [WinSide]::BringWindowToTop($h) | Out-Null
     $r = [WinSide]::SetForegroundWindow($h)
     [WinSide]::SwitchToThisWindow($h, $true)
+    if ($attTgt) { [WinSide]::AttachThreadInput($curThread, $targetThread, $false) | Out-Null }
+    if ($attFg) { [WinSide]::AttachThreadInput($curThread, $fgThread, $false) | Out-Null }
     return "OK $([int]$r) winMs=$(Get-UtcMs) pos=$([int]$pos)"
 }
 
