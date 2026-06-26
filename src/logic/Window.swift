@@ -191,6 +191,18 @@ class Window {
 
     func refreshThumbnail(_ screenshot: CALayerContents, liveSurface: Bool = true) {
         if let wid = cgWindowId {
+            // Diagnostic: a Coherence window WindowServer can't render (offscreen /
+            // occluded / on another Space) captures as an all-black surface, then
+            // gets cached and shown as a black thumbnail. Log which Parallels
+            // windows produce a (near-)black frame so we can confirm the cause and
+            // verify a reject-black fix won't misfire on real content. Scoped to
+            // Coherence windows to keep the per-capture cost and log noise down.
+            if isParallelsCoherenceWindow, case let .cgImage(img?) = screenshot {
+                let frac = ThumbnailBitmap.blackFraction(of: img)
+                if frac >= 0.98 {
+                    Diagnostics.log("THUMBBLACK", "wid=\(wid) black=\(Int(frac * 100))% app=\(thumbnailProvenanceTag) title='\(title ?? "")'")
+                }
+            }
             ThumbnailCache.shared.writeCapture(wid: wid, image: screenshot, liveSurface: liveSurface, capturedBy: thumbnailProvenanceTag)
         }
         thumbnailUpdateCount += 1

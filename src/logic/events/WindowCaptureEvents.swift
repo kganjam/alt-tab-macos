@@ -499,6 +499,28 @@ enum ThumbnailBitmap {
         return ctx.makeImage()
     }
 
+    /// Fraction (0…1) of pixels that are (near) black. Drawing into a tiny
+    /// grayscale context normalises any source size/colorspace into 1024 byte
+    /// samples — cheap and format-agnostic. Diagnostic for the "black thumbnail"
+    /// symptom: a Coherence window WindowServer can't render (offscreen /
+    /// occluded / on another Space) captures as an all-black surface, which we
+    /// then cache and show. A real (even dark-mode) window has text/chrome, so
+    /// its fraction stays well below 1; a dead capture is ~1.0.
+    static func blackFraction(of cgImage: CGImage) -> Double {
+        let dim = 32
+        guard let ctx = CGContext(data: nil, width: dim, height: dim,
+                                  bitsPerComponent: 8, bytesPerRow: dim,
+                                  space: CGColorSpaceCreateDeviceGray(),
+                                  bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return 0 }
+        ctx.interpolationQuality = .low
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: dim, height: dim))
+        guard let data = ctx.data else { return 0 }
+        let pixels = data.bindMemory(to: UInt8.self, capacity: dim * dim)
+        var darkCount = 0
+        for i in 0..<(dim * dim) where pixels[i] <= 8 { darkCount += 1 }
+        return Double(darkCount) / Double(dim * dim)
+    }
+
     /// Target pixel size for a stored thumbnail: the full-resolution capture
     /// scaled to fit the largest on-screen thumbnail (points) at retina (2×),
     /// preserving aspect. Reads `TilesPanel.maxPossibleThumbnailSize` (set on
