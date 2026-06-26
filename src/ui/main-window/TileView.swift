@@ -206,6 +206,15 @@ class TileView: FlippedView {
         )
         if !thumbnail.isHidden {
             if let screenshot = element.thumbnail {
+                // Diagnostic: this tile is about to show `element`'s cached bitmap.
+                // If that bitmap was last captured from a *different* app, the user
+                // sees one Parallels app's tile rendering another app's content —
+                // the reported cross-app-thumbnail bug. Logs the exact moment.
+                if let wid = element.cgWindowId,
+                   let writer = ThumbnailCache.shared.capturedBy(wid: wid),
+                   writer != element.thumbnailProvenanceTag {
+                    Diagnostics.log("THUMBSHOW", "CROSS-APP wid=\(wid) tile-app=\(element.thumbnailProvenanceTag) title='\(element.title ?? "")' is showing a bitmap captured-by=\(writer)")
+                }
                 // Render the cached thumbnail directly. It was decompressed
                 // off-main during the display delay (`preDecompressForShow`), so
                 // it's resident → cheap to composite even after a long idle.

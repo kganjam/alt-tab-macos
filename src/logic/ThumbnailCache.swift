@@ -58,6 +58,12 @@ final class ThumbnailCache {
 
     private struct Entry {
         var thumbnail: CALayerContents?
+        /// App-identity tag (pid:bundleId) of the window whose capture last wrote
+        /// this wid's bitmap. Diagnostic only: lets us detect a thumbnail captured
+        /// from one app being shown on a tile for a *different* app — the
+        /// "Parallels tile shows another Parallels app's content" symptom, which
+        /// implies a cgWindowId collision or Parallels reusing a wid across apps.
+        var capturedBy: String?
         /// True iff `thumbnail` is backed by a live WindowServer capture
         /// IOSurface (SCK pixelBuffer, or a non-detached CGSHWCaptureWindowList
         /// CGImage). False for malloc-backed detached copies. This is what
@@ -134,6 +140,14 @@ final class ThumbnailCache {
         return entries[wid]?.lastUpdatedAt ?? 0
     }
 
+    /// App-identity tag (pid:bundleId) of the window whose capture last wrote
+    /// this wid's bitmap, or nil if never captured. Diagnostic for the
+    /// cross-app-thumbnail symptom; see `Entry.capturedBy`.
+    func capturedBy(wid: CGWindowID) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return entries[wid]?.capturedBy
+    }
+
     /// Read every cached thumbnail's pixels so macOS keeps the (downscaled,
     /// <1MB) bitmaps resident — out of the memory compressor — while AltTab sits
     /// idle. A cold panel show then composites them directly instead of faulting
@@ -175,10 +189,18 @@ final class ThumbnailCache {
     /// In-panel captures (`refreshVisibleThumbnailsAfterShowUi` source)
     /// don't set `inFlightScheduleId` (they didn't go through `popDue`), so
     /// they only store the bitmap and don't perturb BG scheduling.
-    func writeCapture(wid: CGWindowID, image: CALayerContents, liveSurface: Bool = true) {
+    func writeCapture(wid: CGWindowID, image: CALayerContents, liveSurface: Bool = true, capturedBy: String? = nil) {
         lock.lock(); defer { lock.unlock() }
         guard entries[wid] != nil else { return }
         var e = entries[wid]!
+        // Diagnostic: if this wid's capture writer changed app identity, the OS
+        // reassigned the cgWindowId to a different app's window (Parallels
+        // Coherence wid reuse) or two windows collide on one wid. Either way the
+        // bitmap now under this key belongs to a different app than before.
+        if let capturedBy, let prev = e.capturedBy, prev != capturedBy {
+            Diagnostics.log("THUMBPROV", "wid=\(wid) capture writer changed: '\(prev)' -> '\(capturedBy)' — same cgWindowId now captured from a different app")
+        }
+        if let capturedBy { e.capturedBy = capturedBy }
         e.thumbnail = image
         e.isLiveSurface = liveSurface
         e.lastUpdatedAt = CFAbsoluteTimeGetCurrent()

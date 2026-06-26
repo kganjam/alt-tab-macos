@@ -2093,6 +2093,23 @@ class Windows {
         }
     }
 
+    /// Diagnostic: log any cgWindowId held by more than one live Window. AltTab
+    /// keys the thumbnail cache by cgWindowId, so a shared wid means two tiles
+    /// read one bitmap — one of them shows the other window's (possibly other
+    /// app's) content. This is the most direct test for the cross-app Parallels
+    /// thumbnail symptom; cheap (a single pass over the list).
+    static func logDuplicateCgWindowIds() {
+        var byWid = [CGWindowID: [Window]]()
+        for w in list {
+            guard let wid = w.cgWindowId, wid != CGWindowID(bitPattern: -1) else { continue }
+            byWid[wid, default: []].append(w)
+        }
+        for (wid, windows) in byWid where windows.count > 1 {
+            let ids = windows.map { "\($0.thumbnailProvenanceTag) title='\($0.title ?? "")'" }.joined(separator: " || ")
+            Diagnostics.log("WIDDUP", "cgWindowId \(wid) shared by \(windows.count) live windows: \(ids)")
+        }
+    }
+
     static func previewSelectedWindowIfNeeded() {
         if App.appIsBeingUsed && ScreenRecordingPermission.status == .granted
                && Preferences.previewSelectedWindow && !Preferences.onlyShowApplications()
@@ -2156,6 +2173,7 @@ class Windows {
         }
         refreshWhichWindowsToShowTheUser()
         sort()
+        logDuplicateCgWindowIds()
         let afterSortAt = CFAbsoluteTimeGetCurrent()
         Diagnostics.log("REFRESH", String(format: "updatesBeforeShowing: total=%.1fms spaces=%.1fms windows=%.1fms sort=%.1fms count=%d", (afterSortAt - startedAt) * 1000, (afterSpacesAt - startedAt) * 1000, (afterWindowsAt - afterSpacesAt) * 1000, (afterSortAt - afterWindowsAt) * 1000, list.count))
         return true

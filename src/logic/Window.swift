@@ -184,9 +184,14 @@ class Window {
         CFRunLoopAddSource(BackgroundWork.accessibilityEventsThread.runLoop, AXObserverGetRunLoopSource(axObserver), .commonModes)
     }
 
+    /// Compact app-identity tag for thumbnail provenance diagnostics. pid+bundle
+    /// distinguishes different Parallels Coherence guest apps — each is its own
+    /// macOS process (distinct pid) with its own `com.parallels.winapp.*` bundle.
+    var thumbnailProvenanceTag: String { "\(application.pid):\(application.bundleIdentifier ?? "?")" }
+
     func refreshThumbnail(_ screenshot: CALayerContents, liveSurface: Bool = true) {
         if let wid = cgWindowId {
-            ThumbnailCache.shared.writeCapture(wid: wid, image: screenshot, liveSurface: liveSurface)
+            ThumbnailCache.shared.writeCapture(wid: wid, image: screenshot, liveSurface: liveSurface, capturedBy: thumbnailProvenanceTag)
         }
         thumbnailUpdateCount += 1
         if !App.appIsBeingUsed || !shouldShowTheUser { return }
