@@ -10,6 +10,7 @@ class CursorEvents {
     static var deadZoneInitialPosition: CGPoint?
     static var isAllowedToMouseHover = true
     private static var hoverPollTimer: Timer?
+    private static var lastHoverPollLocation: CGPoint?
 
     static func observe() {
         observe_()
@@ -43,12 +44,27 @@ class CursorEvents {
     private static func toggleHoverPoll(_ enabled: Bool) {
         hoverPollTimer?.invalidate()
         hoverPollTimer = nil
+        lastHoverPollLocation = nil
         guard enabled else { return }
         let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { _ in
             let location = CGEvent(source: nil)?.location ?? .zero
-            if isAllowedToReactToPointerMovement(location) {
-                TilesView.thumbnailOverView.updateHover()
+            guard isAllowedToReactToPointerMovement(location) else { return }
+            let previous = lastHoverPollLocation
+            lastHoverPollLocation = location
+            // Velocity gate: while the cursor is flicking fast across the grid,
+            // skip hover updates so the highlight doesn't chase through — and pay
+            // the per-tile scroll/preview/window-control cost for — every tile the
+            // cursor passes over. Human pointing decelerates onto the target, so as
+            // the flick lands its per-tick travel drops below ~one tile and the
+            // next tick resolves the tile actually under the cursor. The threshold
+            // scales with tile width (with a floor) so it gates genuine flicks, not
+            // deliberate slow hover-scanning where every tile should highlight.
+            if let previous {
+                let movedThisTick = hypot(location.x - previous.x, location.y - previous.y)
+                let tileWidth = TilesView.recycledViews.first(where: { $0.frame.width > 0 })?.frame.width ?? 160
+                if movedThisTick > max(40, tileWidth * 0.8) { return }
             }
+            TilesView.thumbnailOverView.updateHover()
         }
         timer.tolerance = 1.0 / 120.0
         RunLoop.main.add(timer, forMode: .common)
@@ -205,11 +221,15 @@ class CursorEvents {
     }
 
     private static func handleMouseMoved(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
-        if isAllowedToReactToPointerMovement(cgEvent.location) {
-            if isPointerInsideUi() {
-                App.noteInputCaptureActivity("mouse-move")
-            }
-            TilesView.thumbnailOverView.updateHover()
+        // Arms the dead zone (side effect) and tracks input activity for the
+        // outside-click passthrough timing. Hover itself is resolved by the
+        // velocity-gated 60Hz poll (toggleHoverPoll), NOT here: driving
+        // updateHover from the event tap ran the heavy per-tile work (highlight +
+        // scroll + preview + traffic-light buttons) synchronously in the session
+        // event-tap callback for every mouseMoved event, which both delayed
+        // system-wide input and highlighted every tile a fast flick passed over.
+        if isAllowedToReactToPointerMovement(cgEvent.location), isPointerInsideUi() {
+            App.noteInputCaptureActivity("mouse-move")
         }
         return Unmanaged.passUnretained(cgEvent)
     }
