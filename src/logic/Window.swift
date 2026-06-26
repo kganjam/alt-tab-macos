@@ -136,6 +136,15 @@ class Window {
         if let wid = cgWindowId {
             ThumbnailCache.shared.clearThumbnail(wid: wid)
         }
+        showAppIconOnVisibleTileIfNeeded()
+    }
+
+    /// If this window currently occupies a tile in an open panel, replace its
+    /// thumbnail with the app icon (or clear it). Used whenever we drop a cached
+    /// screenshot — geometry invalidation, or rejecting an unusable capture — so
+    /// the open panel reflects the change immediately instead of keeping the old
+    /// (now-cleared, e.g. black) image until the next layout.
+    private func showAppIconOnVisibleTileIfNeeded() {
         guard App.appIsBeingUsed,
               let view = (TilesView.recycledViews.first { $0.window_?.cgWindowId == cgWindowId }),
               !view.thumbnail.isHidden else { return }
@@ -191,16 +200,20 @@ class Window {
 
     func refreshThumbnail(_ screenshot: CALayerContents, liveSurface: Bool = true) {
         if let wid = cgWindowId {
-            // Diagnostic: a Coherence window WindowServer can't render (offscreen /
-            // occluded / on another Space) captures as an all-black surface, then
-            // gets cached and shown as a black thumbnail. Log which Parallels
-            // windows produce a (near-)black frame so we can confirm the cause and
-            // verify a reject-black fix won't misfire on real content. Scoped to
-            // Coherence windows to keep the per-capture cost and log noise down.
+            // A Coherence window the VM isn't rendering (a background/unfocused
+            // guest window) has no live surface, so CGS captures it as an all-black
+            // frame. Storing that shows a black tile. Reject it: drop the dud so the
+            // tile falls back to the app icon, and reschedule at the normal cadence.
+            // Scoped to Coherence windows — real macOS windows don't have this
+            // failure mode, so they skip the per-capture scan. The 98% threshold is
+            // far above any real (even dark-mode) content, which carries text/chrome.
             if isParallelsCoherenceWindow, case let .cgImage(img?) = screenshot {
                 let frac = ThumbnailBitmap.blackFraction(of: img)
                 if frac >= 0.98 {
-                    Diagnostics.log("THUMBBLACK", "wid=\(wid) black=\(Int(frac * 100))% app=\(thumbnailProvenanceTag) title='\(title ?? "")'")
+                    Diagnostics.log("THUMBBLACK", "wid=\(wid) rejected black=\(Int(frac * 100))% app=\(thumbnailProvenanceTag) title='\(title ?? "")'")
+                    ThumbnailCache.shared.rejectCapture(wid: wid)
+                    showAppIconOnVisibleTileIfNeeded()
+                    return
                 }
             }
             ThumbnailCache.shared.writeCapture(wid: wid, image: screenshot, liveSurface: liveSurface, capturedBy: thumbnailProvenanceTag)

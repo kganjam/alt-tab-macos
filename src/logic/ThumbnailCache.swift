@@ -204,6 +204,30 @@ final class ThumbnailCache {
         e.thumbnail = image
         e.isLiveSurface = liveSurface
         e.lastUpdatedAt = CFAbsoluteTimeGetCurrent()
+        finishCaptureLocked(&e, wid: wid)
+    }
+
+    /// A capture completed but came back unusable (e.g. an all-black Coherence
+    /// frame for a guest window the VM isn't rendering). Drop the dud — clear the
+    /// bitmap so the tile falls back to the app icon rather than showing black —
+    /// and clear in-flight + reschedule at the tier's normal cadence, exactly as a
+    /// successful capture would. Storing the black frame was the bug; this is the
+    /// reject path. Reschedules (not fast first-thumbnail retry) so a persistently
+    /// unrendered window isn't re-captured in a tight loop.
+    func rejectCapture(wid: CGWindowID) {
+        lock.lock(); defer { lock.unlock() }
+        guard entries[wid] != nil else { return }
+        var e = entries[wid]!
+        e.thumbnail = nil
+        e.isLiveSurface = false
+        e.lastUpdatedAt = 0
+        finishCaptureLocked(&e, wid: wid)
+    }
+
+    /// Clear in-flight state and, if this was a BG-initiated capture, push the
+    /// next deadline at the tier's normal cadence. Caller holds `lock` and has
+    /// already set `e`'s content fields; we write `e` back and update the heap.
+    private func finishCaptureLocked(_ e: inout Entry, wid: CGWindowID) {
         let wasBgInitiated = e.inFlight
         let poppedScheduleId = e.inFlightScheduleId
         e.inFlight = false
@@ -211,7 +235,6 @@ final class ThumbnailCache {
         e.inFlightSince = 0
         entries[wid] = e
         guard wasBgInitiated, e.scheduleId == poppedScheduleId else { return }
-        // Push the next BG deadline.
         let now = CFAbsoluteTimeGetCurrent()
         let (interval, jitter) = intervalAndJitter(e.tier)
         let deadline = now + interval + Double.random(in: -jitter...jitter)
