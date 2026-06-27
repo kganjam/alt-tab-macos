@@ -87,6 +87,10 @@ final class ThumbnailCache {
 
     private let lock = NSLock()
     private var entries: [CGWindowID: Entry] = [:]
+    /// How many entries currently hold each non-zero content signature. A count
+    /// > 1 means that bitmap is duplicated across windows (shared Coherence
+    /// surface), so `read` suppresses it. Kept incrementally so reads stay O(1).
+    private var signatureCounts: [UInt64: Int] = [:]
     private var heap = MinHeap<HeapEntry>()
     private var generation: UInt64 = 0
     private var schedule = Schedule()
@@ -118,6 +122,7 @@ final class ThumbnailCache {
 
     func unregister(wid: CGWindowID) {
         lock.lock(); defer { lock.unlock() }
+        if let s = entries[wid]?.signature { updateSignatureCountLocked(old: s, new: 0) }
         entries.removeValue(forKey: wid)
         // Heap entries for this wid become tombstones (entries[wid] == nil).
     }
@@ -134,9 +139,16 @@ final class ThumbnailCache {
     // MARK: - Read
 
     /// Read the thumbnail bitmap. Lock-protected; fast on uncontended path.
+    /// Content dedup: if this bitmap is pixel-identical to another window's
+    /// (Parallels Coherence returned one shared guest surface for several window
+    /// ids), return nil so the tile falls back to its app icon instead of showing
+    /// another window's content. Real windows have unique pixels, so they're
+    /// unaffected; non-Coherence captures carry no signature and never dedup.
     func read(wid: CGWindowID) -> CALayerContents? {
         lock.lock(); defer { lock.unlock() }
-        return entries[wid]?.thumbnail
+        guard let e = entries[wid] else { return nil }
+        if e.signature != 0, (signatureCounts[e.signature] ?? 0) > 1 { return nil }
+        return e.thumbnail
     }
 
     func lastUpdatedAt(wid: CGWindowID) -> CFAbsoluteTime {
@@ -215,6 +227,7 @@ final class ThumbnailCache {
             }
         }
         if let capturedBy { e.capturedBy = capturedBy }
+        updateSignatureCountLocked(old: e.signature, new: signature)
         e.signature = signature
         e.thumbnail = image
         e.isLiveSurface = liveSurface
@@ -236,8 +249,20 @@ final class ThumbnailCache {
         e.thumbnail = nil
         e.isLiveSurface = false
         e.lastUpdatedAt = 0
+        updateSignatureCountLocked(old: e.signature, new: 0)
         e.signature = 0
         finishCaptureLocked(&e, wid: wid)
+    }
+
+    /// Adjust `signatureCounts` when an entry's signature changes. Caller holds
+    /// `lock`. Zero is the "no signature" sentinel and is never counted.
+    private func updateSignatureCountLocked(old: UInt64, new: UInt64) {
+        guard old != new else { return }
+        if old != 0 {
+            if let c = signatureCounts[old], c > 1 { signatureCounts[old] = c - 1 }
+            else { signatureCounts[old] = nil }
+        }
+        if new != 0 { signatureCounts[new, default: 0] += 1 }
     }
 
     /// Clear in-flight state and, if this was a BG-initiated capture, push the
@@ -309,9 +334,11 @@ final class ThumbnailCache {
     func clearThumbnail(wid: CGWindowID) {
         lock.lock(); defer { lock.unlock() }
         guard entries[wid] != nil else { return }
+        updateSignatureCountLocked(old: entries[wid]!.signature, new: 0)
         entries[wid]!.thumbnail = nil
         entries[wid]!.isLiveSurface = false
         entries[wid]!.lastUpdatedAt = 0
+        entries[wid]!.signature = 0
     }
 
     // MARK: - Scheduling

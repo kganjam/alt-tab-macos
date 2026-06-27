@@ -521,15 +521,17 @@ enum ThumbnailBitmap {
         return Double(darkCount) / Double(dim * dim)
     }
 
-    /// Cheap 64-bit average-hash (aHash) of an image's luma. Diagnostic for the
-    /// cross-window mismatch: when Parallels Coherence returns one shared guest
-    /// surface for several window ids, their captures come back pixel-identical,
-    /// so several tiles show the same (wrong) image. Provenance can't catch this
-    /// (it tags by which window requested the capture, not by content); a matching
-    /// signature across different wids does. Perceptual 8x8 → near-identical
-    /// frames collide; returns 0 only on failure.
+    /// 64-bit FNV-1a hash of an image's downscaled luma. Used to detect — and
+    /// then suppress — the cross-window mismatch where Parallels Coherence hands
+    /// back one shared guest surface for several window ids, so their captures are
+    /// pixel-identical and several tiles show the same (wrong) image. Provenance
+    /// can't catch this (it tags by which window requested the capture, not by
+    /// content). An exact hash (not a perceptual one) is deliberate: identical
+    /// surfaces hash equal, while distinct windows effectively never collide, so
+    /// content dedup won't blank unrelated thumbnails. Returns 0 only on failure
+    /// (reserved as the "no signature" sentinel).
     static func contentSignature(of cgImage: CGImage) -> UInt64 {
-        let dim = 8
+        let dim = 32
         guard let ctx = CGContext(data: nil, width: dim, height: dim,
                                   bitsPerComponent: 8, bytesPerRow: dim,
                                   space: CGColorSpaceCreateDeviceGray(),
@@ -538,12 +540,11 @@ enum ThumbnailBitmap {
         ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: dim, height: dim))
         guard let data = ctx.data else { return 0 }
         let pixels = data.bindMemory(to: UInt8.self, capacity: dim * dim)
-        var sum = 0
-        for i in 0..<(dim * dim) { sum += Int(pixels[i]) }
-        let avg = sum / (dim * dim)
-        var hash: UInt64 = 0
-        for i in 0..<(dim * dim) where Int(pixels[i]) > avg { hash |= (UInt64(1) << UInt64(i)) }
-        return hash
+        var hash: UInt64 = 0xcbf29ce484222325
+        for i in 0..<(dim * dim) {
+            hash = (hash ^ UInt64(pixels[i])) &* 0x100000001b3
+        }
+        return hash == 0 ? 1 : hash
     }
 
     /// Target pixel size for a stored thumbnail: the full-resolution capture

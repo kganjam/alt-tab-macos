@@ -237,18 +237,26 @@ class Window {
         }
         thumbnailUpdateCount += 1
         if !App.appIsBeingUsed || !shouldShowTheUser { return }
-        if let position, let size,
-           let view = (TilesView.recycledViews.first { $0.window_?.cgWindowId == cgWindowId }) {
-            if !view.thumbnail.isHidden {
-                let thumbnailSize = TileView.thumbnailSize(size, false)
-                let newSize = thumbnailSize.width != view.thumbnail.frame.width || thumbnailSize.height != view.thumbnail.frame.height
-                view.thumbnail.updateContents(screenshot, thumbnailSize)
+        guard let position, let size, let wid = cgWindowId else { return }
+        // Read back through the cache's dedup: nil means this capture is
+        // pixel-identical to another window's (a shared Coherence surface), so we
+        // show the app icon instead of the duplicated (wrong) image.
+        let display = ThumbnailCache.shared.read(wid: wid)
+        if let view = (TilesView.recycledViews.first { $0.window_?.cgWindowId == wid }), !view.thumbnail.isHidden {
+            let thumbnailSize = TileView.thumbnailSize(size, false)
+            let newSize = thumbnailSize.width != view.thumbnail.frame.width || thumbnailSize.height != view.thumbnail.frame.height
+            if let display {
+                view.thumbnail.updateContents(display, thumbnailSize)
                 // if the thumbnail size has changed, we need to refresh the open UI
                 if newSize {
                     App.refreshOpenUiAfterExternalEvent([])
                 }
+            } else if let icon {
+                view.thumbnail.updateContents(.cgImage(icon), iconPlaceholderThumbnailSize(), .resizeAspect)
             }
-            PreviewPanel.updateIfShowing(cgWindowId, screenshot, position, size)
+        }
+        if let display {
+            PreviewPanel.updateIfShowing(wid, display, position, size)
         }
     }
 
