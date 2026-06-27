@@ -220,13 +220,12 @@ class TileView: FlippedView {
                 // it's resident → cheap to composite even after a long idle.
                 thumbnail.updateContents(screenshot, TileView.thumbnailSize(element.size, false))
             } else {
-                // No thumbnail captured yet: app icon, sized to the window's
-                // thumbnail dimensions (when known) so the tile keeps its size and
-                // doesn't resize/shift/overlap when the real screenshot lands.
-                let size = element.size != nil
-                    ? TileView.thumbnailSize(element.size, false)
-                    : TileView.thumbnailSize(element.icon?.size(), true)
-                thumbnail.updateContents(.cgImage(element.icon), size)
+                // No usable thumbnail (never captured, or capture rejected): show
+                // the app icon aspect-fit into the window's thumbnail dimensions
+                // (when known) so the cell keeps its size and the icon isn't
+                // stretched to the window's rectangle. Must match
+                // showAppIconOnVisibleTileIfNeeded so async rejects don't flicker.
+                thumbnail.updateContents(.cgImage(element.icon), element.iconPlaceholderThumbnailSize(), .resizeAspect)
             }
         }
         let title = getAppOrAndWindowTitle()

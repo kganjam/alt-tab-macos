@@ -77,7 +77,12 @@ class LightImageLayer: CALayer {
         handRaisedLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
     }
 
-    func updateContents(_ caLayerContents: CALayerContents, _ size: NSSize) {
+    func updateContents(_ caLayerContents: CALayerContents, _ size: NSSize, _ gravity: CALayerContentsGravity = .resize) {
+        // Screenshots fill the cell (.resize — the layer already matches the
+        // window's aspect, so no distortion). An app-icon placeholder must NOT be
+        // stretched into the window's rectangle or it looks squished; callers pass
+        // .resizeAspect for it so the square icon is centered, letterboxed.
+        if contentsGravity != gravity { contentsGravity = gravity }
         var fullyTransparent = false
         switch caLayerContents {
         case .cgImage(let image?):

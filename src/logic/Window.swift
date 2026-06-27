@@ -143,16 +143,28 @@ class Window {
     /// thumbnail with the app icon (or clear it). Used whenever we drop a cached
     /// screenshot — geometry invalidation, or rejecting an unusable capture — so
     /// the open panel reflects the change immediately instead of keeping the old
-    /// (now-cleared, e.g. black) image until the next layout.
+    /// (now-cleared, e.g. black) image until the next layout. Sizes and draws the
+    /// icon identically to the no-thumbnail branch of updateRecycledCellWithNewContent
+    /// (same `iconPlaceholderThumbnailSize`, aspect-fit), so a window cycling
+    /// through reject doesn't flip its tile between square and rect.
     private func showAppIconOnVisibleTileIfNeeded() {
         guard App.appIsBeingUsed,
               let view = (TilesView.recycledViews.first { $0.window_?.cgWindowId == cgWindowId }),
               !view.thumbnail.isHidden else { return }
         if let icon {
-            view.thumbnail.updateContents(.cgImage(icon), TileView.thumbnailSize(icon.size(), true))
+            view.thumbnail.updateContents(.cgImage(icon), iconPlaceholderThumbnailSize(), .resizeAspect)
         } else {
             view.thumbnail.releaseImage()
         }
+    }
+
+    /// Size for the app-icon placeholder shown when a window has no usable
+    /// screenshot. Matches the window's thumbnail dimensions when known so the
+    /// cell keeps its size (no shift if a real screenshot later lands); falls back
+    /// to the icon's own size otherwise. The icon is drawn aspect-fit (not
+    /// stretched) into this rect by the caller.
+    func iconPlaceholderThumbnailSize() -> NSSize {
+        size != nil ? TileView.thumbnailSize(size, false) : TileView.thumbnailSize(icon?.size(), true)
     }
 
     /// Parallels Coherence rewrites the window title on guest page/tab
@@ -207,6 +219,10 @@ class Window {
             // Scoped to Coherence windows — real macOS windows don't have this
             // failure mode, so they skip the per-capture scan. The 98% threshold is
             // far above any real (even dark-mode) content, which carries text/chrome.
+            // For non-black Coherence captures, also compute a content signature so
+            // the cache can flag pixel-identical captures across windows (Coherence
+            // handing back one shared guest surface — the cross-window mismatch).
+            var signature: UInt64 = 0
             if isParallelsCoherenceWindow, case let .cgImage(img?) = screenshot {
                 let frac = ThumbnailBitmap.blackFraction(of: img)
                 if frac >= 0.98 {
@@ -215,8 +231,9 @@ class Window {
                     showAppIconOnVisibleTileIfNeeded()
                     return
                 }
+                signature = ThumbnailBitmap.contentSignature(of: img)
             }
-            ThumbnailCache.shared.writeCapture(wid: wid, image: screenshot, liveSurface: liveSurface, capturedBy: thumbnailProvenanceTag)
+            ThumbnailCache.shared.writeCapture(wid: wid, image: screenshot, liveSurface: liveSurface, capturedBy: thumbnailProvenanceTag, signature: signature)
         }
         thumbnailUpdateCount += 1
         if !App.appIsBeingUsed || !shouldShowTheUser { return }

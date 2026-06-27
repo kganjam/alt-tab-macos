@@ -21,8 +21,8 @@ class LightImageView: NSView {
         imageLayer.frame = bounds
     }
 
-    func updateContents(_ caLayerContents: CALayerContents, _ size: NSSize) {
-        imageLayer.updateContents(caLayerContents, size)
+    func updateContents(_ caLayerContents: CALayerContents, _ size: NSSize, _ gravity: CALayerContentsGravity = .resize) {
+        imageLayer.updateContents(caLayerContents, size, gravity)
         if frame.size != size {
             frame.size = size
         }

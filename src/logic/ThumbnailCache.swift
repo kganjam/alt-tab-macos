@@ -64,6 +64,10 @@ final class ThumbnailCache {
         /// "Parallels tile shows another Parallels app's content" symptom, which
         /// implies a cgWindowId collision or Parallels reusing a wid across apps.
         var capturedBy: String?
+        /// Perceptual aHash of the stored bitmap (0 if not computed). Diagnostic:
+        /// two entries with the same non-zero signature but different wids means a
+        /// shared/duplicate capture surface (Parallels Coherence cross-window).
+        var signature: UInt64 = 0
         /// True iff `thumbnail` is backed by a live WindowServer capture
         /// IOSurface (SCK pixelBuffer, or a non-detached CGSHWCaptureWindowList
         /// CGImage). False for malloc-backed detached copies. This is what
@@ -189,7 +193,7 @@ final class ThumbnailCache {
     /// In-panel captures (`refreshVisibleThumbnailsAfterShowUi` source)
     /// don't set `inFlightScheduleId` (they didn't go through `popDue`), so
     /// they only store the bitmap and don't perturb BG scheduling.
-    func writeCapture(wid: CGWindowID, image: CALayerContents, liveSurface: Bool = true, capturedBy: String? = nil) {
+    func writeCapture(wid: CGWindowID, image: CALayerContents, liveSurface: Bool = true, capturedBy: String? = nil, signature: UInt64 = 0) {
         lock.lock(); defer { lock.unlock() }
         guard entries[wid] != nil else { return }
         var e = entries[wid]!
@@ -200,7 +204,18 @@ final class ThumbnailCache {
         if let capturedBy, let prev = e.capturedBy, prev != capturedBy {
             Diagnostics.log("THUMBPROV", "wid=\(wid) capture writer changed: '\(prev)' -> '\(capturedBy)' — same cgWindowId now captured from a different app")
         }
+        // Diagnostic: a non-zero signature matching a *different* wid's stored
+        // bitmap means two windows captured pixel-identical content — Parallels
+        // Coherence handing back one shared guest surface for multiple window ids,
+        // so several tiles show the same wrong image. Provenance misses this
+        // because each capture is correctly tagged by its requesting window.
+        if signature != 0 {
+            for (otherWid, oe) in entries where otherWid != wid && oe.signature == signature && oe.thumbnail != nil {
+                Diagnostics.log("THUMBDUP", "wid=\(wid) (\(capturedBy ?? "?")) capture is pixel-identical to wid=\(otherWid) (\(oe.capturedBy ?? "?")) sig=\(signature) — shared/duplicate capture surface")
+            }
+        }
         if let capturedBy { e.capturedBy = capturedBy }
+        e.signature = signature
         e.thumbnail = image
         e.isLiveSurface = liveSurface
         e.lastUpdatedAt = CFAbsoluteTimeGetCurrent()
@@ -221,6 +236,7 @@ final class ThumbnailCache {
         e.thumbnail = nil
         e.isLiveSurface = false
         e.lastUpdatedAt = 0
+        e.signature = 0
         finishCaptureLocked(&e, wid: wid)
     }
 

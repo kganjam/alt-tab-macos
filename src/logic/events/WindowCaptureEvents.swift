@@ -521,6 +521,31 @@ enum ThumbnailBitmap {
         return Double(darkCount) / Double(dim * dim)
     }
 
+    /// Cheap 64-bit average-hash (aHash) of an image's luma. Diagnostic for the
+    /// cross-window mismatch: when Parallels Coherence returns one shared guest
+    /// surface for several window ids, their captures come back pixel-identical,
+    /// so several tiles show the same (wrong) image. Provenance can't catch this
+    /// (it tags by which window requested the capture, not by content); a matching
+    /// signature across different wids does. Perceptual 8x8 → near-identical
+    /// frames collide; returns 0 only on failure.
+    static func contentSignature(of cgImage: CGImage) -> UInt64 {
+        let dim = 8
+        guard let ctx = CGContext(data: nil, width: dim, height: dim,
+                                  bitsPerComponent: 8, bytesPerRow: dim,
+                                  space: CGColorSpaceCreateDeviceGray(),
+                                  bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return 0 }
+        ctx.interpolationQuality = .low
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: dim, height: dim))
+        guard let data = ctx.data else { return 0 }
+        let pixels = data.bindMemory(to: UInt8.self, capacity: dim * dim)
+        var sum = 0
+        for i in 0..<(dim * dim) { sum += Int(pixels[i]) }
+        let avg = sum / (dim * dim)
+        var hash: UInt64 = 0
+        for i in 0..<(dim * dim) where Int(pixels[i]) > avg { hash |= (UInt64(1) << UInt64(i)) }
+        return hash
+    }
+
     /// Target pixel size for a stored thumbnail: the full-resolution capture
     /// scaled to fit the largest on-screen thumbnail (points) at retina (2×),
     /// preserving aspect. Reads `TilesPanel.maxPossibleThumbnailSize` (set on
