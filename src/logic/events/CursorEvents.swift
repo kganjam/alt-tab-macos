@@ -18,16 +18,19 @@ class CursorEvents {
     private static var lastHoverPollLocation: CGPoint?
 
     /// Run the LEFT-click tap on a dedicated thread instead of the main runloop.
-    /// The main-runloop tap is disabled by macOS (and drops the event) whenever
-    /// the main thread stalls past the tap timeout — which is why thumbnail clicks
-    /// were intermittently lost under load. A dedicated thread services the tap's
-    /// mach port promptly regardless of main-thread load; the click is absorbed
-    /// synchronously from a cached geometry snapshot and the focus work is
-    /// dispatched to main (delayed under load, never dropped). Default on; set
-    /// `offMainClickTapEnabled -bool false` + relaunch to fall back to the
-    /// original single main-thread tap.
+    /// Intent: the main-runloop tap is disabled by macOS (and drops the event)
+    /// when the main thread stalls past the tap timeout. A dedicated thread would
+    /// service the tap's mach port regardless of main-thread load.
+    ///
+    /// DEFAULT OFF: in practice the dedicated-thread tap was observed not to
+    /// reliably receive events (recv=0), so clicks did nothing — worse than the
+    /// main-thread tap. The proven main-thread path keeps all the click-correctness
+    /// fixes (press-window-id focus, dropped-down recovery) and the in-panel
+    /// refresh burst-cap reduces the stalls that caused the original drops. Set
+    /// `offMainClickTapEnabled -bool true` + relaunch to re-try the off-main tap
+    /// (its receipt/thread diagnostics will show whether it's actually servicing).
     private static var offMainClickTapEnabled: Bool {
-        UserDefaults.standard.object(forKey: "offMainClickTapEnabled") as? Bool ?? true
+        UserDefaults.standard.object(forKey: "offMainClickTapEnabled") as? Bool ?? false
     }
 
     // MARK: - Click-tap geometry snapshot (written on main, read on the click-tap thread)
@@ -180,10 +183,13 @@ class CursorEvents {
     /// port is processed promptly even when the main thread is stalled.
     private static func startClickTapThread() {
         let thread = Thread {
-            guard let clickTap else { return }
+            guard let clickTap else { Diagnostics.log("SESSION", "click-tap thread: clickTap nil — exiting (tap dead)"); return }
             let source = CFMachPortCreateRunLoopSource(nil, clickTap, 0)
             CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+            Diagnostics.log("SESSION", "click-tap thread: runloop running")
             CFRunLoopRun()
+            // If we get here the runloop emptied and the tap is no longer serviced.
+            Diagnostics.log("SESSION", "click-tap thread: runloop EXITED — left-click tap is DEAD")
         }
         thread.name = "com.lwouis.alt-tab-macos.clickTap"
         thread.qualityOfService = .userInteractive
@@ -250,6 +256,7 @@ class CursorEvents {
             return Unmanaged.passUnretained(cgEvent)
         }
         clickTapDownInSearchField = false
+        Diagnostics.log("CLICKTAP", "recv left-down → absorb + defer")
         let enqueuedAt = CFAbsoluteTimeGetCurrent()
         DispatchQueue.main.async { performLeftDownAction(enqueuedAt: enqueuedAt) }
         return nil
