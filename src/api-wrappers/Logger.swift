@@ -172,6 +172,8 @@ class Diagnostics {
         "AXTITLE": .warn,
         "CLICKMISROUTE": .warn,
         "CLICKAFTER": .warn,
+        "CLICKMISS": .warn,
+        "CTAPDISABLE": .warn,
         "CAPTURE": .warn,
         // info — normal-flow events (default for unknown categories)
         "PANEL": .info,
