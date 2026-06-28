@@ -266,6 +266,7 @@ class CursorEvents {
             return Unmanaged.passUnretained(cgEvent)
         }
         let enqueuedAt = CFAbsoluteTimeGetCurrent()
+        Diagnostics.log("CLICKTAP", "recv left-up → absorb + defer focus")
         DispatchQueue.main.async { performLeftUpAction(enqueuedAt: enqueuedAt) }
         return nil
     }
@@ -320,6 +321,7 @@ class CursorEvents {
             } else if target !== downTarget {
                 Diagnostics.log("CLICKMISS", "recovered (off-main): down/up mismatch down=\(describeTarget(downTarget)) → focusing tile#\(target.window_?.cgWindowId ?? 0)")
             }
+            Diagnostics.log("CLICKTAP", "FOCUS tile#\(target.window_?.cgWindowId ?? 0) '\(target.window_?.title ?? "?")' (lag=\(Int(lagMs))ms) — calling mouseUpCallback")
             target.mouseUpCallback()
             return
         }
