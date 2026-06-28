@@ -664,6 +664,19 @@ class TilesView {
 
     static func startVisibleThumbnailRefreshTimer() {
         stopVisibleThumbnailRefreshTimer()
+        // The periodic in-panel refresh fires a batch of CGSHWCaptureWindowList
+        // calls that contend with the main thread for the WindowServer connection;
+        // under load that stalls the main runloop long enough for the click event
+        // tap to time out and DROP the click (observed: a "visible thumbnail
+        // refresh reason=timer" immediately followed by CTAPDISABLE-by-TIMEOUT,
+        // dropping a click on the tile the user was aiming at). It only keeps
+        // already-shown thumbnails live — on-show capture already populates them —
+        // so default it OFF: reliable clicks beat slightly-fresher tiles. Re-enable
+        // with `defaults write … inPanelPeriodicThumbnailRefresh -bool true`.
+        guard UserDefaults.standard.object(forKey: "inPanelPeriodicThumbnailRefresh") as? Bool ?? false else {
+            Diagnostics.log("CAPTURE", "in-panel periodic thumbnail refresh DISABLED (prevents click-dropping main-thread stalls)")
+            return
+        }
         let interval = TimeInterval(max(500, RuntimeFlags.visibleThumbnailRefreshIntervalMs)) / 1000
         let timer = Timer(timeInterval: interval, repeats: true) { _ in refreshVisibleThumbnailsIfNeeded("timer") }
         visibleThumbnailRefreshTimer = timer
