@@ -8,6 +8,7 @@ class CursorEvents {
     private static var clickTapUsed = false
     private static var shouldBeEnabled: Bool!
     private static var mouseDownTarget: AnyObject?         // MAIN-thread only (set/read in click actions)
+    private static var mouseDownWindowId: CGWindowID = 0   // cgWindowId of the tile the user pressed on (0 = none)
     private static var mouseDownInsideSearchField = false  // MAIN-tap path only
     private static var clickTapDownInSearchField = false   // click-tap THREAD only
     private static var outsideMouseDownPassedThroughButton: String?
@@ -284,6 +285,7 @@ class CursorEvents {
             return
         }
         mouseDownTarget = (findButtonUnderPointer() ?? findTileViewUnderPointer()) as AnyObject?
+        mouseDownWindowId = (mouseDownTarget as? TileView)?.window_?.cgWindowId ?? 0
     }
 
     private static func performLeftUpAction(enqueuedAt: CFAbsoluteTime) {
@@ -307,25 +309,35 @@ class CursorEvents {
             return
         }
         let downTarget = mouseDownTarget
+        let downWid = mouseDownWindowId
         mouseDownTarget = nil
+        mouseDownWindowId = 0
+        resolveLeftClickFocus(downTarget: downTarget, downWid: downWid, lagMs: lagMs)
+    }
+
+    /// Decide what a completed left click focuses. Focuses the WINDOW the user
+    /// PRESSED on — the thumbnail they saw and aimed at — located via whatever tile
+    /// currently shows it, so it's robust to the grid relaying out / tiles being
+    /// recycled between press and release (the bug where a stationary click focused
+    /// a different window than the one pressed). Falls back to the release tile only
+    /// when there was no press target (a dropped mousedown event). Buttons keep
+    /// strict press+release semantics so a traffic-light action never misfires.
+    private static func resolveLeftClickFocus(downTarget: AnyObject?, downWid: CGWindowID, lagMs: Double) {
         if let button = findButtonUnderPointer(), button === downTarget {
             button.onClick()
             return
         }
-        // Focus whatever tile is under the cursor at release (see handleLeftMouseUp
-        // for the rationale: recovers clicks whose down was dropped, or where a
-        // relayout/drift moved the tile between press and release).
-        if let target = findTileViewUnderPointer() {
-            if downTarget == nil {
-                Diagnostics.log("CLICKMISS", "recovered (off-main): no mousedown target → focusing tile#\(target.window_?.cgWindowId ?? 0) (lag=\(Int(lagMs))ms)")
-            } else if target !== downTarget {
-                Diagnostics.log("CLICKMISS", "recovered (off-main): down/up mismatch down=\(describeTarget(downTarget)) → focusing tile#\(target.window_?.cgWindowId ?? 0)")
-            }
-            Diagnostics.log("CLICKTAP", "FOCUS tile#\(target.window_?.cgWindowId ?? 0) '\(target.window_?.title ?? "?")' (lag=\(Int(lagMs))ms) — calling mouseUpCallback")
-            target.mouseUpCallback()
+        if downWid != 0, let tile = TilesView.recycledViews.first(where: { $0.window_?.cgWindowId == downWid }) {
+            Diagnostics.log("CLICKTAP", "FOCUS press-target wid#\(downWid) '\(tile.window_?.title ?? "?")' (lag=\(Int(lagMs))ms)")
+            tile.mouseUpCallback()
             return
         }
-        Diagnostics.log("CLICKMISS", "in-panel left click did nothing (off-main): down=\(describeTarget(downTarget)) upTile=nil (lag=\(Int(lagMs))ms)")
+        if let upTile = findTileViewUnderPointer() {
+            Diagnostics.log("CLICKMISS", "recovered: no press target (down=\(describeTarget(downTarget)) wid#\(downWid)) → release tile#\(upTile.window_?.cgWindowId ?? 0) (lag=\(Int(lagMs))ms)")
+            upTile.mouseUpCallback()
+            return
+        }
+        Diagnostics.log("CLICKMISS", "left click did nothing: downWid#\(downWid) upTile=nil (lag=\(Int(lagMs))ms)")
     }
 
     /// Logs the click-tap decision so absorbed events become visible.
@@ -354,6 +366,7 @@ class CursorEvents {
             return handleOutsideUiMouseDown("left", cgEvent)
         }
         mouseDownTarget = (findButtonUnderPointer() ?? findTileViewUnderPointer()) as AnyObject?
+        mouseDownWindowId = (mouseDownTarget as? TileView)?.window_?.cgWindowId ?? 0
         logTapDecision("left", "down", cgEvent, absorbed: true, reason: "insideUi")
         return nil
     }
@@ -376,36 +389,13 @@ class CursorEvents {
             return nil
         }
         let downTarget = mouseDownTarget
+        let downWid = mouseDownWindowId
         mouseDownTarget = nil
-        let upButton = findButtonUnderPointer()
-        if let button = upButton, button === downTarget {
-            button.onClick()
-            logTapDecision("left", "up", cgEvent, absorbed: true, reason: "button")
-            return nil
-        }
-        let upTile = findTileViewUnderPointer()
-        // Focus whatever tile is under the cursor at release. We deliberately do
-        // NOT require it to match the mousedown target: a thumbnail click is
-        // otherwise swallowed when the mousedown event was dropped (event-tap
-        // timeout during a main-thread stall → down=nil, confirmed in the logs),
-        // or when a relayout/drift moved the tile under the cursor between press
-        // and release. Tiles have no drag gesture, so selecting the release tile
-        // is correct and recovers these misses. Buttons (above) keep strict
-        // press+release semantics so a traffic-light action never misfires.
-        if let target = upTile {
-            if downTarget == nil {
-                Diagnostics.log("CLICKMISS", "recovered: no mousedown target (likely dropped down event) → focusing release tile#\(target.window_?.cgWindowId ?? 0)")
-            } else if target !== downTarget {
-                Diagnostics.log("CLICKMISS", "recovered: down/up mismatch down=\(describeTarget(downTarget)) → focusing release tile#\(target.window_?.cgWindowId ?? 0)")
-            }
-            target.mouseUpCallback()
-            logTapDecision("left", "up", cgEvent, absorbed: true, reason: "tile")
-            return nil
-        }
-        // Nothing under the release at all.
-        let p = pointerLocationInWindow()
-        Diagnostics.log("CLICKMISS", "in-panel left click did nothing: down=\(describeTarget(downTarget)) upTile=nil upButton=\(describeTarget(upButton)) at (\(Int(p.x)),\(Int(p.y)))")
-        logTapDecision("left", "up", cgEvent, absorbed: true, reason: "insideUi-noTarget")
+        mouseDownWindowId = 0
+        // Prefer the pressed window; fall back to the release tile only on a dropped
+        // mousedown (see resolveLeftClickFocus).
+        resolveLeftClickFocus(downTarget: downTarget, downWid: downWid, lagMs: 0)
+        logTapDecision("left", "up", cgEvent, absorbed: true, reason: "resolved")
         return nil
     }
 
