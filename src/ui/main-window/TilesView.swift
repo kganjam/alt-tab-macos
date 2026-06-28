@@ -599,27 +599,53 @@ class TilesView {
     }
 
     static func visibleWindowsForThumbnailRefresh(limit: Int = 48) -> [Window] {
-        var result = [Window]()
+        var candidates = [Window]()
         var seen = Set<CGWindowID>()
-        func append(_ window: Window?) {
+        func consider(_ window: Window?) {
             guard let window,
                   !window.isWindowlessApp,
                   let wid = window.cgWindowId,
                   !seen.contains(wid),
                   Windows.shouldDisplay(window) else { return }
             seen.insert(wid)
-            result.append(window)
+            candidates.append(window)
         }
-        append(Windows.selectedWindow())
+        let selected = Windows.selectedWindow()
         let visibleRect = scrollView.contentView.bounds.insetBy(dx: 0, dy: -max(80, TileView.height(layoutCache.labelHeight)))
         for view in recycledViews where view.frame.intersects(visibleRect) {
-            append(view.window_)
-            if result.count >= limit { return result }
+            consider(view.window_)
         }
-        if result.isEmpty {
+        if candidates.isEmpty {
             for window in Windows.list {
-                append(window)
-                if result.count >= limit { break }
+                consider(window)
+                if candidates.count >= limit { break }
+            }
+        }
+        // Cap the per-tick burst. Re-capturing every visible thumbnail each tick
+        // hands the 2-wide screenshots queue a big batch of CGSHWCaptureWindowList
+        // calls that contend with the main thread for the WindowServer connection;
+        // under WindowServer load that stalls the main runloop enough to time out
+        // the click event tap and drop clicks. Refresh only the stalest few each
+        // tick (always including the selected window) — coverage rotates across
+        // ticks, but the instantaneous spike stays small. Tunable via
+        // `visibleThumbnailRefreshMaxPerTick` (default 16).
+        let maxPerTick = max(1, UserDefaults.standard.object(forKey: "visibleThumbnailRefreshMaxPerTick") as? Int ?? 16)
+        guard candidates.count > maxPerTick else { return candidates }
+        let cache = ThumbnailCache.shared
+        let byStaleness = candidates
+            .map { (window: $0, updatedAt: cache.lastUpdatedAt(wid: $0.cgWindowId ?? 0)) }
+            .sorted { $0.updatedAt < $1.updatedAt }
+            .map { $0.window }
+        var result = [Window]()
+        var added = Set<CGWindowID>()
+        if let selected, let swid = selected.cgWindowId, seen.contains(swid) {
+            result.append(selected)
+            added.insert(swid)
+        }
+        for window in byStaleness {
+            guard result.count < maxPerTick else { break }
+            if let wid = window.cgWindowId, added.insert(wid).inserted {
+                result.append(window)
             }
         }
         return result
