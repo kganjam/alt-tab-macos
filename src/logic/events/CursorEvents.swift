@@ -2,15 +2,63 @@ import Cocoa
 import Carbon.HIToolbox.Events
 
 class CursorEvents {
-    private static var eventTap: CFMachPort!
+    private static var eventTap: CFMachPort!        // main-runloop tap (mouseMoved + right/other; + left when off-main disabled)
+    private static var clickTap: CFMachPort!         // dedicated-thread tap (left clicks only, off-main mode)
+    private static var clickTapThread: Thread?
+    private static var clickTapUsed = false
     private static var shouldBeEnabled: Bool!
-    private static var mouseDownTarget: AnyObject?
-    private static var mouseDownInsideSearchField = false
+    private static var mouseDownTarget: AnyObject?         // MAIN-thread only (set/read in click actions)
+    private static var mouseDownInsideSearchField = false  // MAIN-tap path only
+    private static var clickTapDownInSearchField = false   // click-tap THREAD only
     private static var outsideMouseDownPassedThroughButton: String?
     static var deadZoneInitialPosition: CGPoint?
     static var isAllowedToMouseHover = true
     private static var hoverPollTimer: Timer?
     private static var lastHoverPollLocation: CGPoint?
+
+    /// Run the LEFT-click tap on a dedicated thread instead of the main runloop.
+    /// The main-runloop tap is disabled by macOS (and drops the event) whenever
+    /// the main thread stalls past the tap timeout — which is why thumbnail clicks
+    /// were intermittently lost under load. A dedicated thread services the tap's
+    /// mach port promptly regardless of main-thread load; the click is absorbed
+    /// synchronously from a cached geometry snapshot and the focus work is
+    /// dispatched to main (delayed under load, never dropped). Default on; set
+    /// `offMainClickTapEnabled -bool false` + relaunch to fall back to the
+    /// original single main-thread tap.
+    private static var offMainClickTapEnabled: Bool {
+        UserDefaults.standard.object(forKey: "offMainClickTapEnabled") as? Bool ?? true
+    }
+
+    // MARK: - Click-tap geometry snapshot (written on main, read on the click-tap thread)
+
+    private struct ClickTapGeometry {
+        var searchFieldRectCocoaGlobal: CGRect?   // nil when the search field is hidden
+        var flipHeight: CGFloat = 0               // main-screen height, to map CG-global → Cocoa-global
+        var hasMarkedText = false                 // IME composition in the search field
+    }
+    private static var clickGeo = ClickTapGeometry()
+    private static let clickGeoLock = NSLock()
+
+    /// Recompute the click-tap geometry on the main thread. Called frequently
+    /// (every hover-poll tick while the panel is open, ≤16ms stale) so the
+    /// click-tap thread always has fresh search-field/IME state without hunting
+    /// for every layout/search hook.
+    static func refreshClickTapGeometry() {
+        guard Thread.isMainThread else { return }
+        var g = ClickTapGeometry()
+        g.flipHeight = NSScreen.main?.frame.height ?? 0
+        g.hasMarkedText = TilesView.hasMarkedText()
+        let sf = TilesView.searchField
+        if !sf.isHidden, let win = sf.window {
+            g.searchFieldRectCocoaGlobal = win.convertToScreen(sf.convert(sf.bounds, to: nil))
+        }
+        clickGeoLock.lock(); clickGeo = g; clickGeoLock.unlock()
+    }
+
+    private static func readClickGeo() -> ClickTapGeometry {
+        clickGeoLock.lock(); defer { clickGeoLock.unlock() }
+        return clickGeo
+    }
 
     static func observe() {
         observe_()
@@ -23,8 +71,12 @@ class CursorEvents {
         if !enabled {
             deadZoneInitialPosition = nil
         }
+        if enabled { refreshClickTapGeometry() }
         if let eventTap {
             CGEvent.tapEnable(tap: eventTap, enable: enabled)
+        }
+        if let clickTap {
+            CGEvent.tapEnable(tap: clickTap, enable: enabled)
         }
         toggleHoverPoll(enabled)
     }
@@ -47,6 +99,8 @@ class CursorEvents {
         lastHoverPollLocation = nil
         guard enabled else { return }
         let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { _ in
+            // Keep the click-tap thread's geometry fresh (search field / IME).
+            refreshClickTapGeometry()
             let location = CGEvent(source: nil)?.location ?? .zero
             guard isAllowedToReactToPointerMovement(location) else { return }
             let previous = lastHoverPollLocation
@@ -72,30 +126,71 @@ class CursorEvents {
     }
 
     static func reEnableTapIfNeeded() {
-        guard let eventTap, shouldBeEnabled, !CGEvent.tapIsEnabled(tap: eventTap) else { return }
-        CGEvent.tapEnable(tap: eventTap, enable: true)
-        Logger.warning { "" }
+        if let eventTap, shouldBeEnabled, !CGEvent.tapIsEnabled(tap: eventTap) {
+            CGEvent.tapEnable(tap: eventTap, enable: true)
+            Logger.warning { "" }
+        }
+        if let clickTap, shouldBeEnabled, !CGEvent.tapIsEnabled(tap: clickTap) {
+            CGEvent.tapEnable(tap: clickTap, enable: true)
+        }
+    }
+
+    private static func mask(_ types: [CGEventType]) -> CGEventMask {
+        types.reduce(CGEventMask(0)) { $0 | (1 << $1.rawValue) }
     }
 
     private static func observe_() {
-        let eventMask = [CGEventType.leftMouseDown, CGEventType.leftMouseUp, CGEventType.rightMouseDown, CGEventType.rightMouseUp, CGEventType.otherMouseDown, CGEventType.otherMouseUp, CGEventType.mouseMoved].reduce(CGEventMask(0), { $0 | (1 << $1.rawValue) })
+        let leftTypes: [CGEventType] = [.leftMouseDown, .leftMouseUp]
+        let allTypes: [CGEventType] = [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp, .mouseMoved]
+        // Try to stand up the dedicated-thread LEFT-click tap first; only then do
+        // we know whether the main tap should exclude left clicks.
+        clickTapUsed = false
+        if offMainClickTapEnabled {
+            clickTap = CGEvent.tapCreate(
+                tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+                eventsOfInterest: mask(leftTypes), callback: handleClickTapEvent, userInfo: nil)
+            clickTapUsed = (clickTap != nil)
+        }
+        let mainTypes = clickTapUsed ? allTypes.filter { !leftTypes.contains($0) } : allTypes
         // CGEvent.tapCreate returns nil if ensureAccessibilityCheckboxIsChecked() didn't pass
         eventTap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .defaultTap,
-            eventsOfInterest: eventMask,
-            callback: handleEvent,
-            userInfo: nil)
-        if let eventTap {
-            toggle(false)
-            let runLoopSource = CFMachPortCreateRunLoopSource(nil, eventTap, 0)
-            // we run on main-thread directly since all we do is check NSEvent and UI coordinates, which we must do on main-thread
-            CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
-        } else {
+            tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+            eventsOfInterest: mask(mainTypes), callback: handleEvent, userInfo: nil)
+        guard let eventTap else {
             App.restart()
+            return
+        }
+        toggle(false)
+        let runLoopSource = CFMachPortCreateRunLoopSource(nil, eventTap, 0)
+        // The main tap runs on the main runloop: it only does mouseMoved (hover/
+        // dead-zone) and right/other clicks, all of which must touch NSEvent/UI on
+        // main. LEFT clicks go to the dedicated-thread clickTap (see below) so they
+        // survive main-thread stalls.
+        CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
+        if clickTapUsed {
+            startClickTapThread()
+            Diagnostics.log("CTAP", "left-click tap on dedicated thread (off-main); main tap handles moved/right/other")
+        } else {
+            Diagnostics.log("CTAP", "single main-thread tap (off-main left-click tap disabled or unavailable)")
         }
     }
+
+    /// Dedicated thread whose runloop services the LEFT-click tap so its mach
+    /// port is processed promptly even when the main thread is stalled.
+    private static func startClickTapThread() {
+        let thread = Thread {
+            guard let clickTap else { return }
+            let source = CFMachPortCreateRunLoopSource(nil, clickTap, 0)
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+            CFRunLoopRun()
+        }
+        thread.name = "com.lwouis.alt-tab-macos.clickTap"
+        thread.qualityOfService = .userInteractive
+        thread.start()
+        clickTapThread = thread
+    }
+
+    // MARK: - Main-runloop tap (mouseMoved + right/other; + left when off-main disabled)
 
     private static let handleEvent: CGEventTapCallBack = { _, type, cgEvent, _ in
         switch type {
@@ -112,12 +207,111 @@ class CursorEvents {
                 // we intentionally turn the tap off on panel-close (shouldBeEnabled
                 // == false) is benign and would just be noise.
                 if shouldBeEnabled == true {
-                    Diagnostics.log("CTAPDISABLE", "event tap disabled by \(type == .tapDisabledByTimeout ? "TIMEOUT (main-thread stall → events dropped)" : "userInput") while enabled — clicks in this window are lost; re-enabling")
+                    Diagnostics.log("CTAPDISABLE", "main tap disabled by \(type == .tapDisabledByTimeout ? "TIMEOUT (main-thread stall → moved/right/other dropped)" : "userInput") while enabled; re-enabling")
                     CGEvent.tapEnable(tap: eventTap!, enable: true)
                 }
                 return Unmanaged.passUnretained(cgEvent)
             default: return Unmanaged.passUnretained(cgEvent)
         }
+    }
+
+    // MARK: - Dedicated-thread LEFT-click tap
+
+    private static let handleClickTapEvent: CGEventTapCallBack = { _, type, cgEvent, _ in
+        switch type {
+            case .leftMouseDown: return clickTapLeftDown(cgEvent)
+            case .leftMouseUp: return clickTapLeftUp(cgEvent)
+            case .tapDisabledByUserInput, .tapDisabledByTimeout:
+                if shouldBeEnabled == true {
+                    // Should be rare now: this tap is on its own thread, not blocked
+                    // by main-thread stalls.
+                    Diagnostics.log("CTAPDISABLE", "CLICK tap (dedicated thread) disabled by \(type == .tapDisabledByTimeout ? "TIMEOUT" : "userInput"); re-enabling")
+                    CGEvent.tapEnable(tap: clickTap!, enable: true)
+                }
+                return Unmanaged.passUnretained(cgEvent)
+            default: return Unmanaged.passUnretained(cgEvent)
+        }
+    }
+
+    /// Runs on the click-tap thread. Decides absorb-vs-pass synchronously from the
+    /// cached geometry, then dispatches the real (main-thread) focus work with the
+    /// EVENT's own location so a delayed action still targets where the user
+    /// actually clicked.
+    private static func clickTapLeftDown(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
+        let loc = cgEvent.location
+        let geo = readClickGeo()
+        if geo.hasMarkedText || ContextMenuEvents.isMenuOpen {
+            return Unmanaged.passUnretained(cgEvent)
+        }
+        if let sf = geo.searchFieldRectCocoaGlobal,
+           sf.contains(CGPoint(x: loc.x, y: geo.flipHeight - loc.y)) {
+            clickTapDownInSearchField = true
+            return Unmanaged.passUnretained(cgEvent)
+        }
+        clickTapDownInSearchField = false
+        DispatchQueue.main.async { performLeftDownAction(at: loc) }
+        return nil
+    }
+
+    private static func clickTapLeftUp(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
+        let loc = cgEvent.location
+        let geo = readClickGeo()
+        if geo.hasMarkedText || ContextMenuEvents.isMenuOpen {
+            return Unmanaged.passUnretained(cgEvent)
+        }
+        let inSearch = geo.searchFieldRectCocoaGlobal.map { $0.contains(CGPoint(x: loc.x, y: geo.flipHeight - loc.y)) } ?? false
+        if clickTapDownInSearchField || inSearch {
+            clickTapDownInSearchField = false
+            return Unmanaged.passUnretained(cgEvent)
+        }
+        DispatchQueue.main.async { performLeftUpAction(at: loc) }
+        return nil
+    }
+
+    /// CG-global (top-left) event location → TilesPanel window coordinates. Main only.
+    private static func windowPoint(fromCGGlobal loc: CGPoint) -> NSPoint {
+        let flip = NSScreen.main?.frame.height ?? 0
+        let cocoaGlobal = NSPoint(x: loc.x, y: flip - loc.y)
+        return TilesPanel.shared.convertPoint(fromScreen: cocoaGlobal)
+    }
+
+    private static func performLeftDownAction(at loc: CGPoint) {
+        outsideMouseDownPassedThroughButton = nil
+        mouseDownTarget = nil
+        let wp = windowPoint(fromCGGlobal: loc)
+        guard isInsideUi(wp) else {
+            App.hideUi()
+            return
+        }
+        mouseDownTarget = (findButton(at: wp) ?? findTile(at: wp)) as AnyObject?
+    }
+
+    private static func performLeftUpAction(at loc: CGPoint) {
+        let wp = windowPoint(fromCGGlobal: loc)
+        guard isInsideUi(wp) else {
+            if mouseDownTarget == nil { App.hideUi() }
+            mouseDownTarget = nil
+            return
+        }
+        let downTarget = mouseDownTarget
+        mouseDownTarget = nil
+        if let button = findButton(at: wp), button === downTarget {
+            button.onClick()
+            return
+        }
+        // Focus whatever tile is under the cursor at release (see handleLeftMouseUp
+        // for the rationale: recovers clicks whose down was dropped, or where a
+        // relayout/drift moved the tile between press and release).
+        if let target = findTile(at: wp) {
+            if downTarget == nil {
+                Diagnostics.log("CLICKMISS", "recovered (off-main): no mousedown target → focusing release tile#\(target.window_?.cgWindowId ?? 0)")
+            } else if target !== downTarget {
+                Diagnostics.log("CLICKMISS", "recovered (off-main): down/up mismatch down=\(describeTarget(downTarget)) → focusing release tile#\(target.window_?.cgWindowId ?? 0)")
+            }
+            target.mouseUpCallback()
+            return
+        }
+        Diagnostics.log("CLICKMISS", "in-panel left click did nothing (off-main): down=\(describeTarget(downTarget)) upTile=nil at (\(Int(wp.x)),\(Int(wp.y)))")
     }
 
     /// Logs the click-tap decision so absorbed events become visible.
@@ -299,8 +493,12 @@ class CursorEvents {
         TilesPanel.shared.mouseLocationOutsideOfEventStream
     }
 
+    private static func isInsideUi(_ windowPoint: NSPoint) -> Bool {
+        TilesPanel.shared.contentLayoutRect.contains(windowPoint)
+    }
+
     private static func isPointerInsideUi() -> Bool {
-        TilesPanel.shared.contentLayoutRect.contains(pointerLocationInWindow())
+        isInsideUi(pointerLocationInWindow())
     }
 
     private static func isPointerInsideSearchField() -> Bool {
@@ -310,19 +508,22 @@ class CursorEvents {
         return searchField.bounds.contains(point)
     }
 
-    private static func pointerInOverlay() -> (TileOverView, NSPoint) {
+    private static func findButton(at windowPoint: NSPoint) -> TrafficLightButton? {
         let overlay = TilesView.thumbnailOverView
-        return (overlay, overlay.convert(pointerLocationInWindow(), from: nil))
+        return overlay.findButton(overlay.convert(windowPoint, from: nil))
+    }
+
+    private static func findTile(at windowPoint: NSPoint) -> TileView? {
+        let overlay = TilesView.thumbnailOverView
+        return overlay.findTarget(overlay.convert(windowPoint, from: nil))
     }
 
     private static func findButtonUnderPointer() -> TrafficLightButton? {
-        let (overlay, point) = pointerInOverlay()
-        return overlay.findButton(point)
+        findButton(at: pointerLocationInWindow())
     }
 
     private static func findTileViewUnderPointer() -> TileView? {
-        let (overlay, point) = pointerInOverlay()
-        return overlay.findTarget(point)
+        findTile(at: pointerLocationInWindow())
     }
 
     /// when using the trackpad, the user may swipe with a slight mistake. This will create a small cursor movement
