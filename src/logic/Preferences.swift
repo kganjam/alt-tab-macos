@@ -133,6 +133,7 @@ class Preferences {
             "screenRecordingPermissionSkipped": "false",
             "trackpadHapticFeedbackEnabled": "true",
             "settingsWindowShownOnFirstLaunch": "false",
+            "winsideAutoRepairGuestConnectivity": "true",
         ]
         (0..<maxShortcutCount).forEach { index in
             values[indexToName("holdShortcut", index)] = defaultShortcut("⌥")
@@ -562,6 +563,15 @@ enum RuntimeFlags {
     static var postAltTabFocusSuppressionMs: Int { int("postAltTabFocusSuppressionMs", default: 2500) }
     static var protectNativeCommandBacktickShortcut: Bool { bool("protectNativeCommandBacktickShortcut", default: false) }
     static var protectNativeCommandNumberShortcuts: Bool { bool("protectNativeCommandNumberShortcuts", default: true) }
+    // When the winside helper is reachable-but-blocked (it IS listening in the
+    // guest, but the host can't connect — guest Windows Firewall dropping inbound
+    // because the Parallels network reclassified to the Public profile), AltTab's
+    // normal kill+relaunch self-heal is futile (it keeps killing a working
+    // listener). With this on, AltTab instead repairs the guest via an elevated
+    // `prlctl exec` (runs as the guest SYSTEM account — no UAC): allow inbound TCP
+    // 18765 on all profiles + reapply the firewall policy + set the network back to
+    // Private. Off → AltTab only logs the diagnosis and the manual fix.
+    static var winsideAutoRepairGuestConnectivity: Bool { bool("winsideAutoRepairGuestConnectivity", default: true) }
     static var bgThumbnailRefreshEnabled: Bool { bool("bgThumbnailRefreshEnabled", default: true) }
     static var bgThumbnailHotTierSize: Int { int("bgThumbnailHotTierSize", default: 10) }
     // The periodic background cadence is deliberately slow: the freshness that

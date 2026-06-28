@@ -1835,17 +1835,116 @@ class Winside {
         }
         consecutiveFailures += 1
         Diagnostics.log("WINSIDE", "command failure #\(consecutiveFailures): \(reason)")
-        if consecutiveFailures >= failureThreshold && !restartInProgress {
-            restartInProgress = true
-            Diagnostics.log("WINSIDE", "helper appears hung (\(consecutiveFailures) failures); killing + restarting")
-            closeSocket("auto-restart")
-            killHelperInGuest(reason: "auto-restart after \(consecutiveFailures) failures")
-            consecutiveFailures = 0
-            restartInProgress = false
-            // Re-launch via the public path so probe + log fire normally.
-            // Done from `queue.async` so we don't recurse on the queue.
-            queue.async { startInternal() }
+        guard consecutiveFailures >= failureThreshold, !restartInProgress else { return }
+        restartInProgress = true
+        // Distinguish a dead helper from a reachable-but-blocked one. If the helper
+        // is actually LISTENING in the guest, the host→guest path is blocked — almost
+        // always the guest Windows Firewall after the Parallels network reclassified
+        // to the Public profile (errno=60/ETIMEDOUT on connect, not 61/refused).
+        // Killing + relaunching is futile then: it just churns a working listener
+        // every few minutes. Detect it, warn with the fix, and optionally self-repair.
+        if guestHelperIsListening() {
+            Diagnostics.log("WINSIDE", "helper IS listening in guest on \(port) but unreachable from host after \(consecutiveFailures) failures — guest firewall is blocking inbound (Parallels network profile likely Public). Skipping the futile kill/restart.")
+            if RuntimeFlags.winsideAutoRepairGuestConnectivity {
+                startupQueue.async {
+                    repairGuestConnectivity()
+                    queue.async { consecutiveFailures = 0; restartInProgress = false }
+                }
+            } else {
+                Diagnostics.log("WINSIDE", "auto-repair disabled (winsideAutoRepairGuestConnectivity=false); fix in guest as admin: set network Private, and `netsh advfirewall firewall add rule name=AltTabWinside\(port) dir=in action=allow protocol=TCP localport=\(port) profile=any`.")
+                consecutiveFailures = 0
+                restartInProgress = false
+            }
+            return
         }
+        Diagnostics.log("WINSIDE", "helper appears hung (\(consecutiveFailures) failures); killing + restarting")
+        closeSocket("auto-restart")
+        killHelperInGuest(reason: "auto-restart after \(consecutiveFailures) failures")
+        consecutiveFailures = 0
+        restartInProgress = false
+        // Re-launch via the public path so probe + log fire normally.
+        // Done from `queue.async` so we don't recurse on the queue.
+        queue.async { startInternal() }
+    }
+
+    /// Run a one-off command in the guest via `prlctl exec` and capture its
+    /// combined stdout/stderr (trimmed), or nil on launch failure / timeout.
+    /// `elevated` omits `--current-user`, so the command runs as the guest's
+    /// SYSTEM account (no UAC prompt) — required for firewall / network-profile
+    /// changes. Outputs here are tiny (a netstat line, a netsh "Ok."), so reading
+    /// the pipe after the process exits can't deadlock on a full pipe buffer.
+    private static func runProcessCapturing(_ path: String, _ args: [String], timeoutSec: Int) -> String? {
+        guard FileManager.default.isExecutableFile(atPath: path) else { return nil }
+        let task = Process()
+        task.launchPath = path
+        task.arguments = args
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+        task.launch()
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .utility).async { task.waitUntilExit(); done.signal() }
+        if done.wait(timeout: .now() + .seconds(timeoutSec)) == .timedOut {
+            task.terminate()
+            return nil
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Run a command in the guest via `prlctl exec`. `elevated` omits
+    /// `--current-user`, so it runs as the guest SYSTEM account (no UAC prompt) —
+    /// required for firewall / network-profile changes.
+    private static func runGuestCommandCapturing(_ guestArgs: [String], elevated: Bool, timeoutSec: Int) -> String? {
+        var args = ["exec", vmName]
+        if !elevated { args.append("--current-user") }
+        args.append(contentsOf: guestArgs)
+        return runProcessCapturing("/usr/local/bin/prlctl", args, timeoutSec: timeoutSec)
+    }
+
+    /// The host's IPv4 on the Parallels Shared network — the only address the
+    /// guest helper should accept winside connections from. Parsed (host-side)
+    /// from `prlsrvctl net info Shared` (the Parallels adapter's "IPv4 address:").
+    /// nil if Parallels isn't installed or the field can't be found.
+    private static func parallelsSharedHostIp() -> String? {
+        guard let out = runProcessCapturing("/usr/local/bin/prlsrvctl", ["net", "info", "Shared"], timeoutSec: 8) else { return nil }
+        for raw in out.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix("IPv4 address:") else { continue }
+            let ip = line.dropFirst("IPv4 address:".count).trimmingCharacters(in: .whitespaces)
+            if !ip.isEmpty, ip.contains(".") { return ip }
+        }
+        return nil
+    }
+
+    /// True if the helper's port is in LISTENING state inside the guest. Used to
+    /// tell "helper dead" (relaunch) from "helper alive but host can't reach it"
+    /// (firewall — repair, don't relaunch).
+    private static func guestHelperIsListening() -> Bool {
+        guard let out = runGuestCommandCapturing(["cmd.exe", "/c", "netstat -an | findstr \(port)"], elevated: false, timeoutSec: 8) else { return false }
+        return out.uppercased().contains("LISTENING")
+    }
+
+    /// Repair host→guest reachability for the helper port, elevated (guest SYSTEM,
+    /// no UAC): add an inbound allow rule for the port on all profiles, reapply the
+    /// firewall policy so the rule takes effect immediately, and move any Public
+    /// connection profile back to Private. Mirrors the manual fix. The next focus
+    /// command's connect confirms reachability (logs "socket opened").
+    private static func repairGuestConnectivity() {
+        // Scope the inbound rule to the host's Parallels IP so the (unauthenticated)
+        // helper port is reachable ONLY from the Mac — not from sibling VMs on the
+        // shared net, and fail-closed if the VM is ever switched to Bridged mode.
+        // Fall back to LocalSubnet (still blocks the internet / off-subnet) if the
+        // host IP can't be resolved.
+        let hostScope = parallelsSharedHostIp() ?? "LocalSubnet"
+        Diagnostics.log("WINSIDE", "auto-repair: allow inbound TCP \(port) from \(hostScope) + reapply firewall policy + network→Private (elevated)")
+        let ruleName = "AltTabWinside\(port)"
+        // delete-then-add so repeated repairs don't accumulate duplicate rules
+        _ = runGuestCommandCapturing(["netsh.exe", "advfirewall", "firewall", "delete", "rule", "name=\(ruleName)"], elevated: true, timeoutSec: 12)
+        _ = runGuestCommandCapturing(["netsh.exe", "advfirewall", "firewall", "add", "rule", "name=\(ruleName)", "dir=in", "action=allow", "protocol=TCP", "localport=\(port)", "profile=any", "remoteip=\(hostScope)"], elevated: true, timeoutSec: 15)
+        _ = runGuestCommandCapturing(["netsh.exe", "advfirewall", "set", "allprofiles", "firewallpolicy", "blockinbound,allowoutbound"], elevated: true, timeoutSec: 15)
+        _ = runGuestCommandCapturing(["powershell.exe", "-NoProfile", "-Command", "Get-NetConnectionProfile | Where-Object {$_.NetworkCategory -eq 'Public'} | Set-NetConnectionProfile -NetworkCategory Private"], elevated: true, timeoutSec: 20)
+        Diagnostics.log("WINSIDE", "auto-repair: done; next winside connect will confirm host reachability")
     }
 
     /// Internal launcher (no enable-check, no probe). Used by both
