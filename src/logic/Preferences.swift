@@ -65,6 +65,8 @@ class Preferences {
             "bgThumbnailWarmJitterMs": "30000",
             "bgThumbnailColdJitterMs": "60000",
             "bgThumbnailFirstRetryMs": "3000",
+            "bgThumbnailIdleBackoffEnabled": "true",
+            "bgThumbnailMaxBackoffMs": "600000",
             "bgThumbnailReconcileMs": "30000",
             "bgThumbnailDetachNonHotTier": "true",
             "bgThumbnailInitialMaxDelayMs": "250",
@@ -581,6 +583,16 @@ enum RuntimeFlags {
     // interval) until it has at least one image. Guarantees every visible
     // window always has a thumbnail without making the steady-state cadence fast.
     static var bgThumbnailFirstRetryMs: Int { int("bgThumbnailFirstRetryMs", default: 3000) }
+    // Idle backoff: a window whose captured content is byte-identical to its
+    // previous capture is static, so its periodic-refresh interval is doubled per
+    // consecutive unchanged capture, up to `bgThumbnailMaxBackoffMs`. Reset to the
+    // tier's base cadence the moment the window changes or is activated
+    // (noteRecentlyActive). This is the second idle-CPU lever after the slow base
+    // cadence: a static hot window drops from 60s toward the 10-min ceiling. The
+    // cap is only effective for tiers whose base is below it (hot 60s, warm 5min);
+    // cold (10min base) is already at the ceiling.
+    static var bgThumbnailIdleBackoffEnabled: Bool { bool("bgThumbnailIdleBackoffEnabled", default: true) }
+    static var bgThumbnailMaxBackoffMs: Int { int("bgThumbnailMaxBackoffMs", default: 600000) }
     /// How often the background refresher reconciles its window list against
     /// the live WindowServer window list (zombie GC), releasing thumbnails
     /// (and their IOSurfaces) for windows that closed without an AX-destroyed

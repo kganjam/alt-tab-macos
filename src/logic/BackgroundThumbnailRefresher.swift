@@ -67,6 +67,9 @@ final class BackgroundThumbnailRefresher {
     /// Push current Preferences into the cache so post-capture reschedules
     /// use the latest intervals/jitter. Call after preference changes too.
     func applyScheduleFromPreferences() {
+        let maxBackoffSec: TimeInterval = RuntimeFlags.bgThumbnailIdleBackoffEnabled
+            ? Double(RuntimeFlags.bgThumbnailMaxBackoffMs) / 1000
+            : 0
         ThumbnailCache.shared.configure(ThumbnailCache.Schedule(
             hotIntervalSec: Double(RuntimeFlags.bgThumbnailHotIntervalMs) / 1000,
             warmIntervalSec: Double(RuntimeFlags.bgThumbnailWarmIntervalMs) / 1000,
@@ -74,7 +77,8 @@ final class BackgroundThumbnailRefresher {
             hotJitterSec: Double(RuntimeFlags.bgThumbnailHotJitterMs) / 1000,
             warmJitterSec: Double(RuntimeFlags.bgThumbnailWarmJitterMs) / 1000,
             coldJitterSec: Double(RuntimeFlags.bgThumbnailColdJitterMs) / 1000,
-            firstThumbnailRetrySec: Double(RuntimeFlags.bgThumbnailFirstRetryMs) / 1000
+            firstThumbnailRetrySec: Double(RuntimeFlags.bgThumbnailFirstRetryMs) / 1000,
+            maxBackoffSec: maxBackoffSec
         ))
     }
 
@@ -107,6 +111,10 @@ final class BackgroundThumbnailRefresher {
         for window in windows {
             guard let wid = window.cgWindowId else { continue }
             ThumbnailCache.shared.setTier(wid: wid, tier: .hot)
+            // The user just returned to this window — clear any accumulated idle
+            // backoff so it resumes the fast base cadence, then pull its next
+            // capture forward to now.
+            ThumbnailCache.shared.resetBackoff(wid: wid)
             ThumbnailCache.shared.bumpUp(wid: wid, to: now)
         }
     }

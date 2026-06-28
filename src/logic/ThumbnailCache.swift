@@ -54,6 +54,12 @@ final class ThumbnailCache {
         /// excluded: they can't be captured until shown, so they keep the slow
         /// cold cadence rather than spinning here.
         var firstThumbnailRetrySec: TimeInterval = 3
+        /// Idle backoff ceiling. When a window's captured content is byte-identical
+        /// to its previous capture it's static, so its next-refresh interval is
+        /// doubled per consecutive unchanged capture, clamped to this. A change or
+        /// an activation drops it back to the tier's base cadence. Set to 0 (or any
+        /// value ≤ a tier's base interval) to disable backoff for that tier.
+        var maxBackoffSec: TimeInterval = 600
     }
 
     private struct Entry {
@@ -67,7 +73,17 @@ final class ThumbnailCache {
         /// Perceptual aHash of the stored bitmap (0 if not computed). Diagnostic:
         /// two entries with the same non-zero signature but different wids means a
         /// shared/duplicate capture surface (Parallels Coherence cross-window).
+        /// Coherence-scoped — drives cross-window dedup, so it stays 0 for normal
+        /// windows (two genuinely-identical normal windows must NOT dedup-suppress).
         var signature: UInt64 = 0
+        /// Exact content hash of THIS window's last captured bitmap, computed for
+        /// every window (unlike `signature`). Compared across time (not across
+        /// windows) to detect a static window and drive the idle refresh backoff.
+        var contentHash: UInt64 = 0
+        /// Consecutive background captures whose `contentHash` was unchanged. Grows
+        /// the next-refresh interval (×2 each, capped at `schedule.maxBackoffSec`);
+        /// reset to 0 by any content change, capture failure, or activation.
+        var unchangedStreak: Int = 0
         /// True iff `thumbnail` is backed by a live WindowServer capture
         /// IOSurface (SCK pixelBuffer, or a non-detached CGSHWCaptureWindowList
         /// CGImage). False for malloc-backed detached copies. This is what
@@ -205,10 +221,14 @@ final class ThumbnailCache {
     /// In-panel captures (`refreshVisibleThumbnailsAfterShowUi` source)
     /// don't set `inFlightScheduleId` (they didn't go through `popDue`), so
     /// they only store the bitmap and don't perturb BG scheduling.
-    func writeCapture(wid: CGWindowID, image: CALayerContents, liveSurface: Bool = true, capturedBy: String? = nil, signature: UInt64 = 0) {
+    func writeCapture(wid: CGWindowID, image: CALayerContents, liveSurface: Bool = true, capturedBy: String? = nil, signature: UInt64 = 0, contentHash: UInt64 = 0) {
         lock.lock(); defer { lock.unlock() }
         guard entries[wid] != nil else { return }
         var e = entries[wid]!
+        // Idle backoff: did this capture's content match the previous one? (A real
+        // hash, computed for every window — distinct from the Coherence-only dedup
+        // `signature`.) Must read e.contentHash before it's overwritten below.
+        let contentUnchanged = contentHash != 0 && contentHash == e.contentHash && e.thumbnail != nil
         // Diagnostic: if this wid's capture writer changed app identity, the OS
         // reassigned the cgWindowId to a different app's window (Parallels
         // Coherence wid reuse) or two windows collide on one wid. Either way the
@@ -229,10 +249,11 @@ final class ThumbnailCache {
         if let capturedBy { e.capturedBy = capturedBy }
         updateSignatureCountLocked(old: e.signature, new: signature)
         e.signature = signature
+        e.contentHash = contentHash
         e.thumbnail = image
         e.isLiveSurface = liveSurface
         e.lastUpdatedAt = CFAbsoluteTimeGetCurrent()
-        finishCaptureLocked(&e, wid: wid)
+        finishCaptureLocked(&e, wid: wid, contentUnchanged: contentUnchanged)
     }
 
     /// A capture completed but came back unusable (e.g. an all-black Coherence
@@ -251,7 +272,8 @@ final class ThumbnailCache {
         e.lastUpdatedAt = 0
         updateSignatureCountLocked(old: e.signature, new: 0)
         e.signature = 0
-        finishCaptureLocked(&e, wid: wid)
+        e.contentHash = 0
+        finishCaptureLocked(&e, wid: wid, contentUnchanged: false)
     }
 
     /// Adjust `signatureCounts` when an entry's signature changes. Caller holds
@@ -268,7 +290,7 @@ final class ThumbnailCache {
     /// Clear in-flight state and, if this was a BG-initiated capture, push the
     /// next deadline at the tier's normal cadence. Caller holds `lock` and has
     /// already set `e`'s content fields; we write `e` back and update the heap.
-    private func finishCaptureLocked(_ e: inout Entry, wid: CGWindowID) {
+    private func finishCaptureLocked(_ e: inout Entry, wid: CGWindowID, contentUnchanged: Bool) {
         let wasBgInitiated = e.inFlight
         let poppedScheduleId = e.inFlightScheduleId
         e.inFlight = false
@@ -276,14 +298,26 @@ final class ThumbnailCache {
         e.inFlightSince = 0
         entries[wid] = e
         guard wasBgInitiated, e.scheduleId == poppedScheduleId else { return }
+        // A static window (content byte-identical to its last capture) is polled
+        // progressively less often; any change drops it back to the base cadence.
+        e.unchangedStreak = contentUnchanged ? e.unchangedStreak + 1 : 0
         let now = CFAbsoluteTimeGetCurrent()
         let (interval, jitter) = intervalAndJitter(e.tier)
-        let deadline = now + interval + Double.random(in: -jitter...jitter)
+        let deadline = now + backedOffInterval(base: interval, streak: e.unchangedStreak) + Double.random(in: -jitter...jitter)
         generation &+= 1
         e.nextRefreshAt = deadline
         e.scheduleId = generation
         entries[wid] = e
         heap.push(HeapEntry(deadline: deadline, wid: wid, scheduleId: generation))
+    }
+
+    /// Exponentially grow a tier's base interval with the unchanged-capture
+    /// streak, clamped to `schedule.maxBackoffSec`. Never shorter than `base`, so
+    /// a tier whose base already meets/exceeds the ceiling is left untouched.
+    private func backedOffInterval(base: TimeInterval, streak: Int) -> TimeInterval {
+        guard streak > 0, schedule.maxBackoffSec > base else { return base }
+        let grown = base * pow(2, Double(Swift.min(streak, 30)))
+        return Swift.min(grown, schedule.maxBackoffSec)
     }
 
     /// Clear in-flight state without storing a bitmap (capture errored or
@@ -297,6 +331,7 @@ final class ThumbnailCache {
         e.inFlight = false
         e.inFlightScheduleId = 0
         e.inFlightSince = 0
+        e.unchangedStreak = 0
         entries[wid] = e
         guard e.scheduleId == poppedScheduleId else { return }
         let now = CFAbsoluteTimeGetCurrent()
@@ -339,6 +374,20 @@ final class ThumbnailCache {
         entries[wid]!.isLiveSurface = false
         entries[wid]!.lastUpdatedAt = 0
         entries[wid]!.signature = 0
+        entries[wid]!.contentHash = 0
+        entries[wid]!.unchangedStreak = 0
+    }
+
+    /// Drop a window back to its tier's base refresh cadence. Called when the
+    /// window is activated (focus / foreground), so a window the user just
+    /// returned to resumes fresh captures regardless of how long it had been
+    /// statically backed off. The pulled-forward deadline is set separately by
+    /// `bumpUp`; this only clears the accumulated backoff so it doesn't re-apply
+    /// on the next reschedule.
+    func resetBackoff(wid: CGWindowID) {
+        lock.lock(); defer { lock.unlock() }
+        guard entries[wid] != nil else { return }
+        entries[wid]!.unchangedStreak = 0
     }
 
     // MARK: - Scheduling
@@ -380,10 +429,11 @@ final class ThumbnailCache {
     func statsLine() -> String {
         lock.lock(); defer { lock.unlock() }
         var hot = 0, warm = 0, cold = 0, inFlight = 0, pixelBuffer = 0, cgImage = 0
-        var liveSurfaces = 0, detached = 0
+        var liveSurfaces = 0, detached = 0, backedOff = 0
         for (_, e) in entries {
             switch e.tier { case .hot: hot += 1; case .warm: warm += 1; case .cold: cold += 1 }
             if e.inFlight { inFlight += 1 }
+            if e.unchangedStreak > 0 { backedOff += 1 }
             switch e.thumbnail {
             case .pixelBuffer?: pixelBuffer += 1
             case .cgImage?: cgImage += 1
@@ -401,7 +451,7 @@ final class ThumbnailCache {
         // so `surfaces` (their sum) overcounts when detach is on — watch `liveSurfaces`, not `surfaces`.
         let surfaces = pixelBuffer + cgImage
         let nextDueMs = heap.peek().map { Int(($0.deadline - CFAbsoluteTimeGetCurrent()) * 1000) } ?? -1
-        return "entries=\(entries.count) liveSurfaces=\(liveSurfaces) detached=\(detached) surfaces=\(surfaces) pixelBuffer=\(pixelBuffer) cgImage=\(cgImage) hot=\(hot) warm=\(warm) cold=\(cold) inFlight=\(inFlight) heap=\(heap.count) nextDueMs=\(nextDueMs)"
+        return "entries=\(entries.count) liveSurfaces=\(liveSurfaces) detached=\(detached) surfaces=\(surfaces) pixelBuffer=\(pixelBuffer) cgImage=\(cgImage) hot=\(hot) warm=\(warm) cold=\(cold) backedOff=\(backedOff) inFlight=\(inFlight) heap=\(heap.count) nextDueMs=\(nextDueMs)"
     }
 
     // MARK: - Internal

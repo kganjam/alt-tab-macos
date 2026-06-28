@@ -219,21 +219,29 @@ class Window {
             // Scoped to Coherence windows — real macOS windows don't have this
             // failure mode, so they skip the per-capture scan. The 98% threshold is
             // far above any real (even dark-mode) content, which carries text/chrome.
-            // For non-black Coherence captures, also compute a content signature so
-            // the cache can flag pixel-identical captures across windows (Coherence
-            // handing back one shared guest surface — the cross-window mismatch).
+            // Compute the content hash for every window (drives the idle refresh
+            // backoff: compared across time for the same window to detect a static
+            // window). It is reused as the cross-window dedup `signature` ONLY for
+            // Coherence, where two window ids can share one guest surface and several
+            // tiles would show the same image — normal windows must never
+            // dedup-suppress (two identical-looking windows are legitimate), so their
+            // `signature` stays 0.
             var signature: UInt64 = 0
-            if isParallelsCoherenceWindow, case let .cgImage(img?) = screenshot {
-                let frac = ThumbnailBitmap.blackFraction(of: img)
-                if frac >= 0.98 {
-                    Diagnostics.log("THUMBBLACK", "wid=\(wid) rejected black=\(Int(frac * 100))% app=\(thumbnailProvenanceTag) title='\(title ?? "")'")
-                    ThumbnailCache.shared.rejectCapture(wid: wid)
-                    showAppIconOnVisibleTileIfNeeded()
-                    return
+            var contentHash: UInt64 = 0
+            if case let .cgImage(img?) = screenshot {
+                if isParallelsCoherenceWindow {
+                    let frac = ThumbnailBitmap.blackFraction(of: img)
+                    if frac >= 0.98 {
+                        Diagnostics.log("THUMBBLACK", "wid=\(wid) rejected black=\(Int(frac * 100))% app=\(thumbnailProvenanceTag) title='\(title ?? "")'")
+                        ThumbnailCache.shared.rejectCapture(wid: wid)
+                        showAppIconOnVisibleTileIfNeeded()
+                        return
+                    }
                 }
-                signature = ThumbnailBitmap.contentSignature(of: img)
+                contentHash = ThumbnailBitmap.contentSignature(of: img)
+                if isParallelsCoherenceWindow { signature = contentHash }
             }
-            ThumbnailCache.shared.writeCapture(wid: wid, image: screenshot, liveSurface: liveSurface, capturedBy: thumbnailProvenanceTag, signature: signature)
+            ThumbnailCache.shared.writeCapture(wid: wid, image: screenshot, liveSurface: liveSurface, capturedBy: thumbnailProvenanceTag, signature: signature, contentHash: contentHash)
         }
         thumbnailUpdateCount += 1
         if !App.appIsBeingUsed || !shouldShowTheUser { return }
