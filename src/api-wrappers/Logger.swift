@@ -1873,14 +1873,10 @@ class Winside {
     /// SYSTEM account (no UAC prompt) — required for firewall / network-profile
     /// changes. Outputs here are tiny (a netstat line, a netsh "Ok."), so reading
     /// the pipe after the process exits can't deadlock on a full pipe buffer.
-    private static func runGuestCommandCapturing(_ guestArgs: [String], elevated: Bool, timeoutSec: Int) -> String? {
-        let prlctlPath = "/usr/local/bin/prlctl"
-        guard FileManager.default.isExecutableFile(atPath: prlctlPath) else { return nil }
+    private static func runProcessCapturing(_ path: String, _ args: [String], timeoutSec: Int) -> String? {
+        guard FileManager.default.isExecutableFile(atPath: path) else { return nil }
         let task = Process()
-        task.launchPath = prlctlPath
-        var args = ["exec", vmName]
-        if !elevated { args.append("--current-user") }
-        args.append(contentsOf: guestArgs)
+        task.launchPath = path
         task.arguments = args
         let pipe = Pipe()
         task.standardOutput = pipe
@@ -1894,6 +1890,31 @@ class Winside {
         }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Run a command in the guest via `prlctl exec`. `elevated` omits
+    /// `--current-user`, so it runs as the guest SYSTEM account (no UAC prompt) —
+    /// required for firewall / network-profile changes.
+    private static func runGuestCommandCapturing(_ guestArgs: [String], elevated: Bool, timeoutSec: Int) -> String? {
+        var args = ["exec", vmName]
+        if !elevated { args.append("--current-user") }
+        args.append(contentsOf: guestArgs)
+        return runProcessCapturing("/usr/local/bin/prlctl", args, timeoutSec: timeoutSec)
+    }
+
+    /// The host's IPv4 on the Parallels Shared network — the only address the
+    /// guest helper should accept winside connections from. Parsed (host-side)
+    /// from `prlsrvctl net info Shared` (the Parallels adapter's "IPv4 address:").
+    /// nil if Parallels isn't installed or the field can't be found.
+    private static func parallelsSharedHostIp() -> String? {
+        guard let out = runProcessCapturing("/usr/local/bin/prlsrvctl", ["net", "info", "Shared"], timeoutSec: 8) else { return nil }
+        for raw in out.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix("IPv4 address:") else { continue }
+            let ip = line.dropFirst("IPv4 address:".count).trimmingCharacters(in: .whitespaces)
+            if !ip.isEmpty, ip.contains(".") { return ip }
+        }
+        return nil
     }
 
     /// True if the helper's port is in LISTENING state inside the guest. Used to
@@ -1910,9 +1931,17 @@ class Winside {
     /// connection profile back to Private. Mirrors the manual fix. The next focus
     /// command's connect confirms reachability (logs "socket opened").
     private static func repairGuestConnectivity() {
-        Diagnostics.log("WINSIDE", "auto-repair: allow inbound TCP \(port) + reapply firewall policy + network→Private (elevated)")
+        // Scope the inbound rule to the host's Parallels IP so the (unauthenticated)
+        // helper port is reachable ONLY from the Mac — not from sibling VMs on the
+        // shared net, and fail-closed if the VM is ever switched to Bridged mode.
+        // Fall back to LocalSubnet (still blocks the internet / off-subnet) if the
+        // host IP can't be resolved.
+        let hostScope = parallelsSharedHostIp() ?? "LocalSubnet"
+        Diagnostics.log("WINSIDE", "auto-repair: allow inbound TCP \(port) from \(hostScope) + reapply firewall policy + network→Private (elevated)")
         let ruleName = "AltTabWinside\(port)"
-        _ = runGuestCommandCapturing(["netsh.exe", "advfirewall", "firewall", "add", "rule", "name=\(ruleName)", "dir=in", "action=allow", "protocol=TCP", "localport=\(port)", "profile=any"], elevated: true, timeoutSec: 15)
+        // delete-then-add so repeated repairs don't accumulate duplicate rules
+        _ = runGuestCommandCapturing(["netsh.exe", "advfirewall", "firewall", "delete", "rule", "name=\(ruleName)"], elevated: true, timeoutSec: 12)
+        _ = runGuestCommandCapturing(["netsh.exe", "advfirewall", "firewall", "add", "rule", "name=\(ruleName)", "dir=in", "action=allow", "protocol=TCP", "localport=\(port)", "profile=any", "remoteip=\(hostScope)"], elevated: true, timeoutSec: 15)
         _ = runGuestCommandCapturing(["netsh.exe", "advfirewall", "set", "allprofiles", "firewallpolicy", "blockinbound,allowoutbound"], elevated: true, timeoutSec: 15)
         _ = runGuestCommandCapturing(["powershell.exe", "-NoProfile", "-Command", "Get-NetConnectionProfile | Where-Object {$_.NetworkCategory -eq 'Public'} | Set-NetConnectionProfile -NetworkCategory Private"], elevated: true, timeoutSec: 20)
         Diagnostics.log("WINSIDE", "auto-repair: done; next winside connect will confirm host reachability")
