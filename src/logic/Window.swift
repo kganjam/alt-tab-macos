@@ -1417,6 +1417,7 @@ class Window {
         // Karabiner/NSWorkspace cache will refresh on the next genuine
         // user input.
         let isCoherence = application.isParallelsCoherence
+        let scheduledAt = CFAbsoluteTimeGetCurrent()
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
             if isCoherence {
                 Diagnostics.log("FRONTMOSTSET", "+\(delayMs)ms repoke skipped Coherence app (would dismiss child popups) pid=\(targetPid) wid=\(targetWid)")
@@ -1424,6 +1425,18 @@ class Window {
             }
             guard Windows.isCurrentZOrderFocusGeneration(generation) else {
                 Diagnostics.log("FRONTMOSTSET", "+\(delayMs)ms repoke skipped stale generation pid=\(targetPid) wid=\(targetWid)")
+                return
+            }
+            // If the app opened a NEW window since we armed this repoke (e.g. Cmd-N
+            // spawning a terminal window), the user's key focus has moved to it.
+            // Re-poking SLPS for the OLD target wid would steal key focus back —
+            // the new window stays visually on top, but typing goes to the old one.
+            // The z-order generation is NOT bumped by window creation, and the z0
+            // guard below races the OS marking the new window topmost, so this birth
+            // check is the reliable signal. The cache refresh is best-effort and
+            // re-fires on the new window's own activation.
+            guard !Windows.windowOfPidBornSince(targetPid, since: scheduledAt) else {
+                Diagnostics.log("FRONTMOSTSET", "+\(delayMs)ms repoke skipped new window opened pid=\(targetPid) wid=\(targetWid)")
                 return
             }
             guard !Windows.recentExternalKeyboardInputFollowsAltTabTarget(requireReleasable: true) else {

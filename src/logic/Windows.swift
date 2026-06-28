@@ -310,6 +310,22 @@ class Windows {
         }
     }
 
+    /// True if any window of `pid` was first observed strictly after `since`.
+    /// Used by the post-focus frontmost repoke to skip re-asserting an old
+    /// target window once the user has opened a NEW window of the same app
+    /// (e.g. Cmd-N in a terminal) — re-poking the old wid would steal key focus
+    /// back to it (new window visually on top, but typing goes to the old one).
+    /// The z-order focus generation is bumped only by our own focus path, NOT by
+    /// window creation, so this birth check is the reliable signal for "a new
+    /// window appeared since we armed the repoke".
+    static func windowOfPidBornSince(_ pid: pid_t, since: CFAbsoluteTime) -> Bool {
+        windowBirthLock.lock(); defer { windowBirthLock.unlock() }
+        for (_, birth) in windowBirthsByWid where birth.pid == pid && birth.createdAt > since {
+            return true
+        }
+        return false
+    }
+
     static func noteZOrderWindowObserved(wid: CGWindowID, pid: pid_t, owner: String, source: String, at: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()) {
         guard wid != 0 else { return }
         var birth: WindowBirth?
