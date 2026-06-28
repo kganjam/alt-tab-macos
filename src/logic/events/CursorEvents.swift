@@ -169,9 +169,9 @@ class CursorEvents {
         CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
         if clickTapUsed {
             startClickTapThread()
-            Diagnostics.log("CTAP", "left-click tap on dedicated thread (off-main); main tap handles moved/right/other")
+            Diagnostics.log("SESSION", "left-click tap on DEDICATED THREAD (off-main); main tap handles moved/right/other")
         } else {
-            Diagnostics.log("CTAP", "single main-thread tap (off-main left-click tap disabled or unavailable)")
+            Diagnostics.log("SESSION", "single MAIN-THREAD tap (off-main left-click tap disabled or unavailable)")
         }
     }
 
