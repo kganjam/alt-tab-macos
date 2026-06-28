@@ -741,8 +741,21 @@ class Windows {
     static func retryNativeFocusTargetIfNeeded(targetWid: CGWindowID, targetPid: pid_t, delayMs: Int) {
         guard RuntimeFlags.zOrderFixesEnabled else { return }
         let generation = currentZOrderFocusGeneration()
+        let enqueuedAt = CFAbsoluteTimeGetCurrent()
         BackgroundWork.zOrderCacheQueue.addOperationAfter(deadline: .now() + .milliseconds(delayMs)) {
+            let queueWaitMs = (CFAbsoluteTimeGetCurrent() - enqueuedAt) * 1000
             guard isCurrentZOrderFocusGeneration(generation) else { return }
+            // Don't re-raise the alt-tab target if the user has since clicked a
+            // different window — that click is the newer intent and a click never
+            // bumps the generation, so the guard above can't catch it. Under load
+            // this op can fire long after the requested delay (queueWait logs it).
+            if userClickedDifferentWindowSince(enqueuedAt, targetWid: targetWid) {
+                Diagnostics.log("ZRESTORE", String(format: "native target-only retry ABORTED user-clicked-different-window target=#%u clickWid=#%u queueWait=%.0fms delay=%dms", targetWid, lastMouseClickWid, queueWaitMs, delayMs))
+                return
+            }
+            if queueWaitMs > Double(delayMs) + 250 {
+                Diagnostics.log("ZRESTORE", String(format: "native target-only retry LATE target=#%u queueWait=%.0fms delay=%dms", targetWid, queueWaitMs, delayMs))
+            }
             let actual = zRankingForRepair(maxCount: 8)
             guard actual.first?.wid != targetWid else {
                 requestZOrderCacheRefresh(full: false)
@@ -1793,8 +1806,16 @@ class Windows {
             _SLPSSetFrontProcessWithOptions(&psn, targetWid, SLPSMode.userGenerated.rawValue)
             Diagnostics.log(source, "restore attempt: SLPS(userGenerated)+AX(pid=\(targetPid), wid=\(targetWid)) — was frontmostPid=\(frontPid?.description ?? "nil")")
         }
+        let enqueuedAt = CFAbsoluteTimeGetCurrent()
         BackgroundWork.accessibilityCommandsQueue.addOperation { [weak target] in
             guard let target else { return }
+            let queueWaitMs = (CFAbsoluteTimeGetCurrent() - enqueuedAt) * 1000
+            // Precise timestamp for this queued re-raise firing. `clickAfter=YES`
+            // means the user clicked a different window after this was enqueued —
+            // if a re-raise lands then, it fought a user action (likely fired late
+            // under load; `queueWait` shows how late).
+            let clickAfter = Windows.userClickedDifferentWindowSince(enqueuedAt, targetWid: targetWid)
+            Diagnostics.log(source, String(format: "queued AX reassert FIRED wid=%u queueWait=%.0fms clickAfterEnqueue=%@", targetWid, queueWaitMs, clickAfter ? "YES" : "no"))
             if let appAx = target.application.axUiElement, let windowAx = target.axUiElement {
                 AXUIElementSetMessagingTimeout(appAx, 0.05)
                 AXUIElementSetMessagingTimeout(windowAx, 0.05)
@@ -1914,6 +1935,17 @@ class Windows {
     static var lastMouseClickOwner: String = ""
     private static var mouseButtonIsDown = false
     private static var pendingDragZReviewWid: CGWindowID = 0
+
+    /// A queued/delayed focus or raise op should abort if the user clicked a
+    /// *different* window after it was enqueued: that click is the newer, explicit
+    /// user intent and must win. A user click does NOT bump the focus generation
+    /// (only an alt-tab focus does), so the generation check that guards these
+    /// queued ops can't catch this on its own — under system load a queued raise
+    /// can sit in its serial AX/z-order queue and fire seconds late, yanking focus
+    /// back to a window the user already navigated away from.
+    static func userClickedDifferentWindowSince(_ enqueuedAt: CFAbsoluteTime, targetWid: CGWindowID) -> Bool {
+        lastMouseClickTime > enqueuedAt && lastMouseClickWid != targetWid
+    }
 
     static func noteGlobalMouseButtonEvent(isDown: Bool, isUp: Bool) {
         if isDown {

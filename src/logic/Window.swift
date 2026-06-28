@@ -979,16 +979,28 @@ class Window {
         guard let target = nativeFocusAxElement(targetWid) else { return false }
         let generation = Windows.currentZOrderFocusGeneration()
         let timeout = nativeMultiWindowAxTimeout()
+        let enqueuedAt = CFAbsoluteTimeGetCurrent()
         BackgroundWork.accessibilityCommandsQueue.addOperation {
-            guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
             let startedAt = CFAbsoluteTimeGetCurrent()
+            let queueWaitMs = (startedAt - enqueuedAt) * 1000
+            guard Windows.isCurrentZOrderFocusGeneration(generation) else {
+                Diagnostics.log("AXRAISE", String(format: "wid=%u SKIPPED stale-generation queueWait=%.1fms async=true", targetWid, queueWaitMs))
+                return
+            }
+            // Abort if the user clicked a different window after we enqueued this
+            // raise: under load this op can fire seconds late and would otherwise
+            // yank focus back to the alt-tab target the user already left.
+            if Windows.userClickedDifferentWindowSince(enqueuedAt, targetWid: targetWid) {
+                Diagnostics.log("AXRAISE", String(format: "wid=%u SKIPPED user-clicked-different-window-after-enqueue clickWid=%u queueWait=%.1fms async=true", targetWid, Windows.lastMouseClickWid, queueWaitMs))
+                return
+            }
             let axTarget = target
             let resolvedAt = CFAbsoluteTimeGetCurrent()
             guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
             AXUIElementSetMessagingTimeout(axTarget.axElement, timeout)
             try? axTarget.axElement.performAction(kAXRaiseAction as String)
             let finishedAt = CFAbsoluteTimeGetCurrent()
-            Diagnostics.log("AXRAISE", String(format: "wid=%u source=%@ age=%.0fms resolve=%.1fms raise=%.1fms async=true", targetWid, axTarget.source, axTarget.ageMs, (resolvedAt - startedAt) * 1000, (finishedAt - resolvedAt) * 1000))
+            Diagnostics.log("AXRAISE", String(format: "wid=%u source=%@ queueWait=%.1fms age=%.0fms resolve=%.1fms raise=%.1fms async=true", targetWid, axTarget.source, queueWaitMs, axTarget.ageMs, (resolvedAt - startedAt) * 1000, (finishedAt - resolvedAt) * 1000))
         }
         return true
     }
