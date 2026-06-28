@@ -250,7 +250,7 @@ class CursorEvents {
         }
         clickTapDownInSearchField = false
         let enqueuedAt = CFAbsoluteTimeGetCurrent()
-        DispatchQueue.main.async { performLeftDownAction(at: loc, enqueuedAt: enqueuedAt) }
+        DispatchQueue.main.async { performLeftDownAction(enqueuedAt: enqueuedAt) }
         return nil
     }
 
@@ -266,68 +266,64 @@ class CursorEvents {
             return Unmanaged.passUnretained(cgEvent)
         }
         let enqueuedAt = CFAbsoluteTimeGetCurrent()
-        DispatchQueue.main.async { performLeftUpAction(at: loc, enqueuedAt: enqueuedAt) }
+        DispatchQueue.main.async { performLeftUpAction(enqueuedAt: enqueuedAt) }
         return nil
     }
 
-    /// CG-global (top-left) event location → TilesPanel window coordinates. Main only.
-    private static func windowPoint(fromCGGlobal loc: CGPoint) -> NSPoint {
-        let flip = NSScreen.main?.frame.height ?? 0
-        let cocoaGlobal = NSPoint(x: loc.x, y: flip - loc.y)
-        return TilesPanel.shared.convertPoint(fromScreen: cocoaGlobal)
-    }
-
-    private static func performLeftDownAction(at loc: CGPoint, enqueuedAt: CFAbsoluteTime) {
+    private static func performLeftDownAction(enqueuedAt: CFAbsoluteTime) {
         guard App.appIsBeingUsed else { return }  // panel closed before this ran — stale
         outsideMouseDownPassedThroughButton = nil
         mouseDownTarget = nil
-        let wp = windowPoint(fromCGGlobal: loc)
-        guard isInsideUi(wp) else {
+        // Use the LIVE pointer position (same as the original synchronous handlers)
+        // rather than re-deriving it from the event's global location — that
+        // conversion was unreliable and silently put the point outside the panel.
+        // For a normal click the action runs within a frame, so live ≈ click.
+        guard isPointerInsideUi() else {
             App.hideUi()
             return
         }
-        mouseDownTarget = (findButton(at: wp) ?? findTile(at: wp)) as AnyObject?
+        mouseDownTarget = (findButtonUnderPointer() ?? findTileViewUnderPointer()) as AnyObject?
     }
 
-    private static func performLeftUpAction(at loc: CGPoint, enqueuedAt: CFAbsoluteTime) {
+    private static func performLeftUpAction(enqueuedAt: CFAbsoluteTime) {
         // The click was absorbed instantly on the click-tap thread; this focus
-        // work runs on main. Under a main-thread stall it can run much later — the
-        // click isn't dropped, but the window comes forward late, which feels like
-        // a miss. `lag` quantifies that delay; a large lag means the cure is
-        // reducing main-thread stalls, not the click path.
+        // work runs on main. Under a main-thread stall it can run later — the click
+        // isn't dropped, but the window comes forward late, which feels like a miss.
+        // `lag` quantifies that delay; a large lag means the cure is reducing
+        // main-thread stalls, not the click path.
         let lagMs = (CFAbsoluteTimeGetCurrent() - enqueuedAt) * 1000
         if lagMs > 250 {
             Diagnostics.log("CLICKLAG", "left-click focus ran \(Int(lagMs))ms after the click (main-thread stall delayed it; click captured)")
         }
         guard App.appIsBeingUsed else {
-            Diagnostics.log("CLICKLAG", "left-click NOT applied: panel closed before the focus action ran (lag=\(Int(lagMs))ms) — e.g. an earlier click's focus already hid the panel")
+            Diagnostics.log("CLICKLAG", "left-click NOT applied: panel closed before the focus action ran (lag=\(Int(lagMs))ms)")
             return
         }
-        let wp = windowPoint(fromCGGlobal: loc)
-        guard isInsideUi(wp) else {
+        guard isPointerInsideUi() else {
             if mouseDownTarget == nil { App.hideUi() }
             mouseDownTarget = nil
+            Diagnostics.log("CLICKMISS", "left-click release not over the panel at action time (lag=\(Int(lagMs))ms) — cursor moved off / panel relaid; not applied")
             return
         }
         let downTarget = mouseDownTarget
         mouseDownTarget = nil
-        if let button = findButton(at: wp), button === downTarget {
+        if let button = findButtonUnderPointer(), button === downTarget {
             button.onClick()
             return
         }
         // Focus whatever tile is under the cursor at release (see handleLeftMouseUp
         // for the rationale: recovers clicks whose down was dropped, or where a
         // relayout/drift moved the tile between press and release).
-        if let target = findTile(at: wp) {
+        if let target = findTileViewUnderPointer() {
             if downTarget == nil {
-                Diagnostics.log("CLICKMISS", "recovered (off-main): no mousedown target → focusing release tile#\(target.window_?.cgWindowId ?? 0)")
+                Diagnostics.log("CLICKMISS", "recovered (off-main): no mousedown target → focusing tile#\(target.window_?.cgWindowId ?? 0) (lag=\(Int(lagMs))ms)")
             } else if target !== downTarget {
-                Diagnostics.log("CLICKMISS", "recovered (off-main): down/up mismatch down=\(describeTarget(downTarget)) → focusing release tile#\(target.window_?.cgWindowId ?? 0)")
+                Diagnostics.log("CLICKMISS", "recovered (off-main): down/up mismatch down=\(describeTarget(downTarget)) → focusing tile#\(target.window_?.cgWindowId ?? 0)")
             }
             target.mouseUpCallback()
             return
         }
-        Diagnostics.log("CLICKMISS", "in-panel left click did nothing (off-main): down=\(describeTarget(downTarget)) upTile=nil at (\(Int(wp.x)),\(Int(wp.y)))")
+        Diagnostics.log("CLICKMISS", "in-panel left click did nothing (off-main): down=\(describeTarget(downTarget)) upTile=nil (lag=\(Int(lagMs))ms)")
     }
 
     /// Logs the click-tap decision so absorbed events become visible.
