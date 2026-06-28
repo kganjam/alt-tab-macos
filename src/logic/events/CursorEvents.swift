@@ -249,7 +249,8 @@ class CursorEvents {
             return Unmanaged.passUnretained(cgEvent)
         }
         clickTapDownInSearchField = false
-        DispatchQueue.main.async { performLeftDownAction(at: loc) }
+        let enqueuedAt = CFAbsoluteTimeGetCurrent()
+        DispatchQueue.main.async { performLeftDownAction(at: loc, enqueuedAt: enqueuedAt) }
         return nil
     }
 
@@ -264,7 +265,8 @@ class CursorEvents {
             clickTapDownInSearchField = false
             return Unmanaged.passUnretained(cgEvent)
         }
-        DispatchQueue.main.async { performLeftUpAction(at: loc) }
+        let enqueuedAt = CFAbsoluteTimeGetCurrent()
+        DispatchQueue.main.async { performLeftUpAction(at: loc, enqueuedAt: enqueuedAt) }
         return nil
     }
 
@@ -275,7 +277,8 @@ class CursorEvents {
         return TilesPanel.shared.convertPoint(fromScreen: cocoaGlobal)
     }
 
-    private static func performLeftDownAction(at loc: CGPoint) {
+    private static func performLeftDownAction(at loc: CGPoint, enqueuedAt: CFAbsoluteTime) {
+        guard App.appIsBeingUsed else { return }  // panel closed before this ran — stale
         outsideMouseDownPassedThroughButton = nil
         mouseDownTarget = nil
         let wp = windowPoint(fromCGGlobal: loc)
@@ -286,7 +289,20 @@ class CursorEvents {
         mouseDownTarget = (findButton(at: wp) ?? findTile(at: wp)) as AnyObject?
     }
 
-    private static func performLeftUpAction(at loc: CGPoint) {
+    private static func performLeftUpAction(at loc: CGPoint, enqueuedAt: CFAbsoluteTime) {
+        // The click was absorbed instantly on the click-tap thread; this focus
+        // work runs on main. Under a main-thread stall it can run much later — the
+        // click isn't dropped, but the window comes forward late, which feels like
+        // a miss. `lag` quantifies that delay; a large lag means the cure is
+        // reducing main-thread stalls, not the click path.
+        let lagMs = (CFAbsoluteTimeGetCurrent() - enqueuedAt) * 1000
+        if lagMs > 250 {
+            Diagnostics.log("CLICKLAG", "left-click focus ran \(Int(lagMs))ms after the click (main-thread stall delayed it; click captured)")
+        }
+        guard App.appIsBeingUsed else {
+            Diagnostics.log("CLICKLAG", "left-click NOT applied: panel closed before the focus action ran (lag=\(Int(lagMs))ms) — e.g. an earlier click's focus already hid the panel")
+            return
+        }
         let wp = windowPoint(fromCGGlobal: loc)
         guard isInsideUi(wp) else {
             if mouseDownTarget == nil { App.hideUi() }

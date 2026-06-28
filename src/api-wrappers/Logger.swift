@@ -174,6 +174,7 @@ class Diagnostics {
         "CLICKAFTER": .warn,
         "CLICKMISS": .warn,
         "CTAPDISABLE": .warn,
+        "CLICKLAG": .warn,
         "CAPTURE": .warn,
         // info — normal-flow events (default for unknown categories)
         "PANEL": .info,
