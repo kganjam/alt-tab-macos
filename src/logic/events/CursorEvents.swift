@@ -107,12 +107,14 @@ class CursorEvents {
             case .otherMouseUp: return handleOtherMouseUp(cgEvent)
             case .mouseMoved: return handleMouseMoved(cgEvent)
             case .tapDisabledByUserInput, .tapDisabledByTimeout:
-                // The tap is disabled by macOS when our callback didn't return in
-                // time (main-thread stall) — events in that window are DROPPED, so
-                // an in-panel click can silently fail to focus a tile. Surface it
-                // at a visible level (the normal CTAP decisions are verbose-gated).
-                Diagnostics.log("CTAPDISABLE", "event tap disabled by \(type == .tapDisabledByTimeout ? "TIMEOUT (main-thread stall → events dropped)" : "userInput") shouldBeEnabled=\(shouldBeEnabled == true); re-enabling")
-                if shouldBeEnabled { CGEvent.tapEnable(tap: eventTap!, enable: true) }
+                // Only surface disables that happen while we WANT the tap on
+                // (panel open): those drop real input. The disable that fires when
+                // we intentionally turn the tap off on panel-close (shouldBeEnabled
+                // == false) is benign and would just be noise.
+                if shouldBeEnabled == true {
+                    Diagnostics.log("CTAPDISABLE", "event tap disabled by \(type == .tapDisabledByTimeout ? "TIMEOUT (main-thread stall → events dropped)" : "userInput") while enabled — clicks in this window are lost; re-enabling")
+                    CGEvent.tapEnable(tap: eventTap!, enable: true)
+                }
                 return Unmanaged.passUnretained(cgEvent)
             default: return Unmanaged.passUnretained(cgEvent)
         }
@@ -174,19 +176,27 @@ class CursorEvents {
             return nil
         }
         let upTile = findTileViewUnderPointer()
-        if let target = upTile, target === downTarget {
+        // Focus whatever tile is under the cursor at release. We deliberately do
+        // NOT require it to match the mousedown target: a thumbnail click is
+        // otherwise swallowed when the mousedown event was dropped (event-tap
+        // timeout during a main-thread stall → down=nil, confirmed in the logs),
+        // or when a relayout/drift moved the tile under the cursor between press
+        // and release. Tiles have no drag gesture, so selecting the release tile
+        // is correct and recovers these misses. Buttons (above) keep strict
+        // press+release semantics so a traffic-light action never misfires.
+        if let target = upTile {
+            if downTarget == nil {
+                Diagnostics.log("CLICKMISS", "recovered: no mousedown target (likely dropped down event) → focusing release tile#\(target.window_?.cgWindowId ?? 0)")
+            } else if target !== downTarget {
+                Diagnostics.log("CLICKMISS", "recovered: down/up mismatch down=\(describeTarget(downTarget)) → focusing release tile#\(target.window_?.cgWindowId ?? 0)")
+            }
             target.mouseUpCallback()
             logTapDecision("left", "up", cgEvent, absorbed: true, reason: "tile")
             return nil
         }
-        // The click was absorbed but matched nothing — the user's click is
-        // swallowed (does not focus a tile). Surface WHY at a visible level
-        // (CTAP is verbose-gated): a down/up target MISMATCH means the resolved
-        // tile changed between press and release (pointer drift across a cell
-        // edge, or a relayout from an in-panel refresh); a nil up-target means
-        // the release landed off any tile.
+        // Nothing under the release at all.
         let p = pointerLocationInWindow()
-        Diagnostics.log("CLICKMISS", "in-panel left click did nothing: down=\(describeTarget(downTarget)) upTile=\(describeTarget(upTile)) upButton=\(describeTarget(upButton)) at (\(Int(p.x)),\(Int(p.y)))")
+        Diagnostics.log("CLICKMISS", "in-panel left click did nothing: down=\(describeTarget(downTarget)) upTile=nil upButton=\(describeTarget(upButton)) at (\(Int(p.x)),\(Int(p.y)))")
         logTapDecision("left", "up", cgEvent, absorbed: true, reason: "insideUi-noTarget")
         return nil
     }
