@@ -77,19 +77,31 @@ class RunningApplicationsEvents {
     @objc private static func handleWorkspaceAppEvent(_ notification: Notification) {
         let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
         let pid = app?.processIdentifier ?? 0
+        let name = notification.name.rawValue
+        // Record which app activated and what AltTab decided. The generic
+        // "z-order top review reason=NSWorkspace…" REFRESH line does NOT carry
+        // the activating pid/app, so a Parallels app (e.g. Excel launched from
+        // the dock) being activated — and any COUNTER that re-raises the prior
+        // AltTab target over it — was previously only visible via Logger.debug
+        // (off at the default level). Log it at info so the activation→decision
+        // chain is greppable without enabling trace.
         if notification.name == NSWorkspace.didActivateApplicationNotification,
            let trackedApp = Applications.findOrCreate(pid, false) {
-            if Windows.releaseZOrderEnforcementForExternalForegroundOwner(pid: trackedApp.pid, label: notification.name.rawValue) {
-                Windows.requestZOrderTopReview(reason: notification.name.rawValue, wid: 0)
-                Logger.debug { "\(notification.name.rawValue) pid:\(pid) app:\(app?.debugId() ?? "?") released stale z-enforcement" }
+            let coherence = trackedApp.isParallelsCoherence
+            if Windows.releaseZOrderEnforcementForExternalForegroundOwner(pid: trackedApp.pid, label: name) {
+                Windows.requestZOrderTopReview(reason: name, wid: 0)
+                Diagnostics.log("ACTIVATE", "\(name) pid=\(pid) app=\(trackedApp.debugId) coherence=\(coherence) → released stale z-enforcement")
+                Logger.debug { "\(name) pid:\(pid) app:\(app?.debugId() ?? "?") released stale z-enforcement" }
                 return
             }
-            if Windows.shouldCounterPostAltTabParallelsActivation(for: trackedApp, wid: nil, reason: notification.name.rawValue) {
-                Logger.debug { "\(notification.name.rawValue) pid:\(pid) app:\(app?.debugId() ?? "?") suppressed" }
+            if Windows.shouldCounterPostAltTabParallelsActivation(for: trackedApp, wid: nil, reason: name) {
+                Diagnostics.log("ACTIVATE", "\(name) pid=\(pid) app=\(trackedApp.debugId) coherence=\(coherence) → COUNTERED: re-raising prior AltTab target over it")
+                Logger.debug { "\(name) pid:\(pid) app:\(app?.debugId() ?? "?") suppressed" }
                 return
             }
+            Diagnostics.log("ACTIVATE", "\(name) pid=\(pid) app=\(trackedApp.debugId) coherence=\(coherence) → z-order top review")
         }
-        Windows.requestZOrderTopReview(reason: notification.name.rawValue, wid: 0)
-        Logger.debug { "\(notification.name.rawValue) pid:\(pid) app:\(app?.debugId() ?? "?")" }
+        Windows.requestZOrderTopReview(reason: name, wid: 0)
+        Logger.debug { "\(name) pid:\(pid) app:\(app?.debugId() ?? "?")" }
     }
 }

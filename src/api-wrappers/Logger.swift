@@ -191,6 +191,13 @@ class Diagnostics {
         "HIDE": .info,
         "GUARD": .info,
         "TITLE": .info,
+        // info — decisive, rare, user-visible focus interventions. COUNTER
+        // re-raises the prior AltTab target over a Parallels app that just
+        // activated (the "window shows for a sec then gets hidden" action),
+        // and ACTIVATE records which app activated + what AltTab decided.
+        // These must be visible at the default level without enabling trace.
+        "COUNTER": .info,
+        "ACTIVATE": .info,
         // perf — switch timing & panel build counters
         "SWITCH": .perf,
         "REFRESH": .perf,
@@ -219,7 +226,6 @@ class Diagnostics {
         "SIBLINGSDEMOTE": .trace,
         "FRONT": .trace,
         "AXEVENT": .trace,
-        "COUNTER": .trace,
         "OVERLAY": .trace,
         "XPROC": .trace,
         "TEST": .trace,
@@ -290,17 +296,24 @@ class Diagnostics {
         let utcMs = Int64(Date().timeIntervalSince1970 * 1000)
         // NSLog/asl truncate at the first embedded newline, splitting
         // a single logical message across multiple log lines and
-        // hiding everything that came after the \n. We saw exactly
-        // this with Coherence-window titles containing internal
-        // newlines. Strip line-break characters from the message
-        // before logging.
+        // hiding everything that came after the \n. Worse, Coherence
+        // guest window titles arrive with trailing NUL and other C0
+        // control bytes (e.g. title='Excel\0'); written raw these make
+        // the on-disk log a binary file — `file` reports "data" and
+        // grep silently treats the whole log as binary, matching
+        // nothing. Map every C0 control char (0x00–0x1f) and DEL (0x7f)
+        // to a space so each line stays valid single-line UTF-8 text
+        // that ordinary text tools can read. We saw both failure modes
+        // with Coherence-window titles.
         let raw = message()
         var sanitized = raw
-        if raw.contains("\n") || raw.contains("\r") {
-            sanitized = raw
-                .replacingOccurrences(of: "\r\n", with: " ")
-                .replacingOccurrences(of: "\n", with: " ")
-                .replacingOccurrences(of: "\r", with: " ")
+        if raw.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7f }) {
+            var scalars = String.UnicodeScalarView()
+            scalars.reserveCapacity(raw.unicodeScalars.count)
+            for scalar in raw.unicodeScalars {
+                scalars.append((scalar.value < 0x20 || scalar.value == 0x7f) ? " " : scalar)
+            }
+            sanitized = String(scalars)
         }
         let beforeNslogNs = DispatchTime.now().uptimeNanoseconds
         let line = "[DIAG \(category)] \(String(format: "t+%.3fms", elapsedMs)) utcMs=\(utcMs) tid=\(currentThreadId()) q=\(currentQueueLabel()) \(sanitized)"
