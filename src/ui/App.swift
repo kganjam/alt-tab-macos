@@ -1103,7 +1103,18 @@ class App: AppCenterApplication {
     }
 
     static func refreshOpenUiAfterExternalEvent(_ windowsToScreenshot: [Window], windowRemoved: Bool = false, source: RefreshCausedBy = .refreshUiAfterExternalEvent) {
-        Windows.refreshThumbnailsAsync(windowsToScreenshot, source, windowRemoved: windowRemoved)
+        // Only capture immediately while the switcher is actually on screen. Callers
+        // fire on every focus change and window move/resize (Window.swift focus paths,
+        // Windows.swift post-drag), each passing the whole reordered window set. With
+        // the panel CLOSED, capturing per event storms CGSHWCaptureWindowList (and thus
+        // WindowServer's prepare_layer0 compositing) in a busy/many-window session — and
+        // it's redundant: focus changes already schedule a backoff-aware refresh via
+        // BackgroundThumbnailRefresher.noteRecentlyActive, and the on-show refresh
+        // re-captures whatever's visible when the panel opens. Removals still pass
+        // through so the cache can drop a closed window's thumbnail.
+        if appIsBeingUsed || windowRemoved {
+            Windows.refreshThumbnailsAsync(windowsToScreenshot, source, windowRemoved: windowRemoved)
+        }
         refreshOpenUiThrottler.throttleOrProceed {
             guard appIsBeingUsed else { return }
             if !Windows.updatesBeforeShowing() { hideUi(); return }
