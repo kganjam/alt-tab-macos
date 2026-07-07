@@ -1462,7 +1462,53 @@ extension App: NSApplicationDelegate {
                     "Menubar", "Wallpaper", "CursorUIViewService", "UserNotificationCenter",
                     "LocalAuthenticationRemoteService",
                 ]
+                // Click-capturing system chrome that floats above app windows.
+                // A click here is routed by the OS to the chrome itself, NOT to
+                // the app window geometrically behind it, so it must not be
+                // recorded as a click on that hidden window.
+                let clickCapturingChrome: Set<String> = [
+                    "Dock", "Control Center", "SystemUIServer", "Spotlight", "Notification Center",
+                ]
                 if isDown || isUp, let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+                    // The FIRST on-screen window under the cursor (this list is
+                    // front-to-back) is what actually received the click. If it
+                    // belongs to click-capturing chrome, don't attribute the
+                    // click to the app window behind it. Otherwise, e.g.,
+                    // clicking an app's Dock icon to launch/activate it gets
+                    // recorded as a click on whatever window sits behind the
+                    // Dock; diagnoseCrossProcessActivation then reads that as
+                    // "clicked window X but a different Coherence app activated"
+                    // and repeatedly restores X over the app the user just
+                    // launched — a Coherence activation war that buries it
+                    // within ~1s (project_excel_dock_activation_war).
+                    var chromeUnderCursor: String? = nil
+                    for w in list {
+                        let alpha = (w[kCGWindowAlpha as String] as? Double) ?? 1.0
+                        if alpha < 0.1 { continue }
+                        guard let b = w[kCGWindowBounds as String] as? [String: Any],
+                              let x = b["X"] as? Double, let y = b["Y"] as? Double,
+                              let width = b["Width"] as? Double, let height = b["Height"] as? Double else { continue }
+                        if CGRect(x: x, y: y, width: width, height: height).contains(cgPoint) {
+                            let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
+                            if clickCapturingChrome.contains(owner) { chromeUnderCursor = owner }
+                            break
+                        }
+                    }
+                    if let chromeUnderCursor {
+                        if isDown {
+                            // Do NOT attribute this click to the window behind
+                            // the chrome. Zeroing the pid short-circuits the
+                            // click-misroute repair (guards on pid != 0).
+                            Windows.lastMouseClickWid = 0
+                            Windows.lastMouseClickPid = 0
+                            Windows.lastMouseClickOwner = chromeUnderCursor
+                            Windows.requestZOrderReview(reason: "mouse-down-chrome", fullDelayMs: 500)
+                        } else {
+                            Windows.requestZOrderTopReview(reason: "mouse-up-chrome")
+                        }
+                        Diagnostics.log("MOUSE", "\(button) \(action) at (\(Int(cgPoint.x)),\(Int(cgPoint.y))) → \(chromeUnderCursor) chrome (not attributed to window behind)")
+                        return
+                    }
                     var clickedWindow = false
                     for w in list {
                         let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
