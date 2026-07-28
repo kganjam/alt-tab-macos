@@ -82,15 +82,46 @@ Design that keeps us under budget:
   token+watchdog counter; **`CGS_CONNECTION`** is computed (self-heals after a
   WindowServer restart).
 
+**Second crash mode — the capture retry-storm (REL-102, distinct from the surface budget above):**
+The budget fixes bound *how many surfaces we hold*, but a separate failure comes from
+*re-dispatching captures that never complete*. Some windows (offscreen / Parallels
+Coherence / dead-surface) return no capture completion at all. The original
+`ThumbnailCache.rescueStuckInFlightLocked` cleared such an in-flight capture after 15s
+and re-queued it at `now+1` **unconditionally**, so ~10 un-capturable windows were
+re-dispatched every cycle forever. `bgThumbnailMaxConcurrent` bounds AltTab's own
+in-flight count but **not** WindowServer/replayd work: under SCK each abandoned capture
+strands a `replayd` thread that never returns, so the leak grows with time until replayd
+hits its **513-thread dispatch limit** and its turnstile chain wedges WindowServer's main
+thread → beachball (2026-07-15) / userspace-watchdog kill (2026-07-28). Three invariants
+now prevent it (all flag-gated, default on):
+- **Quarantine un-completable windows** (`ThumbnailCache`): a timed-out capture backs off
+  exponentially and, after `bgThumbnailCaptureTimeoutQuarantineThreshold` (3) consecutive
+  timeouts, is suspended for `bgThumbnailCaptureQuarantineMs` (300s). Never re-dispatch a
+  window that isn't completing. Resets on any completion/activation. Logs `THUMBQUAR`.
+- **WindowServer circuit breaker** (`BackgroundThumbnailRefresher.captureBudgetThisTick`,
+  fed by `ActiveWindowCaptures` capture-latency/expiry telemetry): closed→open on an
+  expiry burst (`bgThumbnailOverloadExpiryThreshold` 5 in 60s) or high latency; open pauses
+  **all** dispatch for a cooldown; halfOpen sends exactly **one probe** and only recovers
+  if it completes. So stranded-thread growth is **O(1) per cooldown, not O(time)**. Logs
+  `OVERLOAD`. This — not the per-window quarantine alone — is the systemic guarantee.
+- **Display-off / screen-lock hold** (`SleepWakeEvents` + `App.holdThumbnailCapturesForDisplayOff`):
+  `screensDidSleep/Wake` + `com.apple.screenIsLocked/Unlocked` hold captures for the whole
+  off/locked span (WindowServer isn't compositing then; captures strand and flush as a herd
+  on unlock).
+
 **Surface watch:** the `THUMBCACHE` log line (perf level, ~every 30s) reports
 `windows=` (tracked/live windows) and `surfaces=` (held IOSurface-backed thumbnails).
 `surfaces` should track `windows` and **not grow** unbounded over a long session; a
 rising `surfaces` decoupled from `windows` means a surface leak regressed. If it ever
 creeps toward the WindowServer per-client tally, flip `bgThumbnailDetachNonHotTier` on.
+For REL-102 the health signals on the same line are `inFlight` (must NOT stay pinned),
+`expired`/`recentExpiries`/`timingOut`/`quarantined` (~0 in steady state), and
+`captureLatencyMs` (tens of ms); `OVERLOAD`/`THUMBQUAR` are warn-level events.
+`ws-mem-watch.sh` trends these plus the replayd thread count every 5 min.
 Tunables: `bgThumbnail*` in `src/logic/Preferences.swift`.
 
 Full incident write-up and the other capture-path fixes: `experiments/release-issue-monitor.md`
-(REL-100/REL-101) and `experiments/release-risk-code-review.md` (Thumbnail/capture row).
+(REL-100/REL-101/REL-102) and `experiments/release-risk-code-review.md` (Thumbnail/capture row).
 
 ## Diagnostics & profiling
 

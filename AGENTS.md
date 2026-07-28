@@ -235,6 +235,17 @@ If you need to think harder about this, see memory note
   (`Windows.list`, `Window.size`/`.screenId`, `cachedSCWindows`): snapshot per-window
   state on the main thread first (`CaptureRequest`); `cachedSCWindows` is lock-guarded
   (REL-101).
+- NEVER re-dispatch a capture that isn't completing (REL-102). A window whose SCK/CGS
+  capture returns no completion (offscreen/Coherence/dead-surface) strands a `replayd`
+  thread; retrying it every tick hangs/watchdog-kills WindowServer (replayd 513-thread
+  limit → WS wedge; beachball 2026-07-15, kill 2026-07-28). Invariants: `ThumbnailCache`
+  quarantines a window after `bgThumbnailCaptureTimeoutQuarantineThreshold` timeouts
+  (`THUMBQUAR`); `BackgroundThumbnailRefresher.captureBudgetThisTick` is a WindowServer
+  circuit breaker (open on capture-expiry burst / high latency, single-probe recovery →
+  O(1) replayd growth, `OVERLOAD`); `SleepWakeEvents` holds captures for the whole
+  display-off/screen-lock span. Health on the `THUMBCACHE` line: `inFlight` must NOT stay
+  pinned, `expired`/`recentExpiries`/`timingOut`/`quarantined` ~0, `captureLatencyMs` low.
+  Instant mitigation: `defaults write com.lwouis.alt-tab-macos bgThumbnailRefreshEnabled -bool false`.
 - Every `bgThumbnail*` (and any) flag must agree between `Preferences.defaultValues`
   (registered into UserDefaults, and it WINS) and its `RuntimeFlags` accessor default.
   A mismatch silently ignores your intended value.
