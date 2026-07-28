@@ -103,6 +103,13 @@ class App: AppCenterApplication {
     private static var thumbnailCaptureGateToken: UInt64 = 0
     private static var thumbnailCaptureGateUntil: CFAbsoluteTime = 0
     private static var thumbnailCaptureGateReason = ""
+    /// Indefinite capture hold while the display is asleep or the screen is
+    /// locked. Unlike the time-boxed gate above, this has no timeout — it's held
+    /// from the sleep/lock event until the paired wake/unlock event. Capturing a
+    /// window while WindowServer isn't compositing (display off) is where the
+    /// requests strand server-side and then flush as a thundering herd on wake —
+    /// the 2026-07-15 unlock beachball. Guarded by `thumbnailCaptureGateLock`.
+    private static var thumbnailCaptureDisplayHold = false
     private static var pendingParCaptureGateToken: UInt64?
     /// Register-once guard for the global mouse-click NSEvent monitor.
     /// Without this, duplicate `[DIAG MOUSE]` lines appeared per click.
@@ -172,6 +179,25 @@ class App: AppCenterApplication {
         return token
     }
 
+    /// Hold ALL thumbnail captures indefinitely (no timeout) while the display
+    /// is off / screen is locked. Released by `releaseThumbnailCaptureDisplayHold`
+    /// on the paired wake/unlock. Idempotent.
+    static func holdThumbnailCapturesForDisplayOff(reason: String) {
+        thumbnailCaptureGateLock.lock()
+        let wasHeld = thumbnailCaptureDisplayHold
+        thumbnailCaptureDisplayHold = true
+        thumbnailCaptureGateLock.unlock()
+        if !wasHeld { Diagnostics.log("CAPTURE", "thumbnail display-off hold begin reason=\(reason)") }
+    }
+
+    static func releaseThumbnailCaptureDisplayHold(reason: String) {
+        thumbnailCaptureGateLock.lock()
+        let wasHeld = thumbnailCaptureDisplayHold
+        thumbnailCaptureDisplayHold = false
+        thumbnailCaptureGateLock.unlock()
+        if wasHeld { Diagnostics.log("CAPTURE", "thumbnail display-off hold end reason=\(reason)") }
+    }
+
     static func releaseThumbnailCaptureGate(_ token: UInt64, reason: String) {
         guard token > 0 else { return }
         thumbnailCaptureGateLock.lock()
@@ -187,6 +213,18 @@ class App: AppCenterApplication {
 
     static func thumbnailCaptureAllowed(_ source: RefreshCausedBy, logBlocked: Bool = true) -> Bool {
         let now = CFAbsoluteTimeGetCurrent()
+        // Absolute hold while the display is off / screen is locked — WindowServer
+        // isn't compositing, so captures issued now strand server-side and flush
+        // as a herd on wake. Checked first; independent of the time-boxed gate.
+        thumbnailCaptureGateLock.lock()
+        let displayHold = thumbnailCaptureDisplayHold
+        thumbnailCaptureGateLock.unlock()
+        if displayHold {
+            if logBlocked {
+                Diagnostics.log("CAPTURE", "thumbnail capture blocked source=\(source) reason=display-off-hold")
+            }
+            return false
+        }
         // Post-selection pause: after the user commits an alt-tab choice,
         // suppress ALL captures for `bgThumbnailPostSelectionPauseMs` so
         // we don't compete with the focus handoff. This also catches

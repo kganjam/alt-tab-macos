@@ -8,6 +8,17 @@ class SleepWakeEvents {
         let nc = NSWorkspace.shared.notificationCenter
         nc.addObserver(self, selector: #selector(handleWake), name: NSWorkspace.didWakeNotification, object: nil)
         nc.addObserver(self, selector: #selector(handleSleep), name: NSWorkspace.willSleepNotification, object: nil)
+        // Display-only sleep/wake (screen off/on without the system sleeping) and
+        // screen lock/unlock. These — NOT system sleep — are what fired the
+        // 2026-07-15 unlock beachball: the screen slept, background captures kept
+        // dispatching into a non-compositing WindowServer, stranded server-side,
+        // then flushed as a herd on unlock. Hold captures for the whole off/locked
+        // span instead of the fixed transition pause.
+        nc.addObserver(self, selector: #selector(handleScreensSleep), name: NSWorkspace.screensDidSleepNotification, object: nil)
+        nc.addObserver(self, selector: #selector(handleScreensWake), name: NSWorkspace.screensDidWakeNotification, object: nil)
+        let dnc = DistributedNotificationCenter.default()
+        dnc.addObserver(self, selector: #selector(handleScreenLocked), name: NSNotification.Name("com.apple.screenIsLocked"), object: nil)
+        dnc.addObserver(self, selector: #selector(handleScreenUnlocked), name: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil)
         observePowerSourceChanges()
     }
 
@@ -20,6 +31,37 @@ class SleepWakeEvents {
 
     @objc private static func handleSleep(_ notification: Notification) {
         onPowerDisplayTransition("sleep")
+    }
+
+    @objc private static func handleScreensSleep(_ notification: Notification) {
+        beginDisplayOffHold("screens-sleep")
+    }
+
+    @objc private static func handleScreensWake(_ notification: Notification) {
+        endDisplayOffHold("screens-wake")
+    }
+
+    @objc private static func handleScreenLocked(_ notification: Notification) {
+        beginDisplayOffHold("screen-locked")
+    }
+
+    @objc private static func handleScreenUnlocked(_ notification: Notification) {
+        endDisplayOffHold("screen-unlocked")
+    }
+
+    /// Hold all thumbnail captures for the entire display-off / locked span.
+    private static func beginDisplayOffHold(_ kind: String) {
+        guard RuntimeFlags.bgThumbnailDisplayOffHoldEnabled else { return }
+        Diagnostics.log("POWER", "display-off/lock: \(kind) — holding thumbnail captures until wake/unlock")
+        App.holdThumbnailCapturesForDisplayOff(reason: kind)
+    }
+
+    /// Release the display-off hold on wake/unlock, then apply the normal
+    /// transition settle pause so we don't resume straight into WindowServer's
+    /// full-screen recomposite.
+    private static func endDisplayOffHold(_ kind: String) {
+        App.releaseThumbnailCaptureDisplayHold(reason: kind)
+        onPowerDisplayTransition(kind)
     }
 
     /// AC <-> battery transitions make the GPU switch and WindowServer recomposite

@@ -428,6 +428,21 @@ class ActiveWindowCaptures {
     private static var counter: UInt64 = 0
     private static let timeoutSec: CFAbsoluteTime = 20
 
+    // Pressure telemetry. A capture that `begin()`s but never `end()`s within
+    // `timeoutSec` "expired" — WindowServer accepted the request and never
+    // returned it. A *burst* of expiries (and/or a climbing round-trip latency)
+    // is the earliest in-process signal that WindowServer is wedging, and is
+    // exactly what precedes the beachball (2026-07-15) and watchdog-kill
+    // (2026-07-28). `WindowServerPressure.isOverloaded()` reads these to pause
+    // background captures before we drive the server over the edge.
+    private static var ewmaLatencyMs: Double = 0
+    private static var completedTotal: UInt64 = 0
+    private static var expiredTotal: UInt64 = 0
+    /// Timestamps of recent expiries, trimmed to `expiryWindowSec`. Its size is
+    /// the "how many captures WindowServer dropped on the floor lately" signal.
+    private static var expiryTimes = [CFAbsoluteTime]()
+    private static let expiryWindowSec: CFAbsoluteTime = 60
+
     @discardableResult
     static func begin() -> UInt64 {
         lock.lock(); defer { lock.unlock() }
@@ -438,16 +453,57 @@ class ActiveWindowCaptures {
 
     static func end(_ token: UInt64) {
         lock.lock(); defer { lock.unlock() }
-        inFlight.removeValue(forKey: token)
+        guard let start = inFlight.removeValue(forKey: token) else { return }
+        let latencyMs = (CFAbsoluteTimeGetCurrent() - start) * 1000
+        // EWMA (alpha 0.2): smooths per-capture noise while tracking the trend.
+        ewmaLatencyMs = ewmaLatencyMs == 0 ? latencyMs : ewmaLatencyMs * 0.8 + latencyMs * 0.2
+        completedTotal &+= 1
     }
 
     static func value() -> Int {
         lock.lock(); defer { lock.unlock() }
-        if !inFlight.isEmpty {
-            let cutoff = CFAbsoluteTimeGetCurrent() - timeoutSec
-            inFlight = inFlight.filter { $0.value > cutoff }
-        }
+        pruneExpiredLocked(CFAbsoluteTimeGetCurrent())
         return inFlight.count
+    }
+
+    /// True when WindowServer is failing to service captures: a burst of
+    /// expiries within the rolling window, or a sustained high round-trip
+    /// latency. Self-clearing — once captures complete again, expiries age out
+    /// of the window and the EWMA decays. Thresholds are read outside the lock.
+    static func isOverloaded(expiryThreshold: Int, latencyMaxMs: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        pruneExpiredLocked(CFAbsoluteTimeGetCurrent())
+        return expiryTimes.count >= expiryThreshold || ewmaLatencyMs > Double(latencyMaxMs)
+    }
+
+    /// One-line pressure summary for the THUMBCACHE/OVERLOAD diagnostics.
+    static func pressureLine() -> String {
+        lock.lock(); defer { lock.unlock() }
+        pruneExpiredLocked(CFAbsoluteTimeGetCurrent())
+        return "captureLatencyMs=\(Int(ewmaLatencyMs)) inFlight=\(inFlight.count) completed=\(completedTotal) expired=\(expiredTotal) recentExpiries=\(expiryTimes.count)"
+    }
+
+    /// Drop tokens that never completed within `timeoutSec` and fold them into
+    /// the expiry telemetry (each counted exactly once, since it's removed).
+    /// This is also what keeps a single wedged capture from permanently jamming
+    /// the back-pressure gate. Caller holds `lock`.
+    private static func pruneExpiredLocked(_ now: CFAbsoluteTime) {
+        if !inFlight.isEmpty {
+            let cutoff = now - timeoutSec
+            let expiredKeys = inFlight.compactMap { $0.value <= cutoff ? $0.key : nil }
+            if !expiredKeys.isEmpty {
+                for k in expiredKeys { inFlight.removeValue(forKey: k) }
+                expiredTotal &+= UInt64(expiredKeys.count)
+                for _ in expiredKeys { expiryTimes.append(now) }
+            }
+        }
+        // Trim the rolling window.
+        let windowStart = now - expiryWindowSec
+        if let firstFresh = expiryTimes.firstIndex(where: { $0 >= windowStart }) {
+            if firstFresh > 0 { expiryTimes.removeFirst(firstFresh) }
+        } else if !expiryTimes.isEmpty {
+            expiryTimes.removeAll(keepingCapacity: true)
+        }
     }
 }
 

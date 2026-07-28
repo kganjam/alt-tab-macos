@@ -25,6 +25,9 @@ final class BackgroundThumbnailRefresher {
     private var tierRecomputeCounter = 0
     private var reconcileCounter = 0
     private var residencyTouchCounter = 0
+    /// Last WindowServer-overload state seen in `tick`, so we log only the
+    /// enter/leave transitions rather than every paused tick.
+    private var lastOverloaded = false
     /// Hot-tier wids from the last `recomputeTiers`, reused by `register` so
     /// new-window registration doesn't re-sort the whole window list each time
     /// (O(n log n) per window → O(n² log n) during a discovery burst). Touched
@@ -78,7 +81,9 @@ final class BackgroundThumbnailRefresher {
             warmJitterSec: Double(RuntimeFlags.bgThumbnailWarmJitterMs) / 1000,
             coldJitterSec: Double(RuntimeFlags.bgThumbnailColdJitterMs) / 1000,
             firstThumbnailRetrySec: Double(RuntimeFlags.bgThumbnailFirstRetryMs) / 1000,
-            maxBackoffSec: maxBackoffSec
+            maxBackoffSec: maxBackoffSec,
+            captureTimeoutQuarantineThreshold: RuntimeFlags.bgThumbnailCaptureTimeoutQuarantineThreshold,
+            captureQuarantineSec: Double(RuntimeFlags.bgThumbnailCaptureQuarantineMs) / 1000
         ))
     }
 
@@ -157,6 +162,24 @@ final class BackgroundThumbnailRefresher {
         // Back-pressure: don't pile on if many captures are already in
         // flight (from in-panel timer, AX events, etc.).
         if ActiveWindowCaptures.value() >= RuntimeFlags.bgThumbnailMaxConcurrent { return }
+
+        // Global overload gate: if WindowServer has stopped servicing captures
+        // (a burst of timeouts or a high round-trip latency), stop feeding it
+        // entirely until it recovers. This is the systemic safety net that would
+        // have cut the retry-storm that beachballed (2026-07-15) and then
+        // watchdog-killed (2026-07-28) WindowServer. Log only the transitions.
+        if RuntimeFlags.bgThumbnailOverloadPauseEnabled {
+            let overloaded = ActiveWindowCaptures.isOverloaded(
+                expiryThreshold: RuntimeFlags.bgThumbnailOverloadExpiryThreshold,
+                latencyMaxMs: RuntimeFlags.bgThumbnailCaptureLatencyOverloadMs)
+            if overloaded != lastOverloaded {
+                lastOverloaded = overloaded
+                Diagnostics.log("OVERLOAD", overloaded
+                    ? "WindowServer overloaded — pausing background captures. \(ActiveWindowCaptures.pressureLine())"
+                    : "WindowServer recovered — resuming background captures. \(ActiveWindowCaptures.pressureLine())")
+            }
+            if overloaded { return }
+        }
 
         tierRecomputeCounter += 1
         if tierRecomputeCounter >= 8 {
@@ -242,7 +265,7 @@ final class BackgroundThumbnailRefresher {
         DispatchQueue.main.async {
             if Diagnostics.shouldLog("THUMBCACHE") {
                 let captures = CaptureBackendCounters.snapshot()
-                Diagnostics.log("THUMBCACHE", "windows=\(Windows.list.count) \(ThumbnailCache.shared.statsLine()) activeCaptures=\(ActiveWindowCaptures.value()) cgsCaptures=\(captures.cgs) sckCaptures=\(captures.sck) selfRss=\(selfResidentMB())MB panelOpen=\(App.appIsBeingUsed)")
+                Diagnostics.log("THUMBCACHE", "windows=\(Windows.list.count) \(ThumbnailCache.shared.statsLine()) activeCaptures=\(ActiveWindowCaptures.value()) \(ActiveWindowCaptures.pressureLine()) cgsCaptures=\(captures.cgs) sckCaptures=\(captures.sck) selfRss=\(selfResidentMB())MB panelOpen=\(App.appIsBeingUsed)")
             }
             Applications.removeZombieWindows()
             // Self-heal the AX↔WindowServer bridge if a WindowServer crash left it

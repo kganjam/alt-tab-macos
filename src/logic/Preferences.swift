@@ -75,6 +75,12 @@ class Preferences {
             "bgThumbnailMaxConcurrent": "4",
             "bgThumbnailPostSelectionPauseMs": "3000",
             "bgThumbnailTransitionPauseMs": "6000",
+            "bgThumbnailCaptureTimeoutQuarantineThreshold": "3",
+            "bgThumbnailCaptureQuarantineMs": "300000",
+            "bgThumbnailOverloadPauseEnabled": "true",
+            "bgThumbnailOverloadExpiryThreshold": "5",
+            "bgThumbnailCaptureLatencyOverloadMs": "2000",
+            "bgThumbnailDisplayOffHoldEnabled": "true",
             "bgThumbnailCoherenceEnabled": "true",
             "axWindowGeometryThrottleMs": "500",
             "focusOverlayCaptureEnabled": "true",
@@ -634,6 +640,28 @@ enum RuntimeFlags {
     // observed trigger for the unresponsive-WindowServer freeze on AC plug/unplug
     // + external-display connect.
     static var bgThumbnailTransitionPauseMs: Int { int("bgThumbnailTransitionPauseMs", default: 6000) }
+    // After this many consecutive capture timeouts (dispatched but no completion
+    // within the in-flight watchdog), a window is quarantined: its background
+    // capture is suspended for `bgThumbnailCaptureQuarantineMs` instead of being
+    // re-dispatched every tick. An un-capturable window (offscreen/Coherence/dead
+    // surface) whose capture never completes was the retry-storm that hung and
+    // watchdog-killed WindowServer (2026-07-15 beachball, 2026-07-28 crash).
+    static var bgThumbnailCaptureTimeoutQuarantineThreshold: Int { int("bgThumbnailCaptureTimeoutQuarantineThreshold", default: 3) }
+    static var bgThumbnailCaptureQuarantineMs: Int { int("bgThumbnailCaptureQuarantineMs", default: 300000) }
+    // Global back-pressure: pause ALL background captures when WindowServer stops
+    // servicing them — a burst of capture timeouts (>= expiry threshold within the
+    // 60s rolling window) or a sustained high capture round-trip latency. This is
+    // the systemic safety net above the per-window quarantine: if WindowServer
+    // starts wedging across the board, stop feeding it immediately rather than
+    // waiting out per-window timeout streaks.
+    static var bgThumbnailOverloadPauseEnabled: Bool { bool("bgThumbnailOverloadPauseEnabled", default: true) }
+    static var bgThumbnailOverloadExpiryThreshold: Int { int("bgThumbnailOverloadExpiryThreshold", default: 5) }
+    static var bgThumbnailCaptureLatencyOverloadMs: Int { int("bgThumbnailCaptureLatencyOverloadMs", default: 2000) }
+    // Hold ALL thumbnail captures for the entire span the display is asleep or the
+    // screen is locked (vs. the fixed transition pause). WindowServer isn't
+    // compositing then, so captures strand server-side and flush as a herd on
+    // wake — the 2026-07-15 unlock beachball.
+    static var bgThumbnailDisplayOffHoldEnabled: Bool { bool("bgThumbnailDisplayOffHoldEnabled", default: true) }
     static var bgThumbnailCoherenceEnabled: Bool { bool("bgThumbnailCoherenceEnabled", default: true) }
     // Trailing-edge coalescing interval for the high-frequency AX window
     // move/resize notification storm (a live drag/resize fires these at the

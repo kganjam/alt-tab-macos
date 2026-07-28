@@ -60,6 +60,20 @@ final class ThumbnailCache {
         /// an activation drops it back to the tier's base cadence. Set to 0 (or any
         /// value ≤ a tier's base interval) to disable backoff for that tier.
         var maxBackoffSec: TimeInterval = 600
+        /// Consecutive capture timeouts (in-flight rescued without a completion
+        /// callback) after which a window is quarantined: its background capture
+        /// is suspended for `captureQuarantineSec` instead of being retried every
+        /// tick. A window whose SCK/CGS capture never completes is almost always
+        /// un-capturable (offscreen/Coherence/dead surface); re-dispatching it
+        /// forever is what pinned `inFlight` at ~10 and hung WindowServer
+        /// (watchdog-killed 2026-07-28). Below the threshold, each timeout backs
+        /// the retry off exponentially (1s, 2s, 4s…) rather than a tight now+1s.
+        var captureTimeoutQuarantineThreshold: Int = 3
+        /// How long a quarantined window's background capture stays suspended.
+        /// It still gets captured on demand when the panel opens or the window is
+        /// activated (which resets the timeout streak), so a window that becomes
+        /// capturable again recovers promptly.
+        var captureQuarantineSec: TimeInterval = 300
     }
 
     private struct Entry {
@@ -99,6 +113,16 @@ final class ThumbnailCache {
         var inFlight: Bool = false
         var inFlightScheduleId: UInt64 = 0
         var inFlightSince: CFAbsoluteTime = 0
+        /// Consecutive in-flight captures that timed out (rescued without a
+        /// `writeCapture`/`rejectCapture`/`clearInFlight` completion). Drives the
+        /// exponential retry backoff and quarantine in `rescueStuckInFlightLocked`;
+        /// reset to 0 by any completion or activation so a recovered window
+        /// resumes its normal cadence.
+        var timeoutStreak: Int = 0
+        /// True while this window is quarantined (capture suspended after
+        /// `captureTimeoutQuarantineThreshold` consecutive timeouts). Diagnostic
+        /// only — the suspension is enforced by the deferred heap deadline.
+        var quarantined: Bool = false
     }
 
     private let lock = NSLock()
@@ -296,6 +320,10 @@ final class ThumbnailCache {
         e.inFlight = false
         e.inFlightScheduleId = 0
         e.inFlightSince = 0
+        // The capture completed (success or a rejected dud), so WindowServer
+        // serviced it — clear any timeout streak / quarantine.
+        e.timeoutStreak = 0
+        e.quarantined = false
         entries[wid] = e
         guard wasBgInitiated, e.scheduleId == poppedScheduleId else { return }
         // A static window (content byte-identical to its last capture) is polled
@@ -332,6 +360,11 @@ final class ThumbnailCache {
         e.inFlightScheduleId = 0
         e.inFlightSince = 0
         e.unchangedStreak = 0
+        // Reached the completion path (capture errored or the window was filtered
+        // out post-dispatch), so this is not a WindowServer timeout — clear the
+        // streak/quarantine.
+        e.timeoutStreak = 0
+        e.quarantined = false
         entries[wid] = e
         guard e.scheduleId == poppedScheduleId else { return }
         let now = CFAbsoluteTimeGetCurrent()
@@ -388,6 +421,10 @@ final class ThumbnailCache {
         lock.lock(); defer { lock.unlock() }
         guard entries[wid] != nil else { return }
         entries[wid]!.unchangedStreak = 0
+        // The user returned to this window, so it's on-screen and capturable again:
+        // lift any capture quarantine so its pulled-forward refresh actually fires.
+        entries[wid]!.timeoutStreak = 0
+        entries[wid]!.quarantined = false
     }
 
     // MARK: - Scheduling
@@ -429,11 +466,13 @@ final class ThumbnailCache {
     func statsLine() -> String {
         lock.lock(); defer { lock.unlock() }
         var hot = 0, warm = 0, cold = 0, inFlight = 0, pixelBuffer = 0, cgImage = 0
-        var liveSurfaces = 0, detached = 0, backedOff = 0
+        var liveSurfaces = 0, detached = 0, backedOff = 0, quarantined = 0, timingOut = 0
         for (_, e) in entries {
             switch e.tier { case .hot: hot += 1; case .warm: warm += 1; case .cold: cold += 1 }
             if e.inFlight { inFlight += 1 }
             if e.unchangedStreak > 0 { backedOff += 1 }
+            if e.quarantined { quarantined += 1 }
+            else if e.timeoutStreak > 0 { timingOut += 1 }
             switch e.thumbnail {
             case .pixelBuffer?: pixelBuffer += 1
             case .cgImage?: cgImage += 1
@@ -451,7 +490,7 @@ final class ThumbnailCache {
         // so `surfaces` (their sum) overcounts when detach is on — watch `liveSurfaces`, not `surfaces`.
         let surfaces = pixelBuffer + cgImage
         let nextDueMs = heap.peek().map { Int(($0.deadline - CFAbsoluteTimeGetCurrent()) * 1000) } ?? -1
-        return "entries=\(entries.count) liveSurfaces=\(liveSurfaces) detached=\(detached) surfaces=\(surfaces) pixelBuffer=\(pixelBuffer) cgImage=\(cgImage) hot=\(hot) warm=\(warm) cold=\(cold) backedOff=\(backedOff) inFlight=\(inFlight) heap=\(heap.count) nextDueMs=\(nextDueMs)"
+        return "entries=\(entries.count) liveSurfaces=\(liveSurfaces) detached=\(detached) surfaces=\(surfaces) pixelBuffer=\(pixelBuffer) cgImage=\(cgImage) hot=\(hot) warm=\(warm) cold=\(cold) backedOff=\(backedOff) inFlight=\(inFlight) timingOut=\(timingOut) quarantined=\(quarantined) heap=\(heap.count) nextDueMs=\(nextDueMs)"
     }
 
     // MARK: - Internal
@@ -465,17 +504,35 @@ final class ThumbnailCache {
         }
     }
 
-    /// Reset entries whose in-flight capture leaked. Forces a new heap
-    /// entry at now+1s so they're retried promptly. Cheap; runs once
-    /// per tick.
+    /// Reset entries whose in-flight capture leaked (dispatched but no
+    /// `writeCapture`/`rejectCapture`/`clearInFlight` completion within
+    /// `inFlightTimeoutSec`). A leaked capture means WindowServer never serviced
+    /// the request — retrying it at now+1s every tick is exactly what pinned
+    /// `inFlight` at ~10 and drove WindowServer into a watchdog-killed hang. So
+    /// instead of an unconditional prompt retry: back the next attempt off
+    /// exponentially with the per-window timeout streak, and once the streak
+    /// crosses `captureTimeoutQuarantineThreshold`, quarantine the window —
+    /// suspend its background capture for `captureQuarantineSec`. Any real
+    /// completion or an activation resets the streak, so a window that becomes
+    /// capturable again recovers on its next on-demand/activation capture.
     private func rescueStuckInFlightLocked(now: CFAbsoluteTime) {
         let timeout = schedule.inFlightTimeoutSec
         for (wid, var e) in entries where e.inFlight && (now - e.inFlightSince) > timeout {
             e.inFlight = false
             e.inFlightScheduleId = 0
             e.inFlightSince = 0
+            e.timeoutStreak += 1
+            let backoff: TimeInterval
+            if e.timeoutStreak >= schedule.captureTimeoutQuarantineThreshold {
+                e.quarantined = true
+                backoff = schedule.captureQuarantineSec
+                Diagnostics.log("THUMBQUAR", "wid=\(wid) quarantined after \(e.timeoutStreak) consecutive capture timeouts — suspending bg capture \(Int(schedule.captureQuarantineSec))s (window un-capturable; not re-hammering WindowServer)")
+            } else {
+                // 1s, 2s, 4s… capped at the quarantine ceiling.
+                backoff = Swift.min(schedule.captureQuarantineSec, pow(2, Double(e.timeoutStreak - 1)))
+            }
             generation &+= 1
-            e.nextRefreshAt = now + 1
+            e.nextRefreshAt = now + backoff
             e.scheduleId = generation
             entries[wid] = e
             heap.push(HeapEntry(deadline: e.nextRefreshAt, wid: wid, scheduleId: generation))
