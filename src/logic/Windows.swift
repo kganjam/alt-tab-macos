@@ -1557,6 +1557,20 @@ class Windows {
                 if window.application.isParallelsCoherence {
                     queueAxRecovery(for: window, wid: mostRecent.wid, pid: mostRecent.pid, attempt: attempt, generation: currentZOrderEnforcementGeneration())
                     Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), focus reassert queued Parallels AX recovery #\(attempt)/\(ZOrderIntent.maxRaiseAttempts)")
+                } else if RuntimeFlags.zOrderDegradedRecoveryEnabled, sameAppBlockerWid == nil,
+                          let app = NSRunningApplication(processIdentifier: mostRecent.pid) {
+                    // CGSOrderWindow failed and a DIFFERENT app is frozen on top
+                    // (cross-app burial, not a same-app sibling). This is the
+                    // degraded-WindowServer case (e.g. post-watchdog-kill): the
+                    // server isn't honoring order requests. Escalate to app
+                    // activation — an independent path (NSWorkspace/app activation)
+                    // that can succeed when CGSOrderWindow doesn't. The queued AX
+                    // reassert above still targets the exact window, so per-window
+                    // focus is preserved for multi-window apps. Scoped to the
+                    // user's explicit target + a non-same-app blocker, so it can't
+                    // dismiss a same-app child popup.
+                    app.activate(options: [])
+                    Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), native escalate app.activate(pid=\(mostRecent.pid)) — CGSOrderWindow err, cross-app blocker #\(attempt)/\(ZOrderIntent.maxRaiseAttempts)")
                 } else {
                     Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), native AX recovery skipped #\(attempt)/\(ZOrderIntent.maxRaiseAttempts)")
                 }

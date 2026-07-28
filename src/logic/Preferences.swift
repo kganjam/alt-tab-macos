@@ -83,6 +83,7 @@ class Preferences {
             "bgThumbnailOverloadCooldownMs": "15000",
             "bgThumbnailOverloadProbeTimeoutMs": "25000",
             "bgThumbnailDisplayOffHoldEnabled": "true",
+            "zOrderDegradedRecoveryEnabled": "true",
             "bgThumbnailCoherenceEnabled": "true",
             "axWindowGeometryThrottleMs": "500",
             "focusOverlayCaptureEnabled": "true",
@@ -668,6 +669,12 @@ enum RuntimeFlags {
     // compositing then, so captures strand server-side and flush as a herd on
     // wake — the 2026-07-15 unlock beachball.
     static var bgThumbnailDisplayOffHoldEnabled: Bool { bool("bgThumbnailDisplayOffHoldEnabled", default: true) }
+    // When CGSOrderWindow fails to raise a native target above a different app
+    // frozen on top (a degraded WindowServer, e.g. post-watchdog-kill), escalate
+    // to NSRunningApplication.activate — an independent path that can succeed when
+    // the CGS order request is silently dropped. Scoped to cross-app blockers so
+    // it can't dismiss a same-app child popup.
+    static var zOrderDegradedRecoveryEnabled: Bool { bool("zOrderDegradedRecoveryEnabled", default: true) }
     static var bgThumbnailCoherenceEnabled: Bool { bool("bgThumbnailCoherenceEnabled", default: true) }
     // Trailing-edge coalescing interval for the high-frequency AX window
     // move/resize notification storm (a live drag/resize fires these at the
