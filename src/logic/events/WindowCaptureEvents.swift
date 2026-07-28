@@ -476,6 +476,16 @@ class ActiveWindowCaptures {
         return expiryTimes.count >= expiryThreshold || ewmaLatencyMs > Double(latencyMaxMs)
     }
 
+    /// Cumulative completed vs expired capture counts. The circuit breaker
+    /// snapshots these to decide a probe's outcome: a rise in `completed` means
+    /// WindowServer serviced the probe (recover); a rise in `expired` means the
+    /// probe stranded another replayd thread (stay open).
+    static func completedExpiredTotals() -> (completed: UInt64, expired: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        pruneExpiredLocked(CFAbsoluteTimeGetCurrent())
+        return (completedTotal, expiredTotal)
+    }
+
     /// One-line pressure summary for the THUMBCACHE/OVERLOAD diagnostics.
     static func pressureLine() -> String {
         lock.lock(); defer { lock.unlock() }

@@ -25,9 +25,16 @@ final class BackgroundThumbnailRefresher {
     private var tierRecomputeCounter = 0
     private var reconcileCounter = 0
     private var residencyTouchCounter = 0
-    /// Last WindowServer-overload state seen in `tick`, so we log only the
-    /// enter/leave transitions rather than every paused tick.
-    private var lastOverloaded = false
+    /// WindowServer capture circuit-breaker state. `closed` = healthy, dispatch
+    /// normally. `open` = paused (WindowServer not servicing captures). `halfOpen`
+    /// = one probe capture in flight, deciding whether to recover.
+    private enum CaptureBreaker: String { case closed, open, halfOpen }
+    private var breaker: CaptureBreaker = .closed
+    private var breakerChangedAt: CFAbsoluteTime = 0
+    /// `completedTotal`/`expiredTotal` snapshots taken when a probe is dispatched,
+    /// so the next ticks can tell whether the probe completed or stranded.
+    private var probeCompletedBaseline: UInt64 = 0
+    private var probeExpiredBaseline: UInt64 = 0
     /// Hot-tier wids from the last `recomputeTiers`, reused by `register` so
     /// new-window registration doesn't re-sort the whole window list each time
     /// (O(n log n) per window → O(n² log n) during a discovery burst). Touched
@@ -163,23 +170,13 @@ final class BackgroundThumbnailRefresher {
         // flight (from in-panel timer, AX events, etc.).
         if ActiveWindowCaptures.value() >= RuntimeFlags.bgThumbnailMaxConcurrent { return }
 
-        // Global overload gate: if WindowServer has stopped servicing captures
-        // (a burst of timeouts or a high round-trip latency), stop feeding it
-        // entirely until it recovers. This is the systemic safety net that would
-        // have cut the retry-storm that beachballed (2026-07-15) and then
-        // watchdog-killed (2026-07-28) WindowServer. Log only the transitions.
-        if RuntimeFlags.bgThumbnailOverloadPauseEnabled {
-            let overloaded = ActiveWindowCaptures.isOverloaded(
-                expiryThreshold: RuntimeFlags.bgThumbnailOverloadExpiryThreshold,
-                latencyMaxMs: RuntimeFlags.bgThumbnailCaptureLatencyOverloadMs)
-            if overloaded != lastOverloaded {
-                lastOverloaded = overloaded
-                Diagnostics.log("OVERLOAD", overloaded
-                    ? "WindowServer overloaded — pausing background captures. \(ActiveWindowCaptures.pressureLine())"
-                    : "WindowServer recovered — resuming background captures. \(ActiveWindowCaptures.pressureLine())")
-            }
-            if overloaded { return }
-        }
+        // WindowServer capture circuit breaker (see captureBudgetThisTick): when
+        // captures stop completing, stop feeding WindowServer/replayd and probe
+        // with a single capture before resuming full volume, so a stranded-thread
+        // leak grows O(1) not O(time) — the failure that beachballed (2026-07-15)
+        // and watchdog-killed (2026-07-28) WindowServer.
+        let captureBudget = captureBudgetThisTick(now: now)
+        guard captureBudget > 0 else { return }
 
         tierRecomputeCounter += 1
         if tierRecomputeCounter >= 8 {
@@ -187,7 +184,7 @@ final class BackgroundThumbnailRefresher {
             recomputeTiers()
         }
 
-        let due = ThumbnailCache.shared.popDue(now: now, max: RuntimeFlags.bgThumbnailMaxPerTick)
+        let due = ThumbnailCache.shared.popDue(now: now, max: min(captureBudget, RuntimeFlags.bgThumbnailMaxPerTick))
         guard !due.isEmpty else { return }
         Logger.debug { "bgRefresh due=\(due.count)" }
 
@@ -220,6 +217,68 @@ final class BackgroundThumbnailRefresher {
                 Windows.refreshThumbnailsAsync([window], .backgroundPeriodic)
             }
         }
+    }
+
+    /// How many captures may be dispatched this tick under the WindowServer
+    /// circuit breaker. The per-window quarantine bounds retries for a single
+    /// un-capturable window, but the 2026-07-28 watchdog-kill was systemic: each
+    /// timed-out SCK capture strands a `replayd` thread, so retrying ANY windows
+    /// while replayd is wedged grows the leak with time. This makes that growth
+    /// O(1):
+    ///   closed   → dispatch normally; a burst of capture expiries or high
+    ///              round-trip latency trips it open.
+    ///   open     → dispatch nothing for the cooldown, letting replayd /
+    ///              WindowServer drain.
+    ///   halfOpen → dispatch exactly ONE probe capture; recover to closed only if
+    ///              it actually completes, re-open if it expires (stranded another
+    ///              thread) or hangs past the probe timeout.
+    /// Returns the capture budget (0 = skip this tick). With the gate disabled it
+    /// always returns the configured per-tick maximum.
+    private func captureBudgetThisTick(now: CFAbsoluteTime) -> Int {
+        let maxPerTick = RuntimeFlags.bgThumbnailMaxPerTick
+        guard RuntimeFlags.bgThumbnailOverloadPauseEnabled else { return maxPerTick }
+        switch breaker {
+        case .closed:
+            let overloaded = ActiveWindowCaptures.isOverloaded(
+                expiryThreshold: RuntimeFlags.bgThumbnailOverloadExpiryThreshold,
+                latencyMaxMs: RuntimeFlags.bgThumbnailCaptureLatencyOverloadMs)
+            if overloaded {
+                transitionBreaker(.open, now: now, why: "WindowServer not servicing captures (expiry burst / high latency)")
+                return 0
+            }
+            return maxPerTick
+        case .open:
+            let cooldown = Double(RuntimeFlags.bgThumbnailOverloadCooldownMs) / 1000
+            guard now - breakerChangedAt >= cooldown else { return 0 }
+            let totals = ActiveWindowCaptures.completedExpiredTotals()
+            probeCompletedBaseline = totals.completed
+            probeExpiredBaseline = totals.expired
+            transitionBreaker(.halfOpen, now: now, why: "cooldown elapsed — probing with one capture")
+            return 1
+        case .halfOpen:
+            let totals = ActiveWindowCaptures.completedExpiredTotals()
+            if totals.completed > probeCompletedBaseline {
+                transitionBreaker(.closed, now: now, why: "probe completed — WindowServer healthy, resuming")
+                return maxPerTick
+            }
+            let probeTimeout = Double(RuntimeFlags.bgThumbnailOverloadProbeTimeoutMs) / 1000
+            if totals.expired > probeExpiredBaseline {
+                transitionBreaker(.open, now: now, why: "probe expired — still stranding threads")
+                return 0
+            }
+            if now - breakerChangedAt >= probeTimeout {
+                transitionBreaker(.open, now: now, why: "probe hung past timeout")
+                return 0
+            }
+            return 0 // probe still in flight
+        }
+    }
+
+    private func transitionBreaker(_ to: CaptureBreaker, now: CFAbsoluteTime, why: String) {
+        guard to != breaker else { return }
+        breaker = to
+        breakerChangedAt = now
+        Diagnostics.log("OVERLOAD", "capture breaker \(to.rawValue): \(why). \(ActiveWindowCaptures.pressureLine())")
     }
 
     // MARK: - Tiering

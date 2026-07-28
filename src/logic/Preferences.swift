@@ -80,6 +80,8 @@ class Preferences {
             "bgThumbnailOverloadPauseEnabled": "true",
             "bgThumbnailOverloadExpiryThreshold": "5",
             "bgThumbnailCaptureLatencyOverloadMs": "2000",
+            "bgThumbnailOverloadCooldownMs": "15000",
+            "bgThumbnailOverloadProbeTimeoutMs": "25000",
             "bgThumbnailDisplayOffHoldEnabled": "true",
             "bgThumbnailCoherenceEnabled": "true",
             "axWindowGeometryThrottleMs": "500",
@@ -657,6 +659,10 @@ enum RuntimeFlags {
     static var bgThumbnailOverloadPauseEnabled: Bool { bool("bgThumbnailOverloadPauseEnabled", default: true) }
     static var bgThumbnailOverloadExpiryThreshold: Int { int("bgThumbnailOverloadExpiryThreshold", default: 5) }
     static var bgThumbnailCaptureLatencyOverloadMs: Int { int("bgThumbnailCaptureLatencyOverloadMs", default: 2000) }
+    // Circuit-breaker timing: how long to pause (open) before probing with one
+    // capture, and how long to wait for that probe before declaring it hung.
+    static var bgThumbnailOverloadCooldownMs: Int { int("bgThumbnailOverloadCooldownMs", default: 15000) }
+    static var bgThumbnailOverloadProbeTimeoutMs: Int { int("bgThumbnailOverloadProbeTimeoutMs", default: 25000) }
     // Hold ALL thumbnail captures for the entire span the display is asleep or the
     // screen is locked (vs. the fixed transition pause). WindowServer isn't
     // compositing then, so captures strand server-side and flush as a herd on
