@@ -177,6 +177,13 @@ class Diagnostics {
         "CLICKLAG": .warn,
         "CLICKTAP": .warn,
         "CAPTURE": .warn,
+        // warn — capture back-pressure mitigations engaging. OVERLOAD: background
+        // captures paused because WindowServer stopped servicing them (the
+        // precursor to a beachball / watchdog-kill). THUMBQUAR: a window's
+        // capture was quarantined after repeated timeouts. Both mean "we just
+        // stopped hammering WindowServer" and must be visible at the normal level.
+        "OVERLOAD": .warn,
+        "THUMBQUAR": .warn,
         // info — normal-flow events (default for unknown categories)
         "PANEL": .info,
         "KEY": .info,

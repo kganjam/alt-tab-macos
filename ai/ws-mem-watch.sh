@@ -19,7 +19,7 @@ rppid=$(pgrep -x replayd | head -1)
 atpid=$(pgrep -f 'AltTab\.app/Contents/MacOS/AltTab' | head -1)
 log=$(readlink /tmp/alttab/latest.log 2>/dev/null)
 counters=$(grep -a 'THUMBCACHE' "$log" 2>/dev/null | tail -1 \
-  | grep -oE 'liveSurfaces=[0-9]+|cgsCaptures=[0-9]+|sckCaptures=[0-9]+|inFlight=[0-9]+' | tr '\n' ' ')
+  | grep -oE 'liveSurfaces=[0-9]+|cgsCaptures=[0-9]+|sckCaptures=[0-9]+|inFlight=[0-9]+|timingOut=[0-9]+|quarantined=[0-9]+|captureLatencyMs=[0-9]+|expired=[0-9]+|recentExpiries=[0-9]+' | tr '\n' ' ')
 printf '%s WS=%dMB(pid %s,up %s) replayd=%dMB AltTab=%dMB(pid %s) %s\n' \
   "$ts" "$(( $(rss "$wspid")/1024 ))" "${wspid:-?}" "$(ps -o etime= -p "${wspid:-0}" 2>/dev/null | tr -d ' ')" \
   "$(( $(rss "$rppid")/1024 ))" "$(( $(rss "$atpid")/1024 ))" "${atpid:-?}" "$counters" >> "$OUT"
