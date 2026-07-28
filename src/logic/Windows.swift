@@ -1523,8 +1523,14 @@ class Windows {
             Diagnostics.log("GUARD", "released stale z-order enforcement by same-app untracked foreground window: blocker=#\(blocker) target=#\(mostRecent.wid)")
             releaseZOrderEnforcement(clearGuard: true)
         } else if targetZPos > 0 {
-            guard mostRecent.raiseAttempts < ZOrderIntent.maxRaiseAttempts else {
-                Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), max \(ZOrderIntent.maxRaiseAttempts) attempts — keeping intent for delayed activation counter")
+            // When WindowServer is dropping order requests (degraded, e.g. after a
+            // watchdog kill) it can take many more attempts to win a raise, so the
+            // retry budget doubles while degraded. `WindowServerHealth.isDegraded`
+            // is driven by the CGSOrderWindow failure rate recorded below.
+            let maxAttempts = (RuntimeFlags.zOrderDegradedRecoveryEnabled && WindowServerHealth.isDegraded())
+                ? ZOrderIntent.maxRaiseAttempts * 2 : ZOrderIntent.maxRaiseAttempts
+            guard mostRecent.raiseAttempts < maxAttempts else {
+                Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), max \(maxAttempts) attempts — keeping intent for delayed activation counter")
                 return
             }
             recentZOrderIntents[recentZOrderIntents.count - 1].raiseAttempts += 1
@@ -1541,38 +1547,40 @@ class Windows {
             }
             let err = CGSOrderWindow(CGS_CONNECTION, mostRecent.wid,
                                      CGSWindowOrderingMode.above.rawValue, 0)
+            WindowServerHealth.recordCgsOrderResult(success: err == .success)
             if err == .success {
                 Diagnostics.log("ZENFORCE", "INTERVENE CGSOrderWindow(wid=\(mostRecent.wid) above all) → OK fixed z\(targetZPos)→z0")
                 reassertFrontmostToTarget(targetWid: mostRecent.wid, targetPid: mostRecent.pid, frontPid: nil, source: "ZENFORCE")
             } else {
-                // For same-pid windows (e.g., multiple Outlook emails),
-                // kAXRaiseAction doesn't work — Parallels ignores it.
-                // Use setAttribute(kAXFocusedWindowAttribute) which TELLS
-                // the app which window should be focused.
-                // For same-pid Parallels windows, use makeKeyWindow
-                // (synthetic HID event) which Parallels responds to even
-                // after settling its internal z-order. AX raise alone
-                // doesn't work for same-pid reordering.
+                // CGSOrderWindow was dropped by a degraded WindowServer. Escalate
+                // via an independent path, chosen by blocker kind:
                 reassertFrontmostToTarget(targetWid: mostRecent.wid, targetPid: mostRecent.pid, frontPid: nil, source: "ZENFORCE")
                 if window.application.isParallelsCoherence {
                     queueAxRecovery(for: window, wid: mostRecent.wid, pid: mostRecent.pid, attempt: attempt, generation: currentZOrderEnforcementGeneration())
-                    Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), focus reassert queued Parallels AX recovery #\(attempt)/\(ZOrderIntent.maxRaiseAttempts)")
-                } else if RuntimeFlags.zOrderDegradedRecoveryEnabled, sameAppBlockerWid == nil,
-                          let app = NSRunningApplication(processIdentifier: mostRecent.pid) {
-                    // CGSOrderWindow failed and a DIFFERENT app is frozen on top
-                    // (cross-app burial, not a same-app sibling). This is the
-                    // degraded-WindowServer case (e.g. post-watchdog-kill): the
-                    // server isn't honoring order requests. Escalate to app
-                    // activation — an independent path (NSWorkspace/app activation)
-                    // that can succeed when CGSOrderWindow doesn't. The queued AX
-                    // reassert above still targets the exact window, so per-window
-                    // focus is preserved for multi-window apps. Scoped to the
-                    // user's explicit target + a non-same-app blocker, so it can't
-                    // dismiss a same-app child popup.
-                    app.activate(options: [])
-                    Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), native escalate app.activate(pid=\(mostRecent.pid)) — CGSOrderWindow err, cross-app blocker #\(attempt)/\(ZOrderIntent.maxRaiseAttempts)")
+                    Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), focus reassert queued Parallels AX recovery #\(attempt)/\(maxAttempts)")
+                } else if RuntimeFlags.zOrderDegradedRecoveryEnabled {
+                    if let blocker = sameAppBlockerWid {
+                        // Same-app sibling burial: another window of the SAME pid
+                        // is frozen above the target. App activation and AX raise
+                        // don't reorder same-pid windows; a synthetic HID key-raise
+                        // of the exact window (makeKeyWindow) does, and only touches
+                        // that one window, so per-window focus is preserved.
+                        var psn = ProcessSerialNumber()
+                        GetProcessForPID(mostRecent.pid, &psn)
+                        window.makeKeyWindow(&psn)
+                        Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), native escalate makeKeyWindow — same-app blocker=#\(blocker) #\(attempt)/\(maxAttempts)")
+                    } else if let app = NSRunningApplication(processIdentifier: mostRecent.pid) {
+                        // Cross-app burial: a DIFFERENT app is frozen on top.
+                        // Activate the target's app — an independent path that can
+                        // succeed when CGSOrderWindow doesn't. The queued AX reassert
+                        // above targets the exact window, preserving per-window focus.
+                        app.activate(options: [])
+                        Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), native escalate app.activate(pid=\(mostRecent.pid)) — cross-app blocker #\(attempt)/\(maxAttempts)")
+                    } else {
+                        Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), native AX recovery skipped (no NSRunningApplication) #\(attempt)/\(maxAttempts)")
+                    }
                 } else {
-                    Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), native AX recovery skipped #\(attempt)/\(ZOrderIntent.maxRaiseAttempts)")
+                    Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), native AX recovery skipped #\(attempt)/\(maxAttempts)")
                 }
             }
         } else {
@@ -1607,16 +1615,28 @@ class Windows {
             // target window after a switch, with no other window taking its
             // place) is no longer corrected by this path — but the prior
             // behavior was visibly worse for the user.
-            let (isCurrent, nonTargetOnTop, topWid) = DispatchQueue.main.sync { () -> (Bool, Bool, CGWindowID?) in
+            let (isCurrent, nonTargetOnTop, topWid, topWasFrozen) = DispatchQueue.main.sync { () -> (Bool, Bool, CGWindowID?, Bool) in
                 let isCurrent = isCurrentZOrderEnforcementGeneration(generation) && recentZOrderIntents.last?.wid == wid
                 let top = Windows.captureTopZRanking(maxCount: 1).first
                 let nonTarget = top?.wid != nil && top?.wid != wid
-                return (isCurrent, nonTarget, top?.wid)
+                // Was the blocker on top ALREADY present before our focus? If so
+                // it's a frozen window WindowServer won't move (the degraded case),
+                // not a fresh user-opened popup — safe to keep recovering against.
+                let frozen = top?.wid != nil && (recentZOrderIntents.last?.preZRanking.contains { $0.wid == top!.wid } ?? false)
+                return (isCurrent, nonTarget, top?.wid, frozen)
             }
             guard isCurrent, let window else { return }
             if nonTargetOnTop {
-                Diagnostics.log("ZENFORCE", "AX recovery skipped — non-target window on top wid=\(wid) top=#\(topWid ?? 0) attempt #\(attempt)")
-                return
+                // The guard protects windows that appeared AFTER our focus (real
+                // popups/user-opened windows) from being dismissed. A window that
+                // was already there and is merely frozen on top (degraded
+                // WindowServer) is NOT a user action — keep recovering against it.
+                if RuntimeFlags.zOrderDegradedRecoveryEnabled, topWasFrozen {
+                    Diagnostics.log("ZENFORCE", "AX recovery proceeding — top #\(topWid ?? 0) was frozen/pre-existing (not a fresh popup) wid=\(wid) attempt #\(attempt)")
+                } else {
+                    Diagnostics.log("ZENFORCE", "AX recovery skipped — fresh non-target window on top wid=\(wid) top=#\(topWid ?? 0) attempt #\(attempt)")
+                    return
+                }
             }
             if let appAx = window.application.axUiElement, let selfAx = window.axUiElement {
                 try? appAx.setAttribute(kAXFocusedWindowAttribute, selfAx)
@@ -3181,4 +3201,37 @@ enum WindowActivityType: Int {
     case none = 0
     case hover = 1
     case focus = 2
+}
+
+/// Tracks whether WindowServer is honoring window-order requests. A degraded
+/// WindowServer (e.g. after a userspace-watchdog kill) silently drops
+/// CGSOrderWindow calls, so raises fail intermittently and windows freeze on
+/// top. We record each CGSOrderWindow result from the z-order enforcement tick;
+/// a burst of failures in the rolling window means "degraded", which (a) doubles
+/// the raise retry budget and (b) emits a one-shot actionable warning so the
+/// user knows a WindowServer restart is needed rather than seeing silent
+/// failures. Main-thread only (the enforcement tick and its callers run on main,
+/// same as `recentZOrderIntents`), so no lock.
+enum WindowServerHealth {
+    private static var failTimes: [CFAbsoluteTime] = []
+    private static let windowSec: CFAbsoluteTime = 30
+    private static let degradedThreshold = 5
+    private static var lastWarnAt: CFAbsoluteTime = 0
+
+    static func recordCgsOrderResult(success: Bool) {
+        let now = CFAbsoluteTimeGetCurrent()
+        failTimes.removeAll { now - $0 > windowSec }
+        guard !success else { return }
+        failTimes.append(now)
+        if failTimes.count >= degradedThreshold, now - lastWarnAt > 60 {
+            lastWarnAt = now
+            Diagnostics.log("WSHEALTH", "WindowServer degraded: \(failTimes.count) CGSOrderWindow failures in \(Int(windowSec))s — window ordering is unreliable (often the aftermath of a WindowServer crash/watchdog-kill). AltTab is escalating raises to compensate, but a logout/login or reboot is the real fix.")
+        }
+    }
+
+    static func isDegraded() -> Bool {
+        let now = CFAbsoluteTimeGetCurrent()
+        failTimes.removeAll { now - $0 > windowSec }
+        return failTimes.count >= degradedThreshold
+    }
 }
