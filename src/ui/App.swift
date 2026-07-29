@@ -123,11 +123,45 @@ class App: AppCenterApplication {
         return w.application.pid
     }
 
+    /// The window this session already focused, if any. A session can
+    /// outlive its own focus: the Parallels hand-off deliberately keeps
+    /// `appIsBeingUsed` true through the settle window (up to ~1.6s), so a
+    /// re-summon inside that window continues the SAME session and
+    /// `sessionSourceWid` still names the PRE-switch window. Every
+    /// source-keyed decision then misfires — the initial selection skips
+    /// the wrong tile, a release on the real switch target is discarded as
+    /// a source no-op by `focusSelectedWindow`, and
+    /// `setTargetAndSourceAsMostRecent` re-promotes the stale source above
+    /// the window the user actually just visited, which is how the recency
+    /// list ends up ordered [current, stale, just-visited].
+    private static var sessionFocusCommittedWid: CGWindowID?
+
+    /// Roll `sessionSourceWid` forward to the window this session already
+    /// focused, so a re-summon during a deferred hand-off behaves like the
+    /// new switch it is. Uses the known focus target rather than
+    /// re-probing WindowServer: mid-settle the target may not have reached
+    /// z0 yet, so the live signals would still answer with the window we
+    /// just left.
+    private static func adoptCommittedFocusAsSessionSource() {
+        guard let committedWid = sessionFocusCommittedWid,
+              committedWid != sessionSourceWid,
+              Windows.list.contains(where: { $0.cgWindowId == committedWid }) else { return }
+        sessionFocusCommittedWid = nil
+        previousSessionSourceWid = sessionSourceWid
+        sessionSourceWid = committedWid
+        Diagnostics.log("RECENCY", "session source rolled forward to committed focus #\(committedWid) previous=#\(previousSessionSourceWid ?? 0)")
+        Windows.normalizeFocusOrderAtSessionStart(
+            currentWid: sessionSourceWid,
+            previousWid: previousSessionSourceWid)
+        Diagnostics.logTrackedRecency("session-continuation post")
+    }
+
     static func noteAltTabFocusIntent(targetWid: CGWindowID?) {
         lastAltTabFocusTargetWid = targetWid
         lastAltTabFocusSourceWid = sessionSourceWid
         lastAltTabFocusAt = CFAbsoluteTimeGetCurrent()
         altTabFocusSourceInvalidated = false
+        sessionFocusCommittedWid = targetWid
         Diagnostics.log("RECENCY", "altTab intent source=#\(sessionSourceWid ?? 0) target=#\(targetWid ?? 0)")
     }
 
@@ -1182,6 +1216,14 @@ class App: AppCenterApplication {
         forceDoNothingOnRelease = forceDoNothingOnRelease_
         Logger.debug { "isFirstSummon:\(isFirstSummon) shortcutIndex:\(shortcutIndex)" }
         let startingNewSession = !appIsBeingUsed
+        if startingNewSession {
+            sessionFocusCommittedWid = nil
+        } else {
+            // Re-summon while a previous focus in this session is still
+            // settling: adopt that focus as the new source before anything
+            // reads `sessionSourceWid`.
+            adoptCommittedFocusAsSessionSource()
+        }
         // Capture the REAL source app before the TilesPanel shows and possibly
         // steals key-window status. Needed for the Parallels Coherence outbound
         // fix — otherwise `Applications.frontmostPid` reads as AltTab's own pid
