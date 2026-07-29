@@ -170,6 +170,15 @@ final class BackgroundThumbnailRefresher {
         // flight (from in-panel timer, AX events, etc.).
         if ActiveWindowCaptures.value() >= RuntimeFlags.bgThumbnailMaxConcurrent { return }
 
+        // Every capture we're about to dispatch would be rejected downstream by
+        // the same gate (display off / screen locked / settle hold), so stop
+        // here instead of popping work: popping marks entries in-flight and
+        // costs a main-thread hop per tick to look them up, for captures that
+        // can never run. An idle locked machine should be idle. `logBlocked:
+        // false` — the POWER log already records the hold engaging and
+        // releasing, and per-tick "blocked" lines were 2,240/hour of noise.
+        guard App.thumbnailCaptureAllowed(.backgroundPeriodic, logBlocked: false) else { return }
+
         // WindowServer capture circuit breaker (see captureBudgetThisTick): when
         // captures stop completing, stop feeding WindowServer/replayd and probe
         // with a single capture before resuming full volume, so a stranded-thread

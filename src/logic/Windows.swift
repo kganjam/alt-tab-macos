@@ -2292,14 +2292,37 @@ class Windows {
             .isParallelsCoherence == true
     }
 
+    /// Hand back the in-flight markers `popDue` set for background windows that
+    /// never reached a capture call, so each reschedules at its normal cadence
+    /// instead of being mis-booked as a WindowServer capture timeout by the
+    /// in-flight watchdog. No-op for non-background sources — they don't go
+    /// through `popDue`, so they hold no marker.
+    private static func releaseBackgroundInFlight(_ windows: [Window], _ source: RefreshCausedBy) {
+        guard source == .backgroundPeriodic else { return }
+        for window in windows {
+            if let wid = window.cgWindowId { ThumbnailCache.shared.clearInFlight(wid: wid) }
+        }
+    }
+
     // dispatch screenshot requests off the main-thread, then wait for completion
     static func refreshThumbnailsAsync(_ windows: [Window], _ source: RefreshCausedBy, windowRemoved: Bool = false) {
+        // `popDue` already marked every window of a background batch in-flight,
+        // so ANY early-out here has to hand those markers back. Returning while
+        // they're still set leaves the entries in-flight until the 15s watchdog,
+        // which books each one as a WindowServer *capture timeout* and
+        // quarantines a window we never even tried to capture. Under the
+        // display-off hold that became a permanent cycle: ~2,240 fake
+        // quarantines/hour for the 11 hours the machine was asleep on
+        // 2026-07-29, each iteration costing a main-thread hop.
         guard RuntimeFlags.thumbnailCaptureEnabled
                && (!windows.isEmpty || windowRemoved) && ScreenRecordingPermission.status == .granted
                && !Preferences.onlyShowApplications()
                && (!Appearance.hideThumbnails || Preferences.previewSelectedWindow)
                && (Preferences.captureWindowsInBackground || App.appIsBeingUsed)
-               && App.thumbnailCaptureAllowed(source) else { return }
+               && App.thumbnailCaptureAllowed(source) else {
+            releaseBackgroundInFlight(windows, source)
+            return
+        }
         // Coherence captures hit CGSHWCaptureWindowList → WindowServer
         // compositor → guest pixel blit. On macOS 15 this can flicker the
         // mouse cursor when fired at high rates. The user-level kill switch
@@ -2329,17 +2352,12 @@ class Windows {
         if skippedCount > 0 && source == .refreshOnlyThumbnailsAfterShowUi {
             Diagnostics.log("CAPTURE", "thumbnail eligible source=\(source) requested=\(windows.count) eligible=\(eligibleWindows.count) skipped=\(skippedCount)")
         }
-        // Background captures mark each window in-flight in ThumbnailCache (via popDue). A window
-        // filtered out here (windowless, invalid wid, or Coherence with captures disabled) never
-        // reaches a capture callback, so clear its in-flight state now — otherwise it stays stuck
-        // until the 15s watchdog instead of rescheduling at its normal cadence.
-        if source == .backgroundPeriodic, skippedCount > 0 {
+        // A window filtered out here (windowless, invalid wid, minimized-and-
+        // already-captured, or Coherence with captures disabled) never reaches a
+        // capture callback, so hand its in-flight marker back now.
+        if skippedCount > 0 {
             let eligibleWids = Set(eligibleWindows.compactMap { $0.cgWindowId })
-            for window in windows {
-                if let wid = window.cgWindowId, !eligibleWids.contains(wid) {
-                    ThumbnailCache.shared.clearInFlight(wid: wid)
-                }
-            }
+            releaseBackgroundInFlight(windows.filter { $0.cgWindowId.map { !eligibleWids.contains($0) } ?? false }, source)
         }
         guard (!eligibleWindows.isEmpty || windowRemoved) else { return }
         // Split eligible windows by capture method.

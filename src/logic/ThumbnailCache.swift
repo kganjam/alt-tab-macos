@@ -383,12 +383,19 @@ final class ThumbnailCache {
         heap.push(HeapEntry(deadline: e.nextRefreshAt, wid: wid, scheduleId: generation))
     }
 
-    /// Move a window's next refresh earlier. No-op if the requested
-    /// deadline is later than (or equal to) the current schedule.
+    /// Move a window's next refresh earlier. No-op if the requested deadline is
+    /// later than (or equal to) the current schedule, or if the window is
+    /// quarantined: a quarantine exists precisely to stop re-hammering an
+    /// un-capturable window, and pulling its deadline forward silently defeated
+    /// it. Tier promotion bumps to `now + hotInterval` (60s), so a 300s
+    /// quarantine was being re-armed every 60s — the 76s quarantine cycle that
+    /// ran all night on 2026-07-29. Callers acting on real user activity clear
+    /// the quarantine via `resetBackoff` first, so those bumps still land.
     func bumpUp(wid: CGWindowID, to requestedDeadline: CFAbsoluteTime) {
         lock.lock(); defer { lock.unlock() }
         guard entries[wid] != nil else { return }
         var e = entries[wid]!
+        guard !e.quarantined else { return }
         guard requestedDeadline < e.nextRefreshAt else { return }
         generation &+= 1
         e.nextRefreshAt = requestedDeadline
