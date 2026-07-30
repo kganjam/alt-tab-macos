@@ -923,6 +923,18 @@ class Windows {
         releaseZOrderEnforcement(clearGuard: true)
     }
 
+    /// A click on click-capturing system chrome (a Dock icon, a menu-bar extra,
+    /// Notification Center) is deliberately NOT attributed to the window behind
+    /// it, but it is still explicit user input. Release enforcement so the timer
+    /// stops re-raising the last alt-tab target for the rest of its lifetime
+    /// while the user works elsewhere. We can't know which window the OS routed
+    /// the click to, so this only ever releases — it never restores anything.
+    static func releaseZOrderEnforcementForChromeClick(owner: String) {
+        guard let current = recentZOrderIntents.last else { return }
+        Diagnostics.log("ZENFORCE", "released by user click on \(owner) chrome target=#\(current.wid)")
+        releaseZOrderEnforcement(clearGuard: true)
+    }
+
     static func repairClickAfterMismatch(clickedWid: CGWindowID, clickedPid: pid_t, frontPid: pid_t, frontName: String) {
         guard RuntimeFlags.zOrderFixesEnabled, frontPid > 0, frontPid != clickedPid else { return }
         guard let clickedWindow = list.first(where: { $0.cgWindowId == clickedWid }),

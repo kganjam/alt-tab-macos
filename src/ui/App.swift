@@ -791,6 +791,19 @@ class App: AppCenterApplication {
         PermissionsWindow.show()
     }
 
+    /// True when `rect` covers (nearly) the whole display containing `point` —
+    /// the signature of a pass-through overlay layer rather than a window the
+    /// user can actually click. `CGWindowListCopyWindowInfo` exposes no
+    /// hit-testing, so geometry is the only available discriminator.
+    private static func isDisplaySizedOverlay(_ rect: CGRect, at point: CGPoint) -> Bool {
+        var displayId = CGDirectDisplayID()
+        var matchCount: UInt32 = 0
+        guard CGGetDisplaysWithPoint(point, 1, &displayId, &matchCount) == .success, matchCount > 0 else { return false }
+        let bounds = CGDisplayBounds(displayId)
+        guard bounds.width > 0, bounds.height > 0 else { return false }
+        return rect.width >= bounds.width * 0.98 && rect.height >= bounds.height * 0.98
+    }
+
     static func showUi(_ shortcutIndex: Int) {
         showUiOrCycleSelection(shortcutIndex, true)
     }
@@ -1579,11 +1592,21 @@ extension App: NSApplicationDelegate {
                         guard let b = w[kCGWindowBounds as String] as? [String: Any],
                               let x = b["X"] as? Double, let y = b["Y"] as? Double,
                               let width = b["Width"] as? Double, let height = b["Height"] as? Double else { continue }
-                        if CGRect(x: x, y: y, width: width, height: height).contains(cgPoint) {
-                            let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
-                            if clickCapturingChrome.contains(owner) { chromeUnderCursor = owner }
-                            break
-                        }
+                        let rect = CGRect(x: x, y: y, width: width, height: height)
+                        if !rect.contains(cgPoint) { continue }
+                        let owner = (w[kCGWindowOwnerName as String] as? String) ?? ""
+                        // The Dock also owns a display-sized layer-20 window that
+                        // clicks pass straight through. Accepting it as the hit
+                        // target classified 95% of ALL clicks (919/970 in one
+                        // session) as "Dock chrome" and so suppressed the
+                        // z-order-enforcement release below — AltTab then kept
+                        // re-raising its last alt-tab target while the user worked
+                        // in a window they had just clicked. Real click-capturing
+                        // chrome is small and anchored, so keep scanning past any
+                        // candidate that covers the whole display.
+                        if clickCapturingChrome.contains(owner), App.isDisplaySizedOverlay(rect, at: cgPoint) { continue }
+                        if clickCapturingChrome.contains(owner) { chromeUnderCursor = owner }
+                        break
                     }
                     if let chromeUnderCursor {
                         if isDown {
@@ -1593,6 +1616,13 @@ extension App: NSApplicationDelegate {
                             Windows.lastMouseClickWid = 0
                             Windows.lastMouseClickPid = 0
                             Windows.lastMouseClickOwner = chromeUnderCursor
+                            // Not attributing the click is not the same as
+                            // ignoring it: it is still explicit user input, so it
+                            // must stop AltTab defending its last target. The
+                            // enforcement guard exists to fight *silent* self-
+                            // activation; once the user has clicked anywhere,
+                            // re-raising the old target is fighting the user.
+                            Windows.releaseZOrderEnforcementForChromeClick(owner: chromeUnderCursor)
                             Windows.requestZOrderReview(reason: "mouse-down-chrome", fullDelayMs: 500)
                         } else {
                             Windows.requestZOrderTopReview(reason: "mouse-up-chrome")
