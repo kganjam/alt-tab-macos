@@ -2578,7 +2578,17 @@ using System.Text;
 public class WinSide {
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  // CharSet.Unicode is REQUIRED, not cosmetic. Without it .NET defaults to
+  // CharSet.Ansi and binds GetWindowTextA, so every title comes back through the
+  // guest's ANSI codepage with un-encodable characters replaced by '?'. Microsoft
+  // Edge titles its windows "<page> - <profile> - Microsoft​ Edge" with a
+  // U+200B ZERO WIDTH SPACE, which ANSI folded to '?' — so the guest reported
+  // "Microsoft? Edge" while the macOS-side needle carried the real U+200B. No
+  // title comparison in Find-WindowByTitle could ever match, SETTITLE64 answered
+  // "ERR no-hwnd" for every Edge window, the guest foreground therefore never
+  // left OneNote, and Parallels re-raised OneNote's proxy ~800ms after AltTab had
+  // put Edge at z0 — the "alt-tab to Edge, OneNote comes back to the top" bug.
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int nCmdShow);
@@ -2682,7 +2692,15 @@ function Do-SetForeground {
 
 function Normalize-Title {
     param([string]$Text)
-    return (($Text -replace "[`r`n]+", " ") -replace "\s+", " ").Trim()
+    # Drop Unicode format/zero-width characters and fold no-break spaces BEFORE
+    # collapsing whitespace. .NET's \s is [\f\n\r\t\v\x85\p{Z}] and U+200B is
+    # category Cf (not Zs), so a zero-width space survives \s+ collapsing and
+    # silently defeats every comparison in Find-WindowByTitle. The guest side is
+    # now read as Unicode (GetWindowText CharSet), so both sides agree — this
+    # keeps them agreeing even when a title carries invisible characters that
+    # only one side reports.
+    $t = ($Text -replace '\p{Cf}', '') -replace '\u00A0', ' '
+    return (($t -replace "[`r`n]+", " ") -replace "\s+", " ").Trim()
 }
 
 function Normalize-TitleKey {
