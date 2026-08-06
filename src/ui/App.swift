@@ -1559,6 +1559,28 @@ extension App: NSApplicationDelegate {
                 Windows.noteGlobalMouseButtonEvent(isDown: isDown, isUp: isUp)
                 if isDown {
                     Windows.lastMouseClickTime = CFAbsoluteTimeGetCurrent()
+                    // Drop the previous click's identity NOW. It is re-established
+                    // below only if this click resolves to a real window, which
+                    // keeps `lastMouseClickPid != 0` meaning "this click was
+                    // attributed to a window" — the invariant every consumer
+                    // already assumes.
+                    //
+                    // Without this, the timestamp and the identity could describe
+                    // DIFFERENT clicks: `lastMouseClickTime` is refreshed on every
+                    // mouse-down, but wid/pid/owner were only overwritten when the
+                    // click hit a window. An unattributed click (Dock icon, desktop,
+                    // menu bar) therefore left a fresh timestamp in front of a stale
+                    // pid, and `diagnoseCrossProcessActivation`'s `dt < 1.0`
+                    // freshness guard would validate the new timestamp while
+                    // repairing toward the OLD window. Observed 2026-08-05: clicking
+                    // Edge in the Dock logged `click-misroute (+197ms): clicked
+                    // wid=36078 pid=2441 (OneNote)` against a click made 66 SECONDS
+                    // earlier, and SLPS-restored OneNote over the Edge the user had
+                    // just raised — the Dock-launch activation war again, this time
+                    // caused by AltTab itself rather than Parallels.
+                    Windows.lastMouseClickWid = 0
+                    Windows.lastMouseClickPid = 0
+                    Windows.lastMouseClickOwner = ""
                 }
                 let skipOwners: Set<String> = [
                     "Window Server", "Control Center", "Dock", "AltTab",
