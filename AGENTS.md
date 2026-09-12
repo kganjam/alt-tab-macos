@@ -43,7 +43,17 @@ Use `bash ai/build.sh {compile|dev|install}`. Three modes, one script:
   bundle is **never modified**, so its code-signing seal stays intact
   and TCC permissions persist. Use this for every iteration where you
   need to actually run AltTab. Doesn't trigger Accessibility/Screen
-  Recording prompts.
+  Recording prompts. Every dev build (from any checkout or worktree) is
+  also published to `~/.alttab-dev/AltTabCore.dylib` — the login version —
+  unless `ALTTAB_DEV_NO_STARTUP=1`, so don't `dev`-build throwaway
+  experiments without that flag.
+
+- `bash ai/build.sh startup` — one-time setup so the published dev build
+  runs at login: installs `ai/alttab-startup-agent.plist` as the single
+  login launcher (sets the override, *then* opens AltTab), and turns off
+  AltTab's own "Start at login", whose RunAtLoad agent raced the override
+  and ran the stale bundled dylib after a reboot. Verify after any reboot:
+  line 1 of the first `/tmp/alttab/*.log` must show the latest dev stamp.
 
 - `bash ai/build.sh install` — Full bundle install. Builds Release as a
   dylib, places the prebuilt shim at `Contents/MacOS/AltTab`, signs

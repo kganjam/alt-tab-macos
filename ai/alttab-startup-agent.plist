@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- AltTab login launcher: runs the latest `ai/build.sh dev` build at login.
+         Installed by `bash ai/build.sh startup` to
+         ~/Library/LaunchAgents/com.kganjam.alttab-dev-override.plist.
+
+         `build.sh dev` publishes every build to ~/.alttab-dev/AltTabCore.dylib
+         (from any checkout or worktree). At login this agent points the shim at
+         that dylib (no bundle change → no TCC re-prompt) and THEN launches
+         AltTab, so the override is always in place first. It is the single
+         launcher: `build.sh startup` turns off AltTab's own "Start at login"
+         (its RunAtLoad agent raced this setenv and ran the stale bundled dylib
+         after the 2026-09-12 reboot, and would double-launch alongside `open`).
+         No published dylib → override cleared → the installed bundle runs.
+         If AltTab is somehow already running without the override (its own
+         login item re-enabled), it is quit and relaunched under it. It only
+         `open`s AltTab when none is running: reopening a running AltTab shows
+         its Settings window (applicationShouldHandleReopen).
+         Logs: `log show --predicate 'senderImagePath CONTAINS "logger"' | grep alttab-startup`.
+         Remove: launchctl bootout gui/$(id -u)/com.kganjam.alttab-dev-override
+                 rm ~/Library/LaunchAgents/com.kganjam.alttab-dev-override.plist
+                 defaults write com.lwouis.alt-tab-macos startAtLogin -string true -->
+    <key>Label</key>
+    <string>com.kganjam.alttab-dev-override</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>D="$HOME/.alttab-dev/AltTabCore.dylib"
+APP=/Applications/AltTab.app
+say() { logger -t alttab-startup "$1"; }
+if [ -f "$D" ]; then launchctl setenv ALTTAB_DYLIB_OVERRIDE "$D"; else launchctl unsetenv ALTTAB_DYLIB_OVERRIDE; say "no published dev dylib; running installed bundle"; fi
+P=$(pgrep -f "^$APP/Contents/MacOS/AltTab\$" | head -1)
+if [ -f "$D" ] &amp;&amp; [ -n "$P" ] &amp;&amp; ! ps eww -p "$P" | grep -qF "ALTTAB_DYLIB_OVERRIDE=$D"; then
+  say "AltTab pid $P running without the dev override; relaunching under $D"
+  osascript -e 'tell application id "com.lwouis.alt-tab-macos" to quit' 2>/dev/null
+  i=0; while kill -0 "$P" 2>/dev/null &amp;&amp; [ $i -lt 20 ]; do sleep 0.5; i=$((i+1)); done
+  kill -9 "$P" 2>/dev/null
+fi
+if pgrep -f "^$APP/Contents/MacOS/AltTab\$" >/dev/null; then say "AltTab already running; nothing to do"; exit 0; fi
+i=0; until open -n "$APP" || [ $i -ge 5 ]; do sleep 2; i=$((i+1)); done
+say "launched AltTab override=${D}"</string>
+    </array>
+</dict>
+</plist>

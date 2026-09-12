@@ -13,6 +13,17 @@
 #            seal stays intact and TCC permissions persist. Use this for
 #            every code iteration once the bundle is installed.
 #
+#            Every dev build is also published to ~/.alttab-dev/AltTabCore.dylib
+#            (the override points there), so the newest dev build from ANY
+#            checkout/worktree is what AltTab runs after logout/reboot.
+#            ALTTAB_DEV_NO_STARTUP=1 skips publishing (throwaway experiments:
+#            the override then points at this checkout's dev/ until login).
+#
+#   startup  Make the published dev build the login version: install the
+#            ai/alttab-startup-agent.plist login launcher, turn off AltTab's
+#            own "Start at login" (it raced the override and would
+#            double-launch), and run the launcher now. One-time setup; no build.
+#
 #   install  Full bundle install. Builds Release as a dylib, swaps the
 #            shim Mach-O into Contents/MacOS/AltTab, signs everything
 #            bottom-up, and atomically replaces /Applications/AltTab.app
@@ -29,9 +40,26 @@ cd "$(dirname "$0")/.."
 
 MODE="${1:-}"
 case "$MODE" in
-    compile|dev|install) ;;
-    *) echo "usage: $0 {compile|dev|install}" >&2; exit 2 ;;
+    compile|dev|install|startup) ;;
+    *) echo "usage: $0 {compile|dev|install|startup}" >&2; exit 2 ;;
 esac
+
+STARTUP_DYLIB="$HOME/.alttab-dev/AltTabCore.dylib"
+STARTUP_AGENT=com.kganjam.alttab-dev-override
+
+# === STARTUP MODE: login launcher for the published dev build ===
+if [ "$MODE" = "startup" ]; then
+    AGENT_PLIST="$HOME/Library/LaunchAgents/$STARTUP_AGENT.plist"
+    plutil -lint ai/alttab-startup-agent.plist >/dev/null
+    cp ai/alttab-startup-agent.plist "$AGENT_PLIST"
+    defaults write com.lwouis.alt-tab-macos startAtLogin -string false
+    rm -f "$HOME/Library/LaunchAgents/com.lwouis.alt-tab-macos.plist"
+    [ -f "$STARTUP_DYLIB" ] || echo "WARNING: $STARTUP_DYLIB missing — run '$0 dev' first; login will use the installed bundle" >&2
+    launchctl bootout "gui/$(id -u)/$STARTUP_AGENT" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST"
+    echo "Login launcher installed: $AGENT_PLIST -> $STARTUP_DYLIB"
+    exit 0
+fi
 
 # === COMPILE MODE: Debug build, that's it. ===
 # Critically, REMOVE the Debug AltTab.app + unregister from LaunchServices
@@ -115,6 +143,15 @@ if [ "$MODE" = "dev" ]; then
     mv "$APP_DIR/Contents/MacOS/AltTab" "$DEV_DYLIB"
     codesign --force --sign "$SIGN_ID" --options runtime --timestamp=none "$DEV_DYLIB"
     echo "  dev dylib cdhash: $(codesign -dvvv "$DEV_DYLIB" 2>&1 | awk -F= '/^CDHash=/{print $2; exit}')"
+    OVERRIDE_DYLIB="$DEV_DYLIB"
+    if [ "${ALTTAB_DEV_NO_STARTUP:-0}" != "1" ]; then
+        # Publish atomically (cp to a sibling + mv): AltTab was stopped above, and
+        # replacing the directory entry never rewrites a file a process still maps.
+        mkdir -p "$(dirname "$STARTUP_DYLIB")"
+        cp "$DEV_DYLIB" "$STARTUP_DYLIB.new" && mv -f "$STARTUP_DYLIB.new" "$STARTUP_DYLIB"
+        OVERRIDE_DYLIB="$STARTUP_DYLIB"
+        echo "  published as login version: $STARTUP_DYLIB"
+    fi
     # The dylib has been extracted; the leftover .app shell in DerivedData is a
     # broken bundle (no main Mach-O) that Spotlight/LaunchServices still indexes,
     # cluttering search with a phantom AltTab. Remove it (install mode does the
@@ -131,12 +168,12 @@ if [ "$MODE" = "dev" ]; then
     # /tmp/alttab/<YYYYMMDD-HHMMSS>.<pid>.log (latest via /tmp/alttab/latest.log).
     # We deliberately do NOT pass --stdout/--stderr here — that was truncating
     # the prior shared /tmp/alttab-run.log on every dev rebuild.
-    launchctl setenv ALTTAB_DYLIB_OVERRIDE "$DEV_DYLIB"
+    launchctl setenv ALTTAB_DYLIB_OVERRIDE "$OVERRIDE_DYLIB"
     open -na "$DEST"
     sleep 3
     PID=$(pgrep -f 'AltTab\.app/Contents/MacOS/AltTab' | head -1)
     LOG_PATH=$(readlink /tmp/alttab/latest.log 2>/dev/null)
-    echo "Dev AltTab pid $PID, dylib: $DEV_DYLIB"
+    echo "Dev AltTab pid $PID, dylib: $OVERRIDE_DYLIB"
     echo "Log file: ${LOG_PATH:-/tmp/alttab/latest.log}"
     MONITOR_SECONDS="${ALTTAB_POST_BUILD_MONITOR_SECONDS:-5}"
     if [ "$MONITOR_SECONDS" != "0" ]; then
