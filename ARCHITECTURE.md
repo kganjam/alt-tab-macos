@@ -109,6 +109,29 @@ now prevent it (all flag-gated, default on):
   off/locked span (WindowServer isn't compositing then; captures strand and flush as a herd
   on unlock).
 
+**Freshness is event-driven, not polled (REL-103).** A capture returns whatever the app last
+presented to WindowServer. Apps that stop painting hidden windows — Edge/Chromium when
+occluded, lazily-restored "sleeping" tabs after a reboot, Coherence guests — keep a frozen
+(blank or old-page) frame there, so re-capturing them faster can never be fresher; it only
+loads WindowServer (the idle backoff already sees the identical hash). Verified 2026-09-12
+by dumping the cache (`AltTab --dump-thumbnails=<dir>`): restored Edge windows held blank
+content areas and one held a different page's frame. Freshness therefore comes from
+capturing at the moments pixels are actually fresh, all through the existing gates:
+- **Session source** (`BackgroundThumbnailRefresher.captureSessionSource`, source
+  `.sessionSource`): the window an AltTab session leaves is captured at session start while
+  still frontmost — one capture per session, skipped under pressure/quarantine/recent
+  capture, exempt from the post-selection pause so it lands if the user commits mid-flight.
+  Previously nothing captured it (the target's AX event only bumps the target, and the
+  on-show refresh is dropped when the panel closes first).
+- **Activation settle** (`noteRecentlyActive`): the newly focused window is captured after
+  `bgThumbnailActivationSettleMs` (1.5s) so it has repainted; the displaced one immediately.
+- **Content change** (`noteContentChanged`, from `Window.updateFromAxAttributes` title/size
+  changes and Coherence `refreshTitleIfChanged`): one settled capture, spaced
+  ≥ `bgThumbnailContentChangeMinIntervalMs` (15s) per window. If that capture is
+  pixel-identical the window is marked **frozen** (`THUMBFROZEN`, `frozen=` on `THUMBCACHE`)
+  and further title changes are ignored until activation, a resize, or a real pixel change
+  — so ticking titles on hidden windows cost ≤ 1 capture per visibility epoch.
+
 **Surface watch:** the `THUMBCACHE` log line (perf level, ~every 30s) reports
 `windows=` (tracked/live windows) and `surfaces=` (held IOSurface-backed thumbnails).
 `surfaces` should track `windows` and **not grow** unbounded over a long session; a

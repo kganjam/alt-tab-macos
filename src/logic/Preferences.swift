@@ -74,6 +74,10 @@ class Preferences {
             "bgThumbnailMaxPerTick": "10",
             "bgThumbnailMaxConcurrent": "4",
             "bgThumbnailPostSelectionPauseMs": "3000",
+            "bgThumbnailActivationSettleMs": "1500",
+            "bgThumbnailContentChangeRefreshEnabled": "true",
+            "bgThumbnailContentChangeMinIntervalMs": "15000",
+            "bgThumbnailSessionSourceCaptureEnabled": "true",
             "bgThumbnailTransitionPauseMs": "6000",
             "bgThumbnailCaptureTimeoutQuarantineThreshold": "3",
             "bgThumbnailCaptureQuarantineMs": "300000",
@@ -637,6 +641,21 @@ enum RuntimeFlags {
     static var bgThumbnailMaxPerTick: Int { int("bgThumbnailMaxPerTick", default: 10) }
     static var bgThumbnailMaxConcurrent: Int { int("bgThumbnailMaxConcurrent", default: 4) }
     static var bgThumbnailPostSelectionPauseMs: Int { int("bgThumbnailPostSelectionPauseMs", default: 3000) }
+    // Event-driven freshness (no polling; every capture still passes the tick's
+    // budget/breaker/quarantine gates). Apps like Edge/Chromium stop painting
+    // hidden windows, so re-capturing them on a timer can't return fresher pixels
+    // — freshness comes from capturing at the right moments instead:
+    // - activation: the newly focused window is captured this long after focus,
+    //   once it has repainted (also the min spacing for a session-source capture);
+    // - content change: a title change/resize schedules one settled capture, at
+    //   most once per `bgThumbnailContentChangeMinIntervalMs` per window, and is
+    //   ignored once such a capture proves the window isn't repainting (frozen);
+    // - session source: the window an AltTab session leaves is captured at session
+    //   start, while still frontmost and fresh (one capture per session).
+    static var bgThumbnailActivationSettleMs: Int { int("bgThumbnailActivationSettleMs", default: 1500) }
+    static var bgThumbnailContentChangeRefreshEnabled: Bool { bool("bgThumbnailContentChangeRefreshEnabled", default: true) }
+    static var bgThumbnailContentChangeMinIntervalMs: Int { int("bgThumbnailContentChangeMinIntervalMs", default: 15000) }
+    static var bgThumbnailSessionSourceCaptureEnabled: Bool { bool("bgThumbnailSessionSourceCaptureEnabled", default: true) }
     // Pause ALL thumbnail captures for this long after a display reconfiguration,
     // power-source (AC<->battery) change, or wake — WindowServer recomposites
     // every window then, and piling CGSHWCaptureWindowList work on top is the

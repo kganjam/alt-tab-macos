@@ -112,6 +112,7 @@ class Window {
     func updateFromAxAttributes(_ title: String?, _ size: CGSize?, _ position: CGPoint?, _ isFullscreen: Bool?, _ isMinimized: Bool?) {
         let newTitle = bestEffortTitle(title)
         let geometryChanged = self.size != nil && size != nil && self.size != size
+        let titleChanged = !(self.title ?? "").isEmpty && self.title != newTitle
         self.title = newTitle
         self.size = size
         self.position = position
@@ -129,6 +130,9 @@ class Window {
         }
         if geometryChanged {
             invalidateThumbnail()
+        }
+        if geometryChanged || titleChanged {
+            BackgroundThumbnailRefresher.shared.noteContentChanged(self, visible: geometryChanged)
         }
     }
 
@@ -177,6 +181,7 @@ class Window {
         guard let wid = cgWindowId, let liveTitle, !liveTitle.isEmpty,
               liveTitle != title else { return }
         Diagnostics.log("TITLE", "wid=\(wid) '\(title ?? "")' → '\(liveTitle)'")
+        BackgroundThumbnailRefresher.shared.noteContentChanged(self, visible: false)
         title = liveTitle
         lastSearchQuery = nil
         debugId = "\(application.debugId) (wid:\(wid) title:\(liveTitle))"

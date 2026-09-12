@@ -123,6 +123,16 @@ final class ThumbnailCache {
         /// `captureTimeoutQuarantineThreshold` consecutive timeouts). Diagnostic
         /// only — the suspension is enforced by the deferred heap deadline.
         var quarantined: Bool = false
+        /// A content-change signal (title/geometry change) scheduled the pending
+        /// background capture, so its result tells us whether the app is painting.
+        var contentChangeExpected: Bool = false
+        /// The app signalled a content change but the capture came back
+        /// pixel-identical: the window isn't repainting (occluded Chromium/Edge
+        /// windows and lazily-restored "sleeping" tabs keep their last presented
+        /// frame in WindowServer). Further content-change signals are ignored until
+        /// the window is activated or its pixels actually change — re-capturing a
+        /// frozen surface can never return fresher pixels, it only loads WindowServer.
+        var frozen: Bool = false
     }
 
     private let lock = NSLock()
@@ -271,6 +281,10 @@ final class ThumbnailCache {
             }
         }
         if let capturedBy { e.capturedBy = capturedBy }
+        if !contentUnchanged {
+            e.frozen = false
+            e.contentChangeExpected = false
+        }
         updateSignatureCountLocked(old: e.signature, new: signature)
         e.signature = signature
         e.contentHash = contentHash
@@ -326,6 +340,7 @@ final class ThumbnailCache {
         e.quarantined = false
         entries[wid] = e
         guard wasBgInitiated, e.scheduleId == poppedScheduleId else { return }
+        markFrozenIfChangeNotPaintedLocked(&e, wid: wid, contentUnchanged: contentUnchanged)
         // A static window (content byte-identical to its last capture) is polled
         // progressively less often; any change drops it back to the base cadence.
         e.unchangedStreak = contentUnchanged ? e.unchangedStreak + 1 : 0
@@ -337,6 +352,17 @@ final class ThumbnailCache {
         e.scheduleId = generation
         entries[wid] = e
         heap.push(HeapEntry(deadline: deadline, wid: wid, scheduleId: generation))
+    }
+
+    /// Resolve a content-change-driven capture: identical pixels despite the
+    /// signal means the app isn't painting this window, so freeze it. Caller
+    /// holds `lock`.
+    private func markFrozenIfChangeNotPaintedLocked(_ e: inout Entry, wid: CGWindowID, contentUnchanged: Bool) {
+        guard e.contentChangeExpected else { return }
+        e.contentChangeExpected = false
+        guard contentUnchanged, !e.frozen else { return }
+        e.frozen = true
+        Diagnostics.log("THUMBFROZEN", "wid=\(wid) content-change signal but capture unchanged — window not repainting (occluded/sleeping); ignoring further change signals until activation or real change")
     }
 
     /// Exponentially grow a tier's base interval with the unchanged-capture
@@ -432,6 +458,35 @@ final class ThumbnailCache {
         // lift any capture quarantine so its pulled-forward refresh actually fires.
         entries[wid]!.timeoutStreak = 0
         entries[wid]!.quarantined = false
+        entries[wid]!.frozen = false
+    }
+
+    /// The window's content probably changed (title/geometry change). Schedule
+    /// one capture at `now + settleSec` (so the app has painted), spaced at least
+    /// `minIntervalSec` after the last stored capture. Ignored while quarantined
+    /// or frozen; `visible` (the change itself proves the window is on screen and
+    /// painting, e.g. a resize) lifts a freeze first.
+    func noteContentChanged(wid: CGWindowID, now: CFAbsoluteTime, settleSec: TimeInterval, minIntervalSec: TimeInterval, visible: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        guard entries[wid] != nil, !entries[wid]!.quarantined else { return }
+        if visible { entries[wid]!.frozen = false }
+        guard !entries[wid]!.frozen else { return }
+        entries[wid]!.contentChangeExpected = true
+        let deadline = Swift.max(now + settleSec, entries[wid]!.lastUpdatedAt + minIntervalSec)
+        guard deadline < entries[wid]!.nextRefreshAt else { return }
+        generation &+= 1
+        entries[wid]!.nextRefreshAt = deadline
+        entries[wid]!.scheduleId = generation
+        heap.push(HeapEntry(deadline: deadline, wid: wid, scheduleId: generation))
+    }
+
+    /// Whether an out-of-band (event-driven, non-heap) capture of this window is
+    /// worthwhile and safe right now: registered, not quarantined, no capture in
+    /// flight, and not already captured within `minIntervalSec`.
+    func allowsEventCapture(wid: CGWindowID, now: CFAbsoluteTime, minIntervalSec: TimeInterval) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let e = entries[wid] else { return false }
+        return !e.quarantined && !e.inFlight && now - e.lastUpdatedAt >= minIntervalSec
     }
 
     // MARK: - Scheduling
@@ -473,11 +528,12 @@ final class ThumbnailCache {
     func statsLine() -> String {
         lock.lock(); defer { lock.unlock() }
         var hot = 0, warm = 0, cold = 0, inFlight = 0, pixelBuffer = 0, cgImage = 0
-        var liveSurfaces = 0, detached = 0, backedOff = 0, quarantined = 0, timingOut = 0
+        var liveSurfaces = 0, detached = 0, backedOff = 0, quarantined = 0, timingOut = 0, frozen = 0
         for (_, e) in entries {
             switch e.tier { case .hot: hot += 1; case .warm: warm += 1; case .cold: cold += 1 }
             if e.inFlight { inFlight += 1 }
             if e.unchangedStreak > 0 { backedOff += 1 }
+            if e.frozen { frozen += 1 }
             if e.quarantined { quarantined += 1 }
             else if e.timeoutStreak > 0 { timingOut += 1 }
             switch e.thumbnail {
@@ -497,7 +553,7 @@ final class ThumbnailCache {
         // so `surfaces` (their sum) overcounts when detach is on — watch `liveSurfaces`, not `surfaces`.
         let surfaces = pixelBuffer + cgImage
         let nextDueMs = heap.peek().map { Int(($0.deadline - CFAbsoluteTimeGetCurrent()) * 1000) } ?? -1
-        return "entries=\(entries.count) liveSurfaces=\(liveSurfaces) detached=\(detached) surfaces=\(surfaces) pixelBuffer=\(pixelBuffer) cgImage=\(cgImage) hot=\(hot) warm=\(warm) cold=\(cold) backedOff=\(backedOff) inFlight=\(inFlight) timingOut=\(timingOut) quarantined=\(quarantined) heap=\(heap.count) nextDueMs=\(nextDueMs)"
+        return "entries=\(entries.count) liveSurfaces=\(liveSurfaces) detached=\(detached) surfaces=\(surfaces) pixelBuffer=\(pixelBuffer) cgImage=\(cgImage) hot=\(hot) warm=\(warm) cold=\(cold) backedOff=\(backedOff) frozen=\(frozen) inFlight=\(inFlight) timingOut=\(timingOut) quarantined=\(quarantined) heap=\(heap.count) nextDueMs=\(nextDueMs)"
     }
 
     // MARK: - Internal

@@ -267,7 +267,9 @@ class App: AppCenterApplication {
         // change reissue) — none of them should run inside the pause.
         // Lifted when the panel reopens (`appIsBeingUsed == true`) since
         // the user is then back in interactive mode and wants fresh tiles.
-        if !appIsBeingUsed && lastAltTabFocusAt > 0 {
+        // `.sessionSource` is exempt: it's dispatched at session start (before the
+        // handoff) and must still land if the user commits while it's in flight.
+        if !appIsBeingUsed && lastAltTabFocusAt > 0 && source != .sessionSource {
             let pauseSec = Double(RuntimeFlags.bgThumbnailPostSelectionPauseMs) / 1000
             let sinceSelection = now - lastAltTabFocusAt
             if sinceSelection < pauseSec {
@@ -1287,6 +1289,9 @@ class App: AppCenterApplication {
             Diagnostics.logTrackedRecency("session-start post")
         }
         appIsBeingUsed = true
+        if startingNewSession, let sourceWid = sessionSourceWid, let source = (Windows.list.first { $0.cgWindowId == sourceWid }) {
+            BackgroundThumbnailRefresher.shared.captureSessionSource(source)
+        }
         startInputCaptureWatchdog(resetCaptureAge: startingNewSession)
         UsageStats.recordTrigger(shortcutIndex)
         if isFirstSummon || shortcutIndex != App.shortcutIndex {
@@ -1826,6 +1831,9 @@ enum RefreshCausedBy {
     /// Driven by BackgroundThumbnailRefresher's tick loop while the panel
     /// is closed. Per-window, off-main, low-pri.
     case backgroundPeriodic
+    /// The window an AltTab session is leaving, captured once at session start
+    /// (`BackgroundThumbnailRefresher.captureSessionSource`).
+    case sessionSource
 
     var requiresOpenPanel: Bool {
         self == .refreshVisibleThumbnailsAfterShowUi || self == .refreshOnlyThumbnailsAfterShowUi

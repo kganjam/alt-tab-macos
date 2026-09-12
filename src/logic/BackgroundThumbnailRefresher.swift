@@ -116,19 +116,64 @@ final class BackgroundThumbnailRefresher {
     /// the switcher shows a fresh image of what the user just used/left without
     /// waiting out the periodic cadence. The actual capture still runs through
     /// the tick's maxPerTick/maxConcurrent gate, so this can't burst the server.
-    /// Called with the focused window and the one it just displaced.
+    /// Called with the focused window first, then the one it just displaced.
+    /// The focused window is captured after `bgThumbnailActivationSettleMs`: it
+    /// was usually hidden until now, and apps that stop painting hidden windows
+    /// (Chromium/Edge, Coherence guests) still hold the pre-activation frame for a
+    /// moment — capturing at once stored that stale frame and, being unchanged,
+    /// even grew its backoff. The displaced window's frame is already its latest
+    /// (it was frontmost until now), so it's captured immediately.
     func noteRecentlyActive(_ windows: [Window]) {
         guard RuntimeFlags.bgThumbnailRefreshEnabled else { return }
         let now = CFAbsoluteTimeGetCurrent()
-        for window in windows {
+        let settleSec = Double(RuntimeFlags.bgThumbnailActivationSettleMs) / 1000
+        for (index, window) in windows.enumerated() {
             guard let wid = window.cgWindowId else { continue }
             ThumbnailCache.shared.setTier(wid: wid, tier: .hot)
             // The user just returned to this window — clear any accumulated idle
             // backoff so it resumes the fast base cadence, then pull its next
-            // capture forward to now.
+            // capture forward.
             ThumbnailCache.shared.resetBackoff(wid: wid)
-            ThumbnailCache.shared.bumpUp(wid: wid, to: now)
+            ThumbnailCache.shared.bumpUp(wid: wid, to: index == 0 ? now + settleSec : now)
         }
+    }
+
+    /// Event-driven refresh for a window whose content probably changed while
+    /// the user wasn't looking at it: a title change (page/tab navigation) or a
+    /// resize. Schedules one settled capture, rate-limited per window, and stops
+    /// listening once a change-driven capture proves the window isn't repainting
+    /// (`ThumbnailCache.Entry.frozen`) — so ticking titles on hidden windows cost
+    /// at most one capture per visibility epoch. Runs through the tick's
+    /// budget/breaker/quarantine gates like every background capture.
+    func noteContentChanged(_ window: Window, visible: Bool) {
+        guard RuntimeFlags.bgThumbnailRefreshEnabled, RuntimeFlags.bgThumbnailContentChangeRefreshEnabled,
+              let wid = window.cgWindowId, !window.isMinimized else { return }
+        ThumbnailCache.shared.noteContentChanged(
+            wid: wid, now: CFAbsoluteTimeGetCurrent(),
+            settleSec: Double(RuntimeFlags.bgThumbnailActivationSettleMs) / 1000,
+            minIntervalSec: Double(RuntimeFlags.bgThumbnailContentChangeMinIntervalMs) / 1000,
+            visible: visible)
+    }
+
+    /// Capture the window an AltTab session is leaving, at session start, while
+    /// it's still frontmost: it's the one thumbnail guaranteed to have changed
+    /// since it was last captured (the user was just working in it), and the
+    /// only moment its pixels are both fresh and on screen — once the switch lands
+    /// it's occluded (Chromium freezes it; Coherence guests capture black). The
+    /// target's AX focus event only refreshes the target, and the on-show refresh
+    /// is dropped if the panel closes first, so without this a quick alt-tab left
+    /// the source's thumbnail as old as its last periodic capture. One capture per
+    /// session, skipped under WindowServer pressure, quarantine, or a recent capture.
+    func captureSessionSource(_ window: Window) {
+        guard RuntimeFlags.bgThumbnailRefreshEnabled, RuntimeFlags.bgThumbnailSessionSourceCaptureEnabled,
+              let wid = window.cgWindowId, !window.isMinimized, !window.isWindowlessApp else { return }
+        let minIntervalSec = Double(RuntimeFlags.bgThumbnailActivationSettleMs) / 1000
+        guard ThumbnailCache.shared.allowsEventCapture(wid: wid, now: CFAbsoluteTimeGetCurrent(), minIntervalSec: minIntervalSec),
+              ActiveWindowCaptures.value() < RuntimeFlags.bgThumbnailMaxConcurrent,
+              !ActiveWindowCaptures.isOverloaded(expiryThreshold: RuntimeFlags.bgThumbnailOverloadExpiryThreshold,
+                                                 latencyMaxMs: RuntimeFlags.bgThumbnailCaptureLatencyOverloadMs) else { return }
+        Diagnostics.log("CAPTURE", "session source capture wid=\(wid)")
+        Windows.refreshThumbnailsAsync([window], .sessionSource)
     }
 
     // MARK: - Tick

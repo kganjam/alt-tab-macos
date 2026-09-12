@@ -140,12 +140,40 @@ class CliServer {
             window.focus()
             return noOutput
         }
+        if rawValue.hasPrefix("--dump-thumbnails=") {
+            return dumpThumbnails(to: String(rawValue.dropFirst("--dump-thumbnails=".count)))
+        }
         if rawValue.hasPrefix("--show="),
            let shortcutIndex = Int(rawValue.dropFirst("--show=".count)), (0..<Preferences.shortcutCount).contains(shortcutIndex) {
             App.showUi(shortcutIndex)
             return noOutput
         }
         return error
+    }
+
+    /// Diagnostic: write every cached thumbnail as `<wid>.png` plus `index.json`
+    /// (title/app/age) into `dir`, so the pixels AltTab would show can be inspected
+    /// from a shell without Screen Recording. Snapshots on main; encodes off-main
+    /// so the 2s CLI round-trip isn't blocked by PNG encoding.
+    private static func dumpThumbnails(to dir: String) -> Codable {
+        let now = CFAbsoluteTimeGetCurrent()
+        let items: [(CGWindowID, CGImage, JsonWindowFull)] = Windows.list.compactMap { w in
+            guard let wid = w.cgWindowId, case let .cgImage(img?)? = ThumbnailCache.shared.read(wid: wid) else { return nil }
+            return (wid, img, jsonWindowFull(w, now))
+        }
+        BackgroundWork.screenshotsQueue.addOperation {
+            let url = URL(fileURLWithPath: dir, isDirectory: true)
+            try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            for (wid, img, _) in items {
+                autoreleasepool {
+                    guard let dest = CGImageDestinationCreateWithURL(url.appendingPathComponent("\(wid).png") as CFURL, "public.png" as CFString, 1, nil) else { return }
+                    CGImageDestinationAddImage(dest, img, nil)
+                    CGImageDestinationFinalize(dest)
+                }
+            }
+            try? jsonEncoder.encode(JsonWindowFullList(windows: items.map { $0.2 })).write(to: url.appendingPathComponent("index.json"))
+        }
+        return JsonThumbnailDump(directory: dir, thumbnails: items.count)
     }
 
     private static func selectionState(_ selectedWindow: Window? = Windows.selectedWindow()) -> JsonSelectionState {
@@ -157,8 +185,7 @@ class CliServer {
             windows: Windows.list.filter { !$0.isWindowlessApp }.map { jsonWindowFull($0) })
     }
 
-    private static func jsonWindowFull(_ window: Window) -> JsonWindowFull {
-        let now = CFAbsoluteTimeGetCurrent()
+    private static func jsonWindowFull(_ window: Window, _ now: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()) -> JsonWindowFull {
         let thumbnailAgeMs = window.thumbnailUpdatedAt > 0 ? (now - window.thumbnailUpdatedAt) * 1000 : nil
         return JsonWindowFull(
             id: window.cgWindowId,
@@ -192,6 +219,11 @@ class CliServer {
 
     private struct JsonNewestWid: Codable {
         var newestWindowId: CGWindowID
+    }
+
+    private struct JsonThumbnailDump: Codable {
+        var directory: String
+        var thumbnails: Int
     }
 
     private struct JsonWindowList: Codable {
@@ -245,7 +277,7 @@ class CliClient {
     static func detectCommand() -> String? {
         let args = CommandLine.arguments
         if args.count == 2 && !args[1].starts(with: "--logs=") {
-            if args[1] == "--list" || args[1] == "--detailed-list" || args[1] == "--selection-state" || args[1] == "--hide" || args[1] == "--focus-target" || args[1].hasPrefix("--select=") || args[1].hasPrefix("--select-index=") || args[1].hasPrefix("--select-and-focus=") || args[1].hasPrefix("--focus=") || args[1].hasPrefix("--focus-newest=") || args[1].hasPrefix("--newest-wid=") || args[1].hasPrefix("--focusUsingLastFocusOrder=") || args[1].hasPrefix("--show=") {
+            if args[1] == "--list" || args[1] == "--detailed-list" || args[1] == "--selection-state" || args[1] == "--hide" || args[1] == "--focus-target" || args[1].hasPrefix("--select=") || args[1].hasPrefix("--select-index=") || args[1].hasPrefix("--select-and-focus=") || args[1].hasPrefix("--focus=") || args[1].hasPrefix("--focus-newest=") || args[1].hasPrefix("--newest-wid=") || args[1].hasPrefix("--focusUsingLastFocusOrder=") || args[1].hasPrefix("--show=") || args[1].hasPrefix("--dump-thumbnails=") {
                 return args[1]
             }
         }

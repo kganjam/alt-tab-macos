@@ -231,6 +231,12 @@ If you need to think harder about this, see memory note
   `surfaces=` (held IOSurface thumbnails); `surfaces` must track `windows` and NOT grow
   unbounded over a long run — a rising `surfaces` decoupled from `windows` is the leak
   regressing. Flip `bgThumbnailDetachNonHotTier` on if it approaches the tally limit.
+- Thumbnail freshness is event-driven, never a faster timer (REL-103): Edge/Chromium and
+  Coherence don't paint hidden windows, so a capture of one returns a frozen frame no matter
+  how often you take it. Capture at the moments pixels are fresh (session source, settled
+  activation, title/resize change with `frozen` detection). Inspect what AltTab actually holds
+  with `AltTab --dump-thumbnails=<dir>` (run with `ALTTAB_DYLIB_OVERRIDE` set to the live
+  dylib — an older bundle doesn't know the verb and launches a second AltTab instead).
 - The concurrent `screenshotsQueue` must NOT read main-thread-owned state
   (`Windows.list`, `Window.size`/`.screenId`, `cachedSCWindows`): snapshot per-window
   state on the main thread first (`CaptureRequest`); `cachedSCWindows` is lock-guarded
