@@ -18,7 +18,7 @@
          login item re-enabled), it is quit and relaunched under it. It only
          `open`s AltTab when none is running: reopening a running AltTab shows
          its Settings window (applicationShouldHandleReopen).
-         Logs: `log show --predicate 'senderImagePath CONTAINS "logger"' | grep alttab-startup`.
+         Log: ~/.alttab-dev/startup.log (one line per login; check it after a reboot).
          Remove: launchctl bootout gui/$(id -u)/com.kganjam.alttab-dev-override
                  rm ~/Library/LaunchAgents/com.kganjam.alttab-dev-override.plist
                  defaults write com.lwouis.alt-tab-macos startAtLogin -string true -->
@@ -34,7 +34,7 @@
         <string>-c</string>
         <string>D="$HOME/.alttab-dev/AltTabCore.dylib"
 APP=/Applications/AltTab.app
-say() { logger -t alttab-startup "$1"; }
+say() { mkdir -p "$HOME/.alttab-dev"; echo "$(date '+%F %T') $1" &gt;&gt; "$HOME/.alttab-dev/startup.log"; }
 if [ -f "$D" ]; then launchctl setenv ALTTAB_DYLIB_OVERRIDE "$D"; else launchctl unsetenv ALTTAB_DYLIB_OVERRIDE; say "no published dev dylib; running installed bundle"; fi
 P=$(pgrep -f "^$APP/Contents/MacOS/AltTab\$" | head -1)
 if [ -f "$D" ] &amp;&amp; [ -n "$P" ] &amp;&amp; ! ps eww -p "$P" | grep -qF "ALTTAB_DYLIB_OVERRIDE=$D"; then
