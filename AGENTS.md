@@ -241,6 +241,11 @@ If you need to think harder about this, see memory note
   `surfaces=` (held IOSurface thumbnails); `surfaces` must track `windows` and NOT grow
   unbounded over a long run — a rising `surfaces` decoupled from `windows` is the leak
   regressing. Flip `bgThumbnailDetachNonHotTier` on if it approaches the tally limit.
+- On macOS 26+ every window capture lights the purple screen-recording indicator — the
+  private CGS path included — and it lingers ~8–12s (REL-104). Never try to hide the
+  indicator; it is a privacy signal. The only lever is capture volume/timing:
+  `captureWindowsInBackground` off = captures only while the switcher is on screen
+  (honoured by the refresher tick AND the session-source capture); `hideThumbnails` = none.
 - Thumbnail freshness is event-driven, never a faster timer (REL-103): Edge/Chromium and
   Coherence don't paint hidden windows, so a capture of one returns a frozen frame no matter
   how often you take it. Capture at the moments pixels are fresh (session source, settled

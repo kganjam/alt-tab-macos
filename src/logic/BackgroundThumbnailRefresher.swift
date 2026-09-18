@@ -165,7 +165,12 @@ final class BackgroundThumbnailRefresher {
     /// the source's thumbnail as old as its last periodic capture. One capture per
     /// session, skipped under WindowServer pressure, quarantine, or a recent capture.
     func captureSessionSource(_ window: Window) {
+        // `captureWindowsInBackground` off means captures only while the switcher
+        // is on screen. A session starts before the panel is shown (and a fast
+        // alt-tab never shows one), so this capture would light the recording
+        // indicator with nothing on screen — exactly what that setting turns off.
         guard RuntimeFlags.bgThumbnailRefreshEnabled, RuntimeFlags.bgThumbnailSessionSourceCaptureEnabled,
+              Preferences.captureWindowsInBackground,
               let wid = window.cgWindowId, !window.isMinimized, !window.isWindowlessApp else { return }
         let minIntervalSec = Double(RuntimeFlags.bgThumbnailActivationSettleMs) / 1000
         guard ThumbnailCache.shared.allowsEventCapture(wid: wid, now: CFAbsoluteTimeGetCurrent(), minIntervalSec: minIntervalSec),
@@ -190,6 +195,15 @@ final class BackgroundThumbnailRefresher {
         // Panel-open: the in-panel `visibleThumbnailRefreshTimer` (1200ms
         // default) takes over. Skip to avoid double-refreshing.
         if App.appIsBeingUsed { return }
+
+        // "Capture windows in the background" off: the user wants captures ONLY
+        // while the switcher is on screen — on macOS 26+ every window capture,
+        // private CGS path included, lights the purple screen-recording
+        // indicator, and it lingers ~10s per capture (REL-104). Stop here rather
+        // than popping work `refreshThumbnailsAsync` would reject: popping marks
+        // entries in-flight and costs a main-thread hop per tick for captures
+        // that can never run.
+        guard Preferences.captureWindowsInBackground else { return }
 
         // Keep the small downscaled thumbnails resident while idle so a cold
         // panel show composites them directly instead of faulting ~130

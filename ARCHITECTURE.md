@@ -132,6 +132,18 @@ capturing at the moments pixels are actually fresh, all through the existing gat
   and further title changes are ignored until activation, a resize, or a real pixel change
   — so ticking titles on hidden windows cost ≤ 1 capture per visibility epoch.
 
+**macOS 26+ lights the screen-recording indicator for EVERY window capture (REL-104).** The
+purple Control Center pill used to be a ScreenCaptureKit-only cost; measured 2026-09-18 on
+macOS 27.0 (26A428), the private `CGSHWCaptureWindowList` path lights it too, and it lingers
+**~8–12s after the last capture**. So any background cadence (hot tier 60s) keeps it lit
+essentially all the time. There is no capture API that avoids it, and the indicator itself is
+a privacy signal — do not try to suppress it. The only lever is **not capturing**:
+- `captureWindowsInBackground` (General tab, user-facing) off → captures only while the
+  switcher is on screen. The refresher's tick returns early, and the session-source capture is
+  skipped (a session — and every fast alt-tab that never shows a panel — starts before the
+  panel is up, so capturing there would light the pill with nothing on screen).
+- `hideThumbnails` on (or `thumbnailCaptureEnabled` false) → no captures at all, no pill ever.
+
 **Surface watch:** the `THUMBCACHE` log line (perf level, ~every 30s) reports
 `windows=` (tracked/live windows) and `surfaces=` (held IOSurface-backed thumbnails).
 `surfaces` should track `windows` and **not grow** unbounded over a long session; a
