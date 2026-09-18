@@ -8,7 +8,9 @@
 
          `build.sh dev` publishes every build to ~/.alttab-dev/AltTabCore.dylib
          (from any checkout or worktree). At login this agent points the shim at
-         that dylib (no bundle change → no TCC re-prompt) and THEN launches
+         that dylib (no bundle change → no TCC re-prompt) and THEN launches it with
+         that override passed explicitly (`open --env`: a bare setenv can lose the race,
+         since launchservicesd spawns apps from a snapshot of the launchd environment),
          AltTab, so the override is always in place first. It is the single
          launcher: `build.sh startup` turns off AltTab's own "Start at login"
          (its RunAtLoad agent raced this setenv and ran the stale bundled dylib
@@ -44,7 +46,7 @@ if [ -f "$D" ] &amp;&amp; [ -n "$P" ] &amp;&amp; ! ps eww -p "$P" | grep -qF "AL
   kill -9 "$P" 2>/dev/null
 fi
 if pgrep -f "^$APP/Contents/MacOS/AltTab\$" >/dev/null; then say "AltTab already running; nothing to do"; exit 0; fi
-i=0; until open -n "$APP" || [ $i -ge 5 ]; do sleep 2; i=$((i+1)); done
+i=0; until open -n "$APP" --env "ALTTAB_DYLIB_OVERRIDE=$D" || [ $i -ge 5 ]; do sleep 2; i=$((i+1)); done
 say "launched AltTab override=${D}"</string>
     </array>
 </dict>

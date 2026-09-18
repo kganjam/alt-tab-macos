@@ -2,9 +2,16 @@
 
 PRODUCT_NAME = AltTab
 PRODUCT_BUNDLE_IDENTIFIER = com.lwouis.alt-tab-macos
-MACOSX_DEPLOYMENT_TARGET = 10.12
+MACOSX_DEPLOYMENT_TARGET = 12.0
 SWIFT_VERSION = 5.8 // xcode 14.2 translates this to 5.0; xcode 16.2 as 5.8
-SWIFT_TREAT_WARNINGS_AS_ERRORS = YES
+// Xcode 27 rejects deployment targets below 12.0; raising ours from 10.12 surfaced pre-existing
+// deprecations (NSAppearance.current, ultraDark/mediumLight materials, NSStatusItem.popUpMenu) that
+// warnings-as-errors turned into build failures. Modernizing them changes the panel's material and the
+// menubar menu's behaviour, so do it deliberately, not as fallout of an OS upgrade. We pass
+// -warnings-as-errors ourselves (instead of SWIFT_TREAT_WARNINGS_AS_ERRORS) because the exemption only
+// applies if it comes AFTER it on the command line; every other warning is still an error.
+SWIFT_TREAT_WARNINGS_AS_ERRORS = NO
+OTHER_SWIFT_FLAGS = -warnings-as-errors -Wwarning DeprecatedDeclaration
 INFOPLIST_FILE = Info.plist
 CODE_SIGN_ENTITLEMENTS = alt_tab_macos.entitlements
 FRAMEWORK_SEARCH_PATHS[config=*] = $(inherited) /System/Library/PrivateFrameworks // for SkyLight.framework

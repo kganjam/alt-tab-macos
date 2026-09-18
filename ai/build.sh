@@ -168,11 +168,23 @@ if [ "$MODE" = "dev" ]; then
     # /tmp/alttab/<YYYYMMDD-HHMMSS>.<pid>.log (latest via /tmp/alttab/latest.log).
     # We deliberately do NOT pass --stdout/--stderr here — that was truncating
     # the prior shared /tmp/alttab-run.log on every dev rebuild.
+    # `launchctl setenv` alone is NOT enough: launchservicesd spawns the app with a
+    # snapshot of the launchd environment, so `open` right after a setenv can still
+    # start AltTab with the PREVIOUS override — observed 2026-09-18, when a fresh
+    # build silently ran a 6-day-old dylib. Pass the override to this launch
+    # explicitly; the setenv is for later logins and CLI clients.
     launchctl setenv ALTTAB_DYLIB_OVERRIDE "$OVERRIDE_DYLIB"
-    open -na "$DEST"
+    open -na "$DEST" --env "ALTTAB_DYLIB_OVERRIDE=$OVERRIDE_DYLIB"
     sleep 3
     PID=$(pgrep -f 'AltTab\.app/Contents/MacOS/AltTab' | head -1)
     LOG_PATH=$(readlink /tmp/alttab/latest.log 2>/dev/null)
+    # Verify the running process actually loaded the dylib we just built, so a
+    # stale dylib can never be mistaken for the new code (the trap that cost a
+    # WindowServer crash and a long misdiagnosis; see memory project_stale_dev_dylib_trap).
+    if [ -z "$PID" ] || ! ps eww -p "$PID" | grep -qF "ALTTAB_DYLIB_OVERRIDE=$OVERRIDE_DYLIB"; then
+        echo "FATAL: AltTab (pid ${PID:-none}) is not running the dylib just built ($OVERRIDE_DYLIB)" >&2
+        exit 1
+    fi
     echo "Dev AltTab pid $PID, dylib: $OVERRIDE_DYLIB"
     echo "Log file: ${LOG_PATH:-/tmp/alttab/latest.log}"
     MONITOR_SECONDS="${ALTTAB_POST_BUILD_MONITOR_SECONDS:-5}"

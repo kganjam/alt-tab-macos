@@ -51,7 +51,7 @@ Change the shortcut keys, switch to a Windows theme and more, using the Settings
 
 ## Compatibility
 
-* __macOS version:__ from 10.12 to latest
+* __macOS version:__ from 12.0 to latest (this fork: Xcode 27 no longer accepts a 10.12 deployment target)
 * __Apple Silicon:__ yes, AltTab is [universal](https://developer.apple.com/documentation/apple-silicon/porting-your-macos-apps-to-apple-silicon)
 
 ## Localization
