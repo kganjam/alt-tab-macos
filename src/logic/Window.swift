@@ -1616,16 +1616,30 @@ class Window {
         }
     }
 
-    /// The following function was ported from https://github.com/Hammerspoon/hammerspoon/issues/370#issuecomment-545545468
+    /// Makes this window the key window of its app by posting a synthetic left-click (down then up)
+    /// to the WindowServer; no public API moves key focus across apps. Ported from
+    /// https://github.com/Hammerspoon/hammerspoon/issues/370#issuecomment-545545468 (yabai's
+    /// `window_manager_make_key_window`), with upstream lwouis/alt-tab-macos 782f1fe2 applied:
+    /// - the window-relative click point (`CGSEventRecord.windowLocation`, offset 0x20) used to be
+    ///   filled with 0xff bytes, i.e. a NaN CGPoint. Chromium apps (Edge, Chrome, PWAs) sanitize
+    ///   NaN to (0, 0) and complete a REAL click on the window's top-left control (upstream
+    ///   #5381/#5935), so every AltTab focus also clicked the browser's chrome. We aim at (-1, -1):
+    ///   the mouse-down still makes the window key (delivery is by window id at 0x3c, not by the
+    ///   point), but the point hit-tests to no view, so nothing is clicked.
+    /// - the buffer is 0x100 bytes while the record still declares 0xf8: on macOS 14.7.4+ the
+    ///   WindowServer's `CGSEncodeEventRecord` reads past the record and would SIGABRT on
+    ///   out-of-bounds heap garbage (karinushka/paneru#123); yabai allocates the same 0x100.
     func makeKeyWindow(_ psn: inout ProcessSerialNumber) -> Void {
-        var bytes = [UInt8](repeating: 0, count: 0xf8)
-        bytes[0x04] = 0xf8
-        bytes[0x3a] = 0x10
-        memcpy(&bytes[0x3c], &cgWindowId, MemoryLayout<UInt32>.size)
-        memset(&bytes[0x20], 0xff, 0x10)
-        bytes[0x08] = 0x01
+        var wid = cgWindowId!
+        var point = CGPoint(x: -1, y: -1)
+        var bytes = [UInt8](repeating: 0, count: 0x100)
+        bytes[0x04] = 0xf8 // declared record length
+        bytes[0x3a] = 0x10 // undocumented; yabai and Hammerspoon set it
+        memcpy(&bytes[0x3c], &wid, MemoryLayout<CGWindowID>.size)
+        memcpy(&bytes[0x20], &point, MemoryLayout<CGPoint>.size)
+        bytes[0x08] = 0x01 // kCGEventLeftMouseDown
         SLPSPostEventRecordTo(&psn, &bytes)
-        bytes[0x08] = 0x02
+        bytes[0x08] = 0x02 // kCGEventLeftMouseUp
         SLPSPostEventRecordTo(&psn, &bytes)
     }
 
