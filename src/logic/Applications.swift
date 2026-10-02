@@ -264,6 +264,7 @@ class Applications {
         for tApp in terminatingApps {
             let pid = tApp.processIdentifier
             AXCallScheduler.shared.removeEntry(key: "pid-\(pid)")
+            AXCallScheduler.shared.removeEntry(key: AccessibilityEvents.focusChangeSchedulerKey(pid))
             AXCallScheduler.shared.removeUnresponsivePid(pid)
             appListUpdateThrottler.removeEntry(withKey: "\(pid)")
         }

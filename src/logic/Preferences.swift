@@ -88,6 +88,7 @@ class Preferences {
             "bgThumbnailOverloadProbeTimeoutMs": "25000",
             "bgThumbnailDisplayOffHoldEnabled": "true",
             "zOrderDegradedRecoveryEnabled": "true",
+            "inAppFocusEventsEnabled": "true",
             "bgThumbnailCoherenceEnabled": "true",
             "axWindowGeometryThrottleMs": "500",
             "focusOverlayCaptureEnabled": "true",
@@ -694,6 +695,12 @@ enum RuntimeFlags {
     // the CGS order request is silently dropped. Scoped to cross-app blockers so
     // it can't dismiss a same-app child popup.
     static var zOrderDegradedRecoveryEnabled: Bool { bool("zOrderDegradedRecoveryEnabled", default: true) }
+    // Track focus moving between windows of the already-active app (click on a
+    // sibling window, Cmd+`, closing the key window). Off = pre-fix behaviour:
+    // those AX notifications are dropped and recency only catches up with the
+    // frontmost window at the next switcher session. Emergency lever only, in
+    // case a Coherence app's spurious sibling focus events disturb recency.
+    static var inAppFocusEventsEnabled: Bool { bool("inAppFocusEventsEnabled", default: true) }
     static var bgThumbnailCoherenceEnabled: Bool { bool("bgThumbnailCoherenceEnabled", default: true) }
     // Trailing-edge coalescing interval for the high-frequency AX window
     // move/resize notification storm (a live drag/resize fires these at the

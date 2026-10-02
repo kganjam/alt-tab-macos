@@ -38,7 +38,12 @@ class AccessibilityEvents {
     private static func handleEvent(_ type: String, _ element: AXUIElement) throws {
         let pid = try element.pid()
         Logger.debug { "\(type) pid:\(pid)" }
-        if [kAXApplicationActivatedNotification, kAXApplicationHiddenNotification, kAXApplicationShownNotification, kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification].contains(type) {
+        if isFocusedOrMainWindowChange(type) {
+            guard RuntimeFlags.inAppFocusEventsEnabled else { return }
+            AXCallScheduler.shared.schedule(key: focusChangeSchedulerKey(pid), context: "(pid:\(pid))", pid: pid) {
+                try handleEventApp(type, pid, element)
+            }
+        } else if [kAXApplicationActivatedNotification, kAXApplicationHiddenNotification, kAXApplicationShownNotification].contains(type) {
             AXCallScheduler.shared.schedule(key: "pid-\(pid)", context: "(pid:\(pid))", pid: pid) {
                 try handleEventApp(type, pid, element)
             }
@@ -65,6 +70,34 @@ class AccessibilityEvents {
         }
     }
 
+    private static func isFocusedOrMainWindowChange(_ type: String) -> Bool {
+        type == kAXFocusedWindowChangedNotification || type == kAXMainWindowChangedNotification
+    }
+
+    /// In-app focus changes get their own scheduler key. "pid-<pid>" is shared with window-list
+    /// refreshes (`Applications.manuallyUpdateWindows`) and the scheduler keeps only the latest
+    /// pending block per key, so on a busy app a queued refresh would silently replace the focus
+    /// change, and a focus change would replace a pending activation.
+    static func focusChangeSchedulerKey(_ pid: pid_t) -> String {
+        "pid-focus-\(pid)"
+    }
+
+    /// The window the app currently reports as focused (else main). Always read from the
+    /// application element: kAXFocusedWindowChanged/kAXMainWindowChanged deliver the *window*
+    /// that gained focus as the notification element (only kAXApplicationActivated delivers the
+    /// application), and a window has no focused/main-window attribute. Reading those off the
+    /// notification element returned nothing, which silently dropped every in-app focus change.
+    private static func currentFocusedOrMainWindow(_ pid: pid_t, eventElement: AXUIElement) throws -> (focused: AXUIElement?, focusedWid: CGWindowID?, main: AXUIElement?, mainWid: CGWindowID?) {
+        let attributes = try AXUIElementCreateApplication(pid).attributes([kAXFocusedWindowAttribute, kAXMainWindowAttribute])
+        let focusedWid = try attributes.focusedWindow?.cgWindowId()
+        let mainWid = try attributes.mainWindow?.cgWindowId()
+        guard attributes.focusedWindow == nil, attributes.mainWindow == nil,
+              let eventWid = try? eventElement.cgWindowId(), eventWid != 0 else {
+            return (attributes.focusedWindow, focusedWid, attributes.mainWindow, mainWid)
+        }
+        return (eventElement, eventWid, nil, nil)
+    }
+
     private static func handleEventApp(_ type: String, _ pid: pid_t, _ element: AXUIElement) throws {
         if type == kAXApplicationHiddenNotification || type == kAXApplicationShownNotification || type == kAXWindowCreatedNotification {
             DispatchQueue.main.async {
@@ -89,12 +122,8 @@ class AccessibilityEvents {
             }
             return
         }
-        let attributes = try element.attributes([kAXFocusedWindowAttribute, kAXMainWindowAttribute])
-        let appFocusedWindow = attributes.focusedWindow
-        let appFocusedWid = try appFocusedWindow?.cgWindowId()
-        let appMainWindow = attributes.mainWindow
-        let appMainWid = try appMainWindow?.cgWindowId()
-        if type == kAXFocusedWindowChangedNotification || type == kAXMainWindowChangedNotification {
+        let (appFocusedWindow, appFocusedWid, appMainWindow, appMainWid) = try currentFocusedOrMainWindow(pid, eventElement: element)
+        if isFocusedOrMainWindowChange(type) {
             DispatchQueue.main.async {
                 guard let app = Applications.findOrCreate(pid, false) else { return }
                 Logger.info { "\(type) app:\(app.debugId)" }
@@ -190,6 +219,7 @@ class AccessibilityEvents {
         guard app.runningApplication.isActive else { return }
         let axWindow = appFocusedWindow ?? appMainWindow
         let wid = appFocusedWid ?? appMainWid
+        Diagnostics.log("AXEVENT", "focusedOrMainWindowChanged type=\(type) pid=\(pid) app=\(app.bundleIdentifier ?? "?") wid=#\(wid ?? 0) guardActive=\(CFAbsoluteTimeGetCurrent() < Windows.altTabFocusTargetUntil)")
         if Windows.releaseZOrderEnforcementForExternalForegroundOwner(wid: wid, pid: pid, label: type) {
             Windows.requestZOrderTopReview(reason: type, wid: wid ?? 0)
         }

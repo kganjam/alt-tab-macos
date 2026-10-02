@@ -323,7 +323,7 @@ Source-of-z-order-change → AltTab observation path:
 |---|---|---|
 | App launched from Spotlight/cli | `kAXApplicationActivatedNotification` → `applicationActivated` → `updateLastFocusOrder` | AccessibilityEvents.swift:47 |
 | User clicks window in different app | `kAXApplicationActivated` + `kAXFocusedWindowChanged` | both fire; updateLastFocusOrder |
-| User clicks window in same app | `kAXFocusedWindowChanged` only | AccessibilityEvents.swift:189 |
+| User clicks window in same app | `kAXFocusedWindowChanged` only → `applicationFocusedOrMainWindowChanged` | was silently dropped 2026-05-17 → 2026-10-02 (REL-106): the notification element is the window, not the app |
 | New window opened | `kAXWindowCreatedNotification` → `findOrCreate` → `appendWindow` | inserted at *end* of recency, not at #0 (Windows.swift:1273) |
 | Window closed | `kAXUIElementDestroyedNotification` → `windowDestroyed` → `removeWindows` | recency re-numbered |
 | Window minimized/zoomed | `kAXMainWindowChangedNotification` | re-routed to focusedWindowChanged |
