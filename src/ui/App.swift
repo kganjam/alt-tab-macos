@@ -806,6 +806,44 @@ class App: AppCenterApplication {
         return rect.width >= bounds.width * 0.98 && rect.height >= bounds.height * 0.98
     }
 
+    /// The Dock draws its icons into its one display-sized pass-through window,
+    /// so the window list can't tell a Dock click from a click on the app window
+    /// behind it. Every Dock launch was attributed to that window, and the XPROC
+    /// misroute repair re-activated it over the app the user launched (observed
+    /// 2026-10-07: five Dock clicks on Teams, each reverted to PowerPoint).
+    /// Ask AX what is under the cursor, only inside the Dock's edge band so
+    /// ordinary clicks never pay for the hit-test.
+    private static let dockHitTestElement: AXUIElement = {
+        let element = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(element, 0.15)
+        return element
+    }()
+
+    static func isDockClick(_ point: CGPoint) -> Bool {
+        guard isInDockEdgeBand(point),
+              let dockPid = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first?.processIdentifier else { return false }
+        var element: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(dockHitTestElement, Float(point.x), Float(point.y), &element) == .success, let element else { return false }
+        var pid: pid_t = 0
+        return AXUIElementGetPid(element, &pid) == .success && pid == dockPid
+    }
+
+    private static func isInDockEdgeBand(_ point: CGPoint) -> Bool {
+        var displayId = CGDirectDisplayID()
+        var matchCount: UInt32 = 0
+        guard CGGetDisplaysWithPoint(point, 1, &displayId, &matchCount) == .success, matchCount > 0 else { return false }
+        let bounds = CGDisplayBounds(displayId)
+        let dock = UserDefaults(suiteName: "com.apple.dock")
+        let tile = dock?.double(forKey: "tilesize") ?? 0
+        let magnified = dock?.bool(forKey: "magnification") == true ? dock?.double(forKey: "largesize") ?? 0 : 0
+        let band = max(tile > 0 ? tile : 64, magnified) + 40
+        switch dock?.string(forKey: "orientation") ?? "bottom" {
+        case "left": return point.x - bounds.minX <= band
+        case "right": return bounds.maxX - point.x <= band
+        default: return bounds.maxY - point.y <= band
+        }
+    }
+
     static func showUi(_ shortcutIndex: Int) {
         showUiOrCycleSelection(shortcutIndex, true)
     }
@@ -1465,6 +1503,7 @@ class App: AppCenterApplication {
         SystemScrollerStyleEvents.observe()
         InputSourceEvents.observe()
         Applications.initialDiscovery()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { Windows.restorePersistedFocusOrderAfterLaunch() }
         KeyboardEvents.addEventHandlers()
         CursorEvents.observe()
         TrackpadEvents.observe()
@@ -1635,6 +1674,7 @@ extension App: NSApplicationDelegate {
                         if clickCapturingChrome.contains(owner) { chromeUnderCursor = owner }
                         break
                     }
+                    if chromeUnderCursor == nil, App.isDockClick(cgPoint) { chromeUnderCursor = "Dock" }
                     if let chromeUnderCursor {
                         if isDown {
                             // Do NOT attribute this click to the window behind

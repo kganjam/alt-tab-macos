@@ -7,6 +7,10 @@ class Windows {
     static var hoveredWindowIndex: Int?
     private static let persistedFocusOrderKey = "focusOrderWindowIds"
     private static var didRestorePersistedFocusOrder = false
+    private static var restoredPersistedFocusOrder = false
+    /// Windows focused in this run before the restore, most recent first. They
+    /// outrank last session's order instead of being overwritten by it.
+    private static var focusedBeforeRestore = [Window]()
     // we use this to track if the focused window changed while alt-tab was open
     private static var lastFocusedWindowTarget: String?
     /// When AltTab initiates a focus change via SLPS + pin for a Parallels
@@ -2767,7 +2771,7 @@ class Windows {
             assignLastFocusOrderByLevel(cgWindowIds)
             return
         }
-        if restorePersistedFocusOrderIfNeeded() { return }
+        if restorePersistedFocusOrderIfNeeded() || restoredPersistedFocusOrder { return }
         Diagnostics.log("ORDER", "sortByLevel falling through to assignClusterSafeLastFocusOrderByLevel")
         assignClusterSafeLastFocusOrderByLevel(cgWindowIds)
     }
@@ -2789,6 +2793,17 @@ class Windows {
         let w: Double?
         let h: Double?
         let screen: String?
+    }
+
+    /// Restore shortly after launch rather than on the first switcher open:
+    /// nothing is persisted until the restore runs, so a session that never
+    /// opened the switcher dropped every focus change (2026-10-07: three quick
+    /// restarts sank WhatsApp to rank 42). The frontmost window is synced after,
+    /// since an app already frontmost at launch never sends a focus event.
+    static func restorePersistedFocusOrderAfterLaunch() {
+        guard restorePersistedFocusOrderIfNeeded() else { return }
+        syncFocusOrderWithLiveFrontmostWindow()
+        persistFocusOrder()
     }
 
     private static func restorePersistedFocusOrderIfNeeded() -> Bool {
@@ -2828,6 +2843,9 @@ class Windows {
             return true
         }
 
+        let liveFocused = focusedBeforeRestore.filter { focused in list.contains { $0 === focused } }
+        liveFocused.forEach { _ = claim($0) }
+        focusedBeforeRestore = []
         var matchTier = [Int: Int]() // tier counts for diag: 1=wid, 2=title, 3=geom
         for key in stored {
             // Tier 1: wid (cheap, works for native macOS windows whose wids stay stable)
@@ -2872,7 +2890,8 @@ class Windows {
         for (index, window) in list.enumerated() {
             window.lastFocusOrder = index
         }
-        Diagnostics.log("ORDER", "restored persisted focus order matched=\(ordered.count)/\(stored.count) total=\(list.count) tier1Wid=\(matchTier[1] ?? 0) tier2Title=\(matchTier[2] ?? 0) tier3Geom=\(matchTier[3] ?? 0)")
+        restoredPersistedFocusOrder = true
+        Diagnostics.log("ORDER", "restored persisted focus order liveFirst=\(liveFocused.count) matched=\(ordered.count - liveFocused.count)/\(stored.count) total=\(list.count) tier1Wid=\(matchTier[1] ?? 0) tier2Title=\(matchTier[2] ?? 0) tier3Geom=\(matchTier[3] ?? 0)")
         return true
     }
 
@@ -3035,6 +3054,7 @@ class Windows {
     }
 
     static func updateLastFocusOrder(_ focusedWindow: Window) -> [Window]? {
+        noteFocusBeforeRestore(focusedWindow)
         // no need to update the list is the window is already lastFocusOrder 0
         guard focusedWindow.lastFocusOrder != 0 && list.count > 1, let previousFocus = (list.first { $0.lastFocusOrder == 0 }) else {
             prewarmLikelyFocusTargets()
@@ -3053,6 +3073,16 @@ class Windows {
         persistFocusOrder()
         prewarmLikelyFocusTargets()
         return windowsToRefresh
+    }
+
+    /// Only the frontmost app's window counts: initial discovery replays every
+    /// background app's focused window through this path, and treating those
+    /// as focus changes pushed ~27 windows over last session's order.
+    private static func noteFocusBeforeRestore(_ window: Window) {
+        guard !didRestorePersistedFocusOrder,
+              window.application.pid == NSWorkspace.shared.frontmostApplication?.processIdentifier else { return }
+        focusedBeforeRestore.removeAll { $0 === window }
+        focusedBeforeRestore.insert(window, at: 0)
     }
 
     static func prewarmLikelyFocusTargets(limit: Int = 1) {
