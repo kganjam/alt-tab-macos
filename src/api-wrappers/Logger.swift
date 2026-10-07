@@ -1540,7 +1540,9 @@ class Winside {
     private static let helperLauncherExeHostPath = "\(NSHomeDirectory())/.alttab/winside-launcher.exe"
     private static let helperLauncherExeGuestPath = #"\\Mac\Home\.alttab\winside-launcher.exe"#
     private static let statusJsonPath = "\(NSHomeDirectory())/.alttab/winside-status.json"
-    private static let vmName = "Windows 11"
+    private static var vmName: String { UserDefaults.standard.string(forKey: "winsideVmName") ?? "Windows 11" }
+    private static let prlctlPath = "/usr/local/bin/prlctl"
+    private static let launchLogPath = "/tmp/alttab-winside-launch.log"
     /// Serial queue so concurrent commands don't trample each other's
     /// stdin/stdout (we use one-shot Process invocations).
     private static let queue = DispatchQueue(label: "alttab.winside", qos: .utility)
@@ -1548,6 +1550,28 @@ class Winside {
     private static let startupQueue = DispatchQueue(label: "alttab.winside.startup", qos: .utility)
     private static var lastKnownIp: String?
     private static var startupInProgress = false
+    /// A failed startup must be retried: at login the VM is often still booting
+    /// (`prlctl exec` → PRL_ERR_IO_STOPPED), and `recordFailure` ignores every
+    /// failure until the first successful round-trip, so nothing else would ever
+    /// relaunch the helper. Observed 2026-10-07: helper down for 4h after boot;
+    /// every guest→guest switch raised the target on the Mac while the Windows
+    /// foreground — and with it all keyboard/mouse input — stayed on the source.
+    /// All startup state below is owned by `startupQueue`.
+    private static let startupRetryInitialDelaySec: Double = 15
+    private static let startupRetryMaxDelaySec: Double = 300
+    private static var startupRetryDelaySec = startupRetryInitialDelaySec
+    private static var startupRetryScheduled = false
+    /// Minimum gap between a finished startup and an on-demand one triggered by
+    /// a focus command the helper didn't answer.
+    private static let ensureMinIntervalSec: Double = 30
+    private static var lastStartupFinishedAt: CFAbsoluteTime = 0
+    /// Periodic PING so a helper that dies between switches is relaunched before
+    /// the next guest→guest switch has to fail to notice.
+    private static let healthCheckIntervalSec: Double = 30
+    private static var healthCheckScheduled = false
+    /// A wedged listener also shows as LISTENING, so when a firewall repair didn't
+    /// restore reachability, the next startup kills + relaunches instead.
+    private static var lastRepairFailed = false
 
     static var isEnabled: Bool {
         if UserDefaults.standard.object(forKey: defaultsEnabledKey) == nil { return true }
@@ -1588,39 +1612,21 @@ class Winside {
         return lastKnownIp
     }
 
-    /// Persistent TCP socket file descriptor (-1 = no connection).
-    /// All access goes through the serial queue, so no extra locking
-    /// needed for the fd itself, but `connectIfNeeded` and `closeSocket`
-    /// must run on `queue` too.
-    private static var socketFd: Int32 = -1
-    /// Counts consecutive sendOverSocket failures since last success.
-    /// 3 in a row → declare the helper hung, kill it, re-launch.
+    /// Counts consecutive command failures since the last success.
+    /// 3 in a row → declare the helper hung and re-run startup.
     /// Real-world failure mode (observed 2026-05-01): helper
     /// process is alive in the guest but TCP listener is wedged
     /// after ~25 hours uptime. Without auto-restart, all SET calls
     /// silently no-op until AltTab is manually restarted.
     private static var consecutiveFailures: Int = 0
     private static let failureThreshold = 3
-    /// Suppress recursive auto-restart attempts.
-    private static var restartInProgress = false
     /// We only treat failures as "the helper hung" once we've actually
-    /// seen one successful round-trip. Without this gate, the startup
-    /// probe loop (which legitimately fails until the helper is up)
-    /// instantly trips the restart logic and kills the helper we just
-    /// launched.
+    /// seen one successful round-trip with the current helper. Without this
+    /// gate, the startup probe loop (which legitimately fails until the
+    /// helper is up) instantly trips the restart logic and kills the helper
+    /// we just launched. Reset on every launch.
     private static var everConnected = false
 
-    private static func closeSocket(_ reason: String = "") {
-        if socketFd >= 0 {
-            close(socketFd)
-            Diagnostics.log("WINSIDE", "socket closed\(reason.isEmpty ? "" : ": \(reason)")")
-            socketFd = -1
-        }
-    }
-
-    /// Open a persistent TCP socket to the helper. Returns true on
-    /// success. Caller must be on `queue`. Idempotent: returns true
-    /// quickly if socket is already open.
     private static func connectWithTimeout(_ fd: Int32, address: inout sockaddr_in, timeoutMs: Int) -> Int32? {
         let flags = fcntl(fd, F_GETFL, 0)
         if flags >= 0 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
@@ -1656,169 +1662,30 @@ class Winside {
         return socketError == 0 ? nil : socketError
     }
 
-    private static func connectIfNeeded() -> Bool {
-        if socketFd >= 0 { return true }
-        guard let ip = readStatusIp() else { return false }
-        let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
-        guard fd >= 0 else {
-            Diagnostics.log("WINSIDE", "socket() failed: errno=\(errno)")
-            return false
-        }
-        // SO_NOSIGPIPE: writing to a half-closed socket raises SIGPIPE
-        // and kills the process with no crash report. We observed
-        // this — AltTab vanished mid-alt-tab when the Winside helper
-        // had hung, leaving no log past the focus's manualUpdate.
-        // Mac doesn't have MSG_NOSIGNAL, so this is the per-socket
-        // way to suppress.
-        var noSigPipe: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
-        // Keep the persistent command socket fail-fast. LIST no longer
-        // uses this path first, so a stale socket must not block the
-        // focus-command queue for the old 5s multiline timeout.
-        var tv = timeval(tv_sec: 1, tv_usec: 0)
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        // TCP_NODELAY for low latency (small commands).
-        var one: Int32 = 1
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
-        var addr = sockaddr_in()
-        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = in_port_t(UInt16(port).bigEndian)
-        addr.sin_addr.s_addr = inet_addr(ip)
-        if let error = connectWithTimeout(fd, address: &addr, timeoutMs: 1000) {
-            Diagnostics.log("WINSIDE", "connect(\(ip):\(port)) failed: errno=\(error)")
-            close(fd)
-            return false
-        }
-        socketFd = fd
-        Diagnostics.log("WINSIDE", "socket opened to \(ip):\(port) fd=\(fd)")
-        return true
-    }
-
-    /// Send `cmd\n` over the persistent socket and read one line back.
-    /// For multi-line responses (LIST), reads until "END\n" sentinel
-    /// or terminator-pattern timeout.
-    /// Returns nil on socket error; closes socket so next call reconnects.
-    /// Multi-line aware via `expectMultiline` flag.
-    private static func sendOverSocket(_ cmd: String, expectMultiline: Bool = false) -> String? {
-        if !connectIfNeeded() { return nil }
-        let payload = (cmd + "\n").data(using: .utf8)!
-        let written = payload.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int in
-            return Darwin.send(socketFd, raw.baseAddress, payload.count, 0)
-        }
-        if written != payload.count {
-            closeSocket("send failed errno=\(errno)")
-            return nil
-        }
-        // Read until we see a complete response. For most commands
-        // that's one line. For LIST we keep reading until "END\n".
-        var buf = [UInt8](repeating: 0, count: 4096)
-        var accumulated = Data()
-        while true {
-            let n = recv(socketFd, &buf, buf.count, 0)
-            if n <= 0 {
-                closeSocket("recv n=\(n) errno=\(errno)")
-                return nil
-            }
-            accumulated.append(contentsOf: buf[0..<n])
-            if !expectMultiline {
-                // First newline ends single-line responses.
-                if accumulated.contains(0x0A) { break }
-            } else {
-                // LIST ends with a sentinel line "END\n" (or "END\r\n"
-                // because the helper uses StreamWriter.WriteLine which
-                // emits CRLF). Match it as a COMPLETE LINE — bracketed
-                // by newlines on both sides — so a window title that
-                // happens to contain literal "END" doesn't trigger a
-                // false-positive end-of-response.
-                if let s = String(data: accumulated, encoding: .utf8),
-                   s.contains("\nEND\n") || s.contains("\nEND\r\n") || s.hasPrefix("END\n") || s.hasPrefix("END\r\n") {
-                    break
-                }
-            }
-            if accumulated.count > 1_000_000 {
-                closeSocket("response too large")
-                return nil
-            }
-        }
-        let s = String(data: accumulated, encoding: .utf8) ?? ""
-        return s.trimmingCharacters(in: CharacterSet(charactersIn: "\r\n \u{FEFF}"))
-    }
-
-    /// Synchronous command. Tries persistent socket first; falls back to
-    /// one-shot nc spawn if socket isn't available. Internal — caller
-    /// must be on `queue`. Tracks consecutive failures and triggers
-    /// helper restart when the threshold is hit.
-    private static func sendCommandSync(_ cmd: String, timeoutSeconds: Int = 2) -> String? {
-        let multiline = (cmd == "LIST")
-        if multiline, let resp = sendCommandViaNetcat(cmd, timeoutSeconds: timeoutSeconds) {
-            consecutiveFailures = 0
-            everConnected = true
-            return resp
-        }
-        // Try the persistent socket first. ~50x faster than spawning nc.
-        if let resp = sendOverSocket(cmd, expectMultiline: multiline) {
-            consecutiveFailures = 0
-            everConnected = true
-            return resp
-        }
-        // Socket path failed (or no IP yet). Fall back to nc one-shot.
-        guard let resp = sendCommandViaNetcat(cmd, timeoutSeconds: timeoutSeconds) else { return nil }
-        consecutiveFailures = 0
-        everConnected = true
-        return resp
-    }
-
-    private static func sendCommandViaNetcat(_ cmd: String, timeoutSeconds: Int) -> String? {
-        guard let ip = readStatusIp() else {
-            recordFailure(reason: "no status file")
-            return nil
-        }
-        let task = Process()
-        task.launchPath = "/bin/sh"
-        task.arguments = ["-c", "printf '%s\\n' '\(cmd)' | /usr/bin/nc -w \(timeoutSeconds) \(ip) \(port)"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-        task.launch()
-        task.waitUntilExit()
-        guard task.terminationStatus == 0 else {
-            recordFailure(reason: "nc exit \(task.terminationStatus)")
-            return nil
-        }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let resp = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: CharacterSet(charactersIn: "\r\n \u{FEFF}"))
-        if resp == nil || resp?.isEmpty == true {
-            recordFailure(reason: "empty nc response")
-            return nil
-        }
-        return resp
-    }
-
-    private static func sendOneShotCommandSync(_ cmd: String, timeoutMs: Int) -> String? {
+    /// One command per connection: connect, send, read the reply, close — each
+    /// step under a hard deadline. The helper serves one client at a time (it
+    /// reads a connection until the client closes or idles 5s), so a held-open
+    /// connection stalls every other command; and `nc -w` does not bound a
+    /// connect whose SYN is dropped, which made each command hang ~75s while
+    /// the helper was down. Connect gets at most 500ms: the guest kernel accepts
+    /// into the backlog even while the helper is busy, so a slower connect means
+    /// nothing is listening. Multiline replies (LIST) end with an "END" line.
+    private static func request(_ cmd: String, timeoutMs: Int) -> String? {
         guard let ip = readStatusIp() else { return nil }
         let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard fd >= 0 else {
-            Diagnostics.log("WINSIDE", "one-shot socket() failed: errno=\(errno)")
+            Diagnostics.log("WINSIDE", "socket() failed: errno=\(errno)")
             return nil
         }
         defer { close(fd) }
-        var noSigPipe: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
-        var tv = timeval(tv_sec: timeoutMs / 1000, tv_usec: Int32((timeoutMs % 1000) * 1000))
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        var one: Int32 = 1
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
+        configureSocket(fd, timeoutMs: timeoutMs)
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = in_port_t(UInt16(port).bigEndian)
         addr.sin_addr.s_addr = inet_addr(ip)
-        if let error = connectWithTimeout(fd, address: &addr, timeoutMs: timeoutMs) {
-            Diagnostics.log("WINSIDE", "one-shot connect(\(ip):\(port)) failed: errno=\(error)")
+        if let error = connectWithTimeout(fd, address: &addr, timeoutMs: min(timeoutMs, 500)) {
+            Diagnostics.log("WINSIDE", "connect(\(ip):\(port)) for \(cmd.prefix(10)) failed: errno=\(error)")
             return nil
         }
         let payload = (cmd + "\n").data(using: .utf8)!
@@ -1826,65 +1693,82 @@ class Winside {
             Darwin.send(fd, raw.baseAddress, payload.count, 0)
         }
         guard written == payload.count else {
-            Diagnostics.log("WINSIDE", "one-shot send failed: errno=\(errno)")
+            Diagnostics.log("WINSIDE", "send \(cmd.prefix(10)) failed: errno=\(errno)")
             return nil
         }
+        return readReply(fd, multiline: cmd == "LIST", deadline: CFAbsoluteTimeGetCurrent() + Double(timeoutMs) / 1000)
+    }
+
+    private static func configureSocket(_ fd: Int32, timeoutMs: Int) {
+        // SO_NOSIGPIPE: writing to a half-closed socket raises SIGPIPE and kills
+        // the process with no crash report (AltTab once vanished mid-switch).
+        var noSigPipe: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        var tv = timeval(tv_sec: timeoutMs / 1000, tv_usec: Int32((timeoutMs % 1000) * 1000))
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var one: Int32 = 1
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
+    }
+
+    private static func readReply(_ fd: Int32, multiline: Bool, deadline: CFAbsoluteTime) -> String? {
         var buf = [UInt8](repeating: 0, count: 4096)
         var accumulated = Data()
-        while true {
+        while !replyIsComplete(accumulated, multiline: multiline) {
+            guard CFAbsoluteTimeGetCurrent() < deadline, accumulated.count <= 1_000_000 else { return nil }
             let n = recv(fd, &buf, buf.count, 0)
             guard n > 0 else { return nil }
             accumulated.append(contentsOf: buf[0..<n])
-            if accumulated.contains(0x0A) { break }
-            if accumulated.count > 16_384 { return nil }
         }
         return (String(data: accumulated, encoding: .utf8) ?? "")
             .trimmingCharacters(in: CharacterSet(charactersIn: "\r\n \u{FEFF}"))
     }
 
-    /// Bump the failure counter. After `failureThreshold` consecutive
-    /// failures, declare the helper hung and re-launch it. Caller must
-    /// be on `queue`.
-    /// Only counts failures AFTER we've had at least one successful
-    /// round-trip — startup probes shouldn't trigger restart.
-    private static func recordFailure(reason: String) {
-        guard everConnected else {
-            // Pre-first-success: silently swallow. The startup probe
-            // loop in startIfNeeded handles its own retry cadence.
-            return
+    /// Single-line replies end at the first newline. LIST ends with "END" as a
+    /// COMPLETE line (the helper's WriteLine emits CRLF), so a window title
+    /// containing "END" can't end the reply early.
+    private static func replyIsComplete(_ data: Data, multiline: Bool) -> Bool {
+        guard multiline else { return data.contains(0x0A) }
+        guard let s = String(data: data, encoding: .utf8) else { return false }
+        return s.contains("\nEND\n") || s.contains("\nEND\r\n") || s.hasPrefix("END\n") || s.hasPrefix("END\r\n")
+    }
+
+    /// Command with failure accounting. Caller must be on `queue`.
+    private static func sendCommandSync(_ cmd: String, timeoutSeconds: Int = 2) -> String? {
+        guard let resp = request(cmd, timeoutMs: timeoutSeconds * 1000) else {
+            recordFailure(reason: "\(cmd.prefix(10)) got no reply")
+            return nil
         }
+        consecutiveFailures = 0
+        everConnected = true
+        return resp
+    }
+
+    /// Bump the failure counter. After `failureThreshold` consecutive
+    /// failures, hand the helper back to the startup path, which tells a dead
+    /// or wedged helper (kill + relaunch) from a firewalled one (repair) and
+    /// retries until it answers. Caller must be on `queue`.
+    /// Only counts failures AFTER a successful round-trip with the current
+    /// helper — startup probes shouldn't trigger restart.
+    private static func recordFailure(reason: String) {
+        guard everConnected else { return }
         consecutiveFailures += 1
         Diagnostics.log("WINSIDE", "command failure #\(consecutiveFailures): \(reason)")
-        guard consecutiveFailures >= failureThreshold, !restartInProgress else { return }
-        restartInProgress = true
-        // Distinguish a dead helper from a reachable-but-blocked one. If the helper
-        // is actually LISTENING in the guest, the host→guest path is blocked — almost
-        // always the guest Windows Firewall after the Parallels network reclassified
-        // to the Public profile (errno=60/ETIMEDOUT on connect, not 61/refused).
-        // Killing + relaunching is futile then: it just churns a working listener
-        // every few minutes. Detect it, warn with the fix, and optionally self-repair.
-        if guestHelperIsListening() {
-            Diagnostics.log("WINSIDE", "helper IS listening in guest on \(port) but unreachable from host after \(consecutiveFailures) failures — guest firewall is blocking inbound (Parallels network profile likely Public). Skipping the futile kill/restart.")
-            if RuntimeFlags.winsideAutoRepairGuestConnectivity {
-                startupQueue.async {
-                    repairGuestConnectivity()
-                    queue.async { consecutiveFailures = 0; restartInProgress = false }
-                }
-            } else {
-                Diagnostics.log("WINSIDE", "auto-repair disabled (winsideAutoRepairGuestConnectivity=false); fix in guest as admin: set network Private, and `netsh advfirewall firewall add rule name=AltTabWinside\(port) dir=in action=allow protocol=TCP localport=\(port) profile=any`.")
-                consecutiveFailures = 0
-                restartInProgress = false
-            }
+        guard consecutiveFailures >= failureThreshold else { return }
+        Diagnostics.log("WINSIDE", "helper unresponsive after \(consecutiveFailures) failures; re-running startup")
+        everConnected = false
+        consecutiveFailures = 0
+        startIfNeeded()
+    }
+
+    /// The helper is LISTENING in the guest but the host can't reach it: the guest
+    /// firewall, after the network reclassified to Public. Relaunching is futile.
+    private static func repairUnreachableHelper() {
+        guard RuntimeFlags.winsideAutoRepairGuestConnectivity else {
+            Diagnostics.log("WINSIDE", "auto-repair disabled (winsideAutoRepairGuestConnectivity=false); fix in guest as admin: set network Private, and `netsh advfirewall firewall add rule name=AltTabWinside\(port) dir=in action=allow protocol=TCP localport=\(port) profile=any`.")
             return
         }
-        Diagnostics.log("WINSIDE", "helper appears hung (\(consecutiveFailures) failures); killing + restarting")
-        closeSocket("auto-restart")
-        killHelperInGuest(reason: "auto-restart after \(consecutiveFailures) failures")
-        consecutiveFailures = 0
-        restartInProgress = false
-        // Re-launch via the public path so probe + log fire normally.
-        // Done from `queue.async` so we don't recurse on the queue.
-        queue.async { startInternal() }
+        repairGuestConnectivity()
     }
 
     /// Run a one-off command in the guest via `prlctl exec` and capture its
@@ -1919,7 +1803,7 @@ class Winside {
         var args = ["exec", vmName]
         if !elevated { args.append("--current-user") }
         args.append(contentsOf: guestArgs)
-        return runProcessCapturing("/usr/local/bin/prlctl", args, timeoutSec: timeoutSec)
+        return runProcessCapturing(prlctlPath, args, timeoutSec: timeoutSec)
     }
 
     /// The host's IPv4 on the Parallels Shared network — the only address the
@@ -1967,109 +1851,181 @@ class Winside {
         Diagnostics.log("WINSIDE", "auto-repair: done; next winside connect will confirm host reachability")
     }
 
-    /// Internal launcher (no enable-check, no probe). Used by both
-    /// startIfNeeded and the auto-restart path.
-    private static func startInternal() {
-        ensureHelperScriptOnDisk()
-        Diagnostics.log("WINSIDE", "startInternal: launching helper via prlctl exec")
-        let task = Process()
-        task.launchPath = "/bin/sh"
-        task.arguments = ["-c", helperLaunchCommand()]
-        task.launch()
-        task.waitUntilExit()
-    }
-
     private static func helperLaunchCommand() -> String {
         let useNativeLauncher = UserDefaults.standard.bool(forKey: useNativeLauncherKey)
             && FileManager.default.fileExists(atPath: helperLauncherExeHostPath)
         let prefix = useNativeLauncher ? "'\(helperLauncherExeGuestPath)'" : "wscript.exe '\(helperLauncherGuestPath)'"
-        return "nohup /usr/local/bin/prlctl exec '\(vmName)' --current-user \(prefix) '\(helperScriptGuestPath)' >/tmp/alttab-winside-launch.log 2>&1 &"
+        return "nohup \(prlctlPath) exec '\(vmName)' --current-user \(prefix) '\(helperScriptGuestPath)' >\(launchLogPath) 2>&1 &"
     }
 
-    /// True if helper responds to PING within `timeoutSeconds`.
-    static func isReady(timeoutSeconds: Int = 2) -> Bool {
+    /// The health check: the helper is working iff it answers PING within
+    /// `timeoutSeconds` on a fresh connection.
+    static func isReady(timeoutSeconds: Int = 1) -> Bool {
         return queue.sync {
             guard let resp = sendCommandSync("PING", timeoutSeconds: timeoutSeconds) else { return false }
             return resp.hasPrefix("PONG")
         }
     }
 
-    /// Launch the helper inside the guest if not already healthy.
-    /// Asynchronous; returns immediately.
+    /// Launch the helper inside the guest if not already healthy, retrying with
+    /// backoff until it answers. Asynchronous; returns immediately.
     static func startIfNeeded() {
         guard isEnabled else {
             Diagnostics.log("WINSIDE", "startIfNeeded: disabled in prefs, skipping")
             return
         }
+        startupQueue.async { runStartup() }
+    }
+
+    /// Focus commands call this when the helper didn't answer. Startup returns
+    /// after one PING when the helper is actually healthy, and the rate limit
+    /// keeps a burst of failed switches to a single probe.
+    static func ensureRunningAsync(reason: String) {
+        guard isEnabled else { return }
         startupQueue.async {
-            guard !startupInProgress else { return }
-            startupInProgress = true
-            defer { startupInProgress = false }
-            // Make sure ~/.alttab and the helper/launcher/kill scripts exist.
-            let helperChanged = ensureHelperScriptOnDisk()
-            if FileManager.default.fileExists(atPath: helperStatusHostPath) {
-                if helperChanged {
-                    Diagnostics.log("WINSIDE", "startIfNeeded: helper script changed — killing prior helper")
-                    queue.sync { closeSocket("helper script changed") }
-                    killHelperInGuest(reason: "helper script changed")
-                } else {
-                    let healthy = queue.sync { sendCommandSync("PING", timeoutSeconds: 1)?.hasPrefix("PONG") == true }
-                    if healthy {
-                        Diagnostics.log("WINSIDE", "startIfNeeded: existing helper is healthy at \(lastKnownIp ?? "?"):\(port)")
-                        return
-                    }
-                    Diagnostics.log("WINSIDE", "startIfNeeded: stale status file at startup — killing prior helper")
-                    killHelperInGuest(reason: "stale status from prior AltTab")
-                }
-            }
-            Diagnostics.log("WINSIDE", "startIfNeeded: launching helper via prlctl exec")
-            let task = Process()
-            task.launchPath = "/bin/sh"
-            // Fire-and-forget. The helper is a long-running PS process;
-            // we don't waitUntilExit. `nohup` + `&` so the prlctl exec
-            // call returns immediately.
-            task.arguments = ["-c", helperLaunchCommand()]
-            task.launch()
-            task.waitUntilExit()  // wait only for the shell, not the prlctl
-            // Probe up to 60s. Cold-start budget covers:
-            //   prlctl exec connection (~5-10s)
-            //   PowerShell -ExecutionPolicy Bypass cold start (~5-10s)
-            //   Add-Type JIT compilation (~5-15s on first run)
-            //   listener bind (~instant)
-            // Subsequent runs are faster (warm caches), but we
-            // intentionally don't tighten the budget: the cost of
-            // waiting longer is just log noise; the cost of giving up
-            // too early is the focus path can't use the helper at all.
-            // Log a heartbeat every 5s so the user sees we're still
-            // waiting.
-            let totalSeconds = 60
-            let pollIntervalSec = 0.5
-            let polls = Int(Double(totalSeconds) / pollIntervalSec)
-            var lastHeartbeat = 0
-            for attempt in 1...polls {
-                Thread.sleep(forTimeInterval: pollIntervalSec)
-                guard readStatusIp() != nil else {
-                    let elapsedSec = Int(Double(attempt) * pollIntervalSec)
-                    if elapsedSec >= lastHeartbeat + 5 {
-                        Diagnostics.log("WINSIDE", "startIfNeeded: waiting for status at \(elapsedSec)s (cold-start budget = \(totalSeconds)s)")
-                        lastHeartbeat = elapsedSec
-                    }
-                    continue
-                }
-                let ready = queue.sync { sendCommandSync("PING", timeoutSeconds: 1)?.hasPrefix("PONG") == true }
-                if ready {
-                    let elapsedMs = Int(Double(attempt) * pollIntervalSec * 1000)
-                    Diagnostics.log("WINSIDE", "startIfNeeded: helper ready after \(elapsedMs)ms at \(lastKnownIp ?? "?"):\(port)")
-                    return
-                }
-                let elapsedSec = Int(Double(attempt) * pollIntervalSec)
-                if elapsedSec >= lastHeartbeat + 5 {
-                    Diagnostics.log("WINSIDE", "startIfNeeded: still waiting at \(elapsedSec)s (cold-start budget = \(totalSeconds)s)")
-                    lastHeartbeat = elapsedSec
-                }
-            }
-            Diagnostics.log("WINSIDE", "startIfNeeded: helper did NOT respond to PING within \(totalSeconds)s — see /tmp/alttab-winside-launch.log")
+            guard CFAbsoluteTimeGetCurrent() - lastStartupFinishedAt >= ensureMinIntervalSec else { return }
+            Diagnostics.log("WINSIDE", "ensureRunning: \(reason) — re-checking helper")
+            runStartup()
         }
+    }
+
+    private static func runStartup() {
+        guard !startupInProgress else { return }
+        guard FileManager.default.isExecutableFile(atPath: prlctlPath) else {
+            Diagnostics.log("WINSIDE", "startIfNeeded: \(prlctlPath) not found; Parallels not installed, not starting helper")
+            return
+        }
+        startupInProgress = true
+        defer {
+            startupInProgress = false
+            lastStartupFinishedAt = CFAbsoluteTimeGetCurrent()
+        }
+        guard startHelper() else {
+            scheduleStartupRetry()
+            return
+        }
+        startupRetryDelaySec = startupRetryInitialDelaySec
+        scheduleHealthCheck()
+    }
+
+    private static func scheduleHealthCheck() {
+        guard !healthCheckScheduled else { return }
+        healthCheckScheduled = true
+        startupQueue.asyncAfter(deadline: .now() + healthCheckIntervalSec) {
+            healthCheckScheduled = false
+            guard isEnabled, !startupRetryScheduled else { return }
+            guard !isReady(timeoutSeconds: 1) else {
+                scheduleHealthCheck()
+                return
+            }
+            Diagnostics.log("WINSIDE", "health check: helper not answering — re-running startup")
+            runStartup()
+        }
+    }
+
+    private static func scheduleStartupRetry() {
+        guard !startupRetryScheduled else { return }
+        startupRetryScheduled = true
+        let delay = startupRetryDelaySec
+        startupRetryDelaySec = min(delay * 2, startupRetryMaxDelaySec)
+        Diagnostics.log("WINSIDE", "startIfNeeded: helper not ready — retrying in \(Int(delay))s")
+        startupQueue.asyncAfter(deadline: .now() + delay) {
+            startupRetryScheduled = false
+            startIfNeeded()
+        }
+    }
+
+    /// One startup attempt; true once the helper answers PING.
+    private static func startHelper() -> Bool {
+        let helperChanged = ensureHelperScriptOnDisk()
+        if FileManager.default.fileExists(atPath: helperStatusHostPath) {
+            if helperChanged {
+                Diagnostics.log("WINSIDE", "startIfNeeded: helper script changed — killing prior helper")
+                killHelperInGuest(reason: "helper script changed")
+            } else {
+                if isReady(timeoutSeconds: 1) {
+                    Diagnostics.log("WINSIDE", "startIfNeeded: existing helper is healthy at \(lastKnownIp ?? "?"):\(port)")
+                    return true
+                }
+                if !lastRepairFailed, guestHelperIsListening() {
+                    Diagnostics.log("WINSIDE", "startIfNeeded: helper is listening in guest but unreachable — repairing guest firewall instead of killing it")
+                    repairUnreachableHelper()
+                    lastRepairFailed = !isReady(timeoutSeconds: 1)
+                    return !lastRepairFailed
+                }
+                lastRepairFailed = false
+                Diagnostics.log("WINSIDE", "startIfNeeded: stale status file — killing prior helper")
+                killHelperInGuest(reason: "stale status")
+            }
+        }
+        guard let vmStatus = runProcessCapturing(prlctlPath, ["status", vmName], timeoutSec: 10), vmStatus.hasSuffix(" running") else {
+            Diagnostics.log("WINSIDE", "startIfNeeded: VM '\(vmName)' not running")
+            return false
+        }
+        return launchAndAwaitHelper()
+    }
+
+    /// Probe up to 60s. Cold-start budget covers:
+    ///   prlctl exec connection (~5-10s)
+    ///   PowerShell -ExecutionPolicy Bypass cold start (~5-10s)
+    ///   Add-Type JIT compilation (~5-15s on first run)
+    ///   listener bind (~instant)
+    /// A `prlctl exec` error (e.g. PRL_ERR_IO_STOPPED while the VM boots) ends
+    /// the attempt early so the retry comes sooner.
+    private static func launchAndAwaitHelper() -> Bool {
+        Diagnostics.log("WINSIDE", "startIfNeeded: launching helper via prlctl exec")
+        queue.sync {
+            everConnected = false
+            consecutiveFailures = 0
+        }
+        try? FileManager.default.removeItem(atPath: launchLogPath)
+        let task = Process()
+        task.launchPath = "/bin/sh"
+        // Fire-and-forget: wait only for the shell, not the backgrounded prlctl.
+        task.arguments = ["-c", helperLaunchCommand()]
+        task.launch()
+        task.waitUntilExit()
+        let totalSeconds = 60.0
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        var lastHeartbeat = 0
+        while CFAbsoluteTimeGetCurrent() - startedAt < totalSeconds {
+            Thread.sleep(forTimeInterval: 0.5)
+            let elapsed = CFAbsoluteTimeGetCurrent() - startedAt
+            if let error = launchError() {
+                Diagnostics.log("WINSIDE", "startIfNeeded: prlctl exec failed after \(Int(elapsed))s: \(error)")
+                return false
+            }
+            let hasStatus = readStatusIp() != nil
+            if hasStatus, isReady(timeoutSeconds: 1) {
+                Diagnostics.log("WINSIDE", "startIfNeeded: helper ready after \(Int(elapsed * 1000))ms at \(lastKnownIp ?? "?"):\(port)")
+                return true
+            }
+            if Int(elapsed) >= lastHeartbeat + 5 {
+                lastHeartbeat = Int(elapsed)
+                Diagnostics.log("WINSIDE", "startIfNeeded: \(hasStatus ? "still waiting for PONG" : "waiting for status") at \(lastHeartbeat)s (cold-start budget = \(Int(totalSeconds))s)")
+            }
+        }
+        Diagnostics.log("WINSIDE", "startIfNeeded: helper did NOT respond to PING within \(Int(totalSeconds))s — see \(launchLogPath)")
+        killOrphanHoldingPort()
+        return false
+    }
+
+    /// A helper that lost its status file still holds the port, so every new
+    /// helper fails to bind and exits before writing status. Clear it so the
+    /// next attempt can start.
+    private static func killOrphanHoldingPort() {
+        guard !FileManager.default.fileExists(atPath: helperStatusHostPath), guestHelperIsListening() else { return }
+        Diagnostics.log("WINSIDE", "startIfNeeded: port \(port) held in guest by a helper without status — killing it")
+        killHelperInGuest(reason: "orphan holding port")
+    }
+
+    /// Error text `prlctl exec` wrote to the launch log. The launchers print
+    /// nothing on success.
+    private static func launchError() -> String? {
+        guard let log = try? String(contentsOfFile: launchLogPath, encoding: .utf8) else { return nil }
+        let text = log.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.contains("PRL_ERR") || text.hasPrefix("Failed") || text.hasPrefix("Error") else { return nil }
+        return String(text.prefix(200))
     }
 
     /// Called from applicationWillTerminate. Always kills the helper
@@ -2077,15 +2033,21 @@ class Winside {
     /// behind. With the native .exe launcher in place, the next AltTab
     /// launch spawns a fresh helper without any visible window flash,
     /// so kill-on-exit costs nothing visually.
+    /// Without a status file there is no helper to stop, and the kill fallback
+    /// must not run: its 3s local timeout abandons a kill that keeps running in
+    /// the guest and lands on the helper the NEXT AltTab launches (observed
+    /// 2026-10-07 on a dev relaunch: new helper ready at +1.6s, then killed).
     static func stop() {
+        guard FileManager.default.fileExists(atPath: helperStatusHostPath) else {
+            Diagnostics.log("WINSIDE", "stop: no helper status file; nothing to stop")
+            return
+        }
         queue.sync {
             if let resp = sendCommandSync("EXIT", timeoutSeconds: 2) {
                 Diagnostics.log("WINSIDE", "stop: helper acknowledged → \(resp)")
-                closeSocket("after EXIT ack")
                 try? FileManager.default.removeItem(atPath: helperStatusHostPath)
                 return
             }
-            closeSocket("after EXIT failure")
             Diagnostics.log("WINSIDE", "stop: EXIT failed; falling back to precise kill")
             killHelperInGuest(reason: "EXIT-failed fallback", timeoutSeconds: 3)
         }
@@ -2208,11 +2170,11 @@ class Winside {
         guard remainingMs > 50 else {
             return ForegroundResult(ok: false, hwnd: nil, reason: "stale-before-settitle age=\(ageMs)ms", elapsedMs: Double(ageMs), listMs: 0, setMs: 0)
         }
-        queue.async { closeSocket("focus SETTITLE one-shot") }
         let setStartedAt = CFAbsoluteTimeGetCurrent()
         let timeoutMs = max(50, min(remainingMs, RuntimeFlags.parGuestPrefocusMaxAgeMs, 350))
-        guard let resp = sendOneShotCommandSync("SETTITLE64 \(encoded)", timeoutMs: timeoutMs) else {
+        guard let resp = request("SETTITLE64 \(encoded)", timeoutMs: timeoutMs) else {
             Diagnostics.log("WINSIDE", "SETTITLE \(label): no response for title='\(needle.prefix(40))'")
+            ensureRunningAsync(reason: "SETTITLE no response")
             return ForegroundResult(ok: false, hwnd: nil, reason: "settitle-no-response", elapsedMs: (CFAbsoluteTimeGetCurrent() - queuedAt) * 1000, listMs: 0, setMs: (CFAbsoluteTimeGetCurrent() - setStartedAt) * 1000)
         }
         if resp.hasPrefix("ERR unknown") { return nil }
@@ -2396,7 +2358,7 @@ class Winside {
             : "wscript.exe '\(helperLauncherGuestPath)'"
         task.arguments = [
             "-c",
-            "/usr/local/bin/prlctl exec '\(vmName)' --current-user \(prefix) '\(helperKillerGuestPath)' wait 2>/tmp/alttab-winside-kill.log",
+            "\(prlctlPath) exec '\(vmName)' --current-user \(prefix) '\(helperKillerGuestPath)' wait 2>/tmp/alttab-winside-kill.log",
         ]
         task.launch()
         let deadline = Date().addingTimeInterval(timeoutSeconds)
