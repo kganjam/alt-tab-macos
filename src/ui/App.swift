@@ -163,6 +163,7 @@ class App: AppCenterApplication {
         altTabFocusSourceInvalidated = false
         sessionFocusCommittedWid = targetWid
         Diagnostics.log("RECENCY", "altTab intent source=#\(sessionSourceWid ?? 0) target=#\(targetWid ?? 0)")
+        KeyWindowSuspects.noteAltTabTarget(targetWid)
     }
 
     static func noteDirectFocusOutsideAltTab(_ wid: CGWindowID?) {

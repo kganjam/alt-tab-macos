@@ -123,6 +123,7 @@ class AccessibilityEvents {
             return
         }
         let (appFocusedWindow, appFocusedWid, appMainWindow, appMainWid) = try currentFocusedOrMainWindow(pid, eventElement: element)
+        KeyWindowSuspects.noteAppFocusedWindow(pid: pid, wid: appFocusedWid)
         if isFocusedOrMainWindowChange(type) {
             DispatchQueue.main.async {
                 guard let app = Applications.findOrCreate(pid, false) else { return }

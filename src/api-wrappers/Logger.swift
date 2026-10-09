@@ -609,7 +609,9 @@ class Diagnostics {
         } else if targetZ != 0 {
             failures.append("targetNotZ0")
         }
-        if let axPid = ax.pid, axPid != targetPid {
+        if ax.pid == nil {
+            failures.append("axUnknown")
+        } else if let axPid = ax.pid, axPid != targetPid {
             failures.append("axPidMismatch")
         }
         if let axWid = ax.wid, ax.pid == targetPid, axWid != targetWid {
@@ -623,7 +625,7 @@ class Diagnostics {
 
     private static func reportableFocusInvariantFailures(_ failures: [String], delayMs: Int?) -> [String] {
         guard let delayMs, delayMs < 1200 else { return failures }
-        return failures.filter { $0 != "targetNotZ0" && $0 != "topPidMismatch" }
+        return failures.filter { $0 != "targetNotZ0" && $0 != "topPidMismatch" && $0 != "axUnknown" }
     }
 
     static func logFrontmostSignals(_ label: String) {

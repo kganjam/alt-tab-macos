@@ -1566,7 +1566,9 @@ class Windows {
             } else {
                 // CGSOrderWindow was dropped by a degraded WindowServer. Escalate
                 // via an independent path, chosen by blocker kind:
-                reassertFrontmostToTarget(targetWid: mostRecent.wid, targetPid: mostRecent.pid, frontPid: nil, source: "ZENFORCE")
+                if window.application.isParallelsCoherence || nativeReassertDue(wid: mostRecent.wid) {
+                    reassertFrontmostToTarget(targetWid: mostRecent.wid, targetPid: mostRecent.pid, frontPid: nil, source: "ZENFORCE")
+                }
                 if window.application.isParallelsCoherence {
                     queueAxRecovery(for: window, wid: mostRecent.wid, pid: mostRecent.pid, attempt: attempt, generation: currentZOrderEnforcementGeneration())
                     Diagnostics.log("ZENFORCE", "wid=\(mostRecent.wid) at z\(targetZPos), focus reassert queued Parallels AX recovery #\(attempt)/\(maxAttempts)")
@@ -1811,6 +1813,7 @@ class Windows {
     /// Only fires while ZENFORCE is active (poll-driven, 200ms cadence).
     private static var lastFrontMismatchLogged: pid_t? = nil
     private static var lastFrontRestoreAt: CFAbsoluteTime = 0
+    private static var lastNativeReassertAt = [CGWindowID: CFAbsoluteTime]()
     private static func diagnoseFrontmostMismatch(targetWid: CGWindowID, targetPid: pid_t, atZ0: Bool) {
         guard atZ0 else { lastFrontMismatchLogged = nil; return }
         let frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
@@ -1869,6 +1872,7 @@ class Windows {
             Diagnostics.log(source, "restore attempt: SLPS(userGenerated)+AX(pid=\(targetPid), wid=\(targetWid)) — was frontmostPid=\(frontPid?.description ?? "nil")")
         }
         let enqueuedAt = CFAbsoluteTimeGetCurrent()
+        let generation = currentZOrderFocusGeneration()
         BackgroundWork.accessibilityCommandsQueue.addOperation { [weak target] in
             guard let target else { return }
             let queueWaitMs = (CFAbsoluteTimeGetCurrent() - enqueuedAt) * 1000
@@ -1877,6 +1881,10 @@ class Windows {
             // if a re-raise lands then, it fought a user action (likely fired late
             // under load; `queueWait` shows how late).
             let clickAfter = Windows.userClickedDifferentWindowSince(enqueuedAt, targetWid: targetWid)
+            if RuntimeFlags.staleAxReassertGuardEnabled, let reason = staleReassertReason(generation: generation, clickAfter: clickAfter) {
+                Diagnostics.log(source, String(format: "queued AX reassert SKIPPED wid=%u queueWait=%.0fms reason=%@", targetWid, queueWaitMs, reason))
+                return
+            }
             Diagnostics.log(source, String(format: "queued AX reassert FIRED wid=%u queueWait=%.0fms clickAfterEnqueue=%@", targetWid, queueWaitMs, clickAfter ? "YES" : "no"))
             if let appAx = target.application.axUiElement, let windowAx = target.axUiElement {
                 AXUIElementSetMessagingTimeout(appAx, 0.05)
@@ -1888,6 +1896,29 @@ class Windows {
             }
             try? target.axUiElement?.focusWindow()
         }
+    }
+
+    /// A late re-raise is a key-window request racing whatever the user did next — the
+    /// way a window ends up with a stale AppKit key bit (KeyWindowSuspects).
+    private static func staleReassertReason(generation: Int64, clickAfter: Bool) -> String? {
+        if !isCurrentZOrderFocusGeneration(generation) { return "newer-switch" }
+        if clickAfter { return "user-clicked-elsewhere" }
+        return nil
+    }
+
+    /// ZENFORCE re-checks every few ms while an activation is still in flight, and
+    /// CGSOrderWindow fails cross-process (err 1000), so without spacing one switch fires
+    /// 4–11 SLPS+AX re-asserts back to back at the target app.
+    private static func nativeReassertDue(wid: CGWindowID) -> Bool {
+        let spacing = Double(RuntimeFlags.zEnforceNativeReassertSpacingMs) / 1000
+        let now = CFAbsoluteTimeGetCurrent()
+        if spacing > 0, let last = lastNativeReassertAt[wid], now - last < spacing {
+            Diagnostics.log("ZENFORCE", String(format: "wid=%u native re-assert spaced (%.0fms since last)", wid, (now - last) * 1000))
+            return false
+        }
+        lastNativeReassertAt = lastNativeReassertAt.filter { now - $0.value < 5 }
+        lastNativeReassertAt[wid] = now
+        return true
     }
 
     /// Restore the correct z-order after a Parallels window close. macOS

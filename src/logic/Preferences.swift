@@ -513,6 +513,16 @@ enum RuntimeFlags {
     static var focusOverlayCaptureEnabled: Bool { bool("focusOverlayCaptureEnabled", default: true) }
     static var zOrderCacheEnabled: Bool { bool("zOrderCacheEnabled", default: true) }
     static var zOrderFixesEnabled: Bool { bool("zOrderFixesEnabled", default: true) }
+    // Phantom key window guard (KeyWindowSuspects): track AltTab targets the app never
+    // confirmed as focused, and repair them with a real key/resign cycle.
+    static var keyWindowSuspectTrackingEnabled: Bool { bool("keyWindowSuspectTrackingEnabled", default: true) }
+    static var keyWindowSuspectRepairEnabled: Bool { bool("keyWindowSuspectRepairEnabled", default: true) }
+    static var keyWindowSuspectRepairDelayMs: Int { int("keyWindowSuspectRepairDelayMs", default: 800) }
+    static var keyWindowSuspectRaiseSettleMs: Int { int("keyWindowSuspectRaiseSettleMs", default: 40) }
+    // Drop queued AX re-asserts once a newer switch or a user click superseded them.
+    static var staleAxReassertGuardEnabled: Bool { bool("staleAxReassertGuardEnabled", default: true) }
+    // Minimum spacing between ZENFORCE re-asserts for one native target (0 = every tick).
+    static var zEnforceNativeReassertSpacingMs: Int { int("zEnforceNativeReassertSpacingMs", default: 200) }
     static var fastZOrderMonitorEnabled: Bool { bool("fastZOrderMonitorEnabled", default: true) }
     static var fastZOrderNativeMonitorEnabled: Bool { bool("fastZOrderNativeMonitorEnabled", default: false) }
     static var fastZOrderMonitorIntervalMs: Int { int("fastZOrderMonitorIntervalMs", default: 25) }
