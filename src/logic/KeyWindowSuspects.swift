@@ -79,10 +79,15 @@ enum KeyWindowSuspects {
             return
         }
         guard userIsIdle() else {
-            if retriesLeft > 0 { scheduleRepair(pid: pid, focusedWid: focusedWid, retriesLeft: retriesLeft - 1) }
+            retryLater(pid: pid, focusedWid: focusedWid, retriesLeft: retriesLeft)
             return
         }
-        repair(pid: pid, focusedWid: focusedWid)
+        repair(pid: pid, focusedWid: focusedWid, retriesLeft: retriesLeft)
+    }
+
+    private static func retryLater(pid: pid_t, focusedWid: CGWindowID, retriesLeft: Int) {
+        guard retriesLeft > 0 else { return }
+        scheduleRepair(pid: pid, focusedWid: focusedWid, retriesLeft: retriesLeft - 1)
     }
 
     private static func repairSkipReason(pid: pid_t, focusedWid: CGWindowID, generation: Int64, scheduledAt: CFAbsoluteTime) -> String? {
@@ -101,25 +106,73 @@ enum KeyWindowSuspects {
         return sinceKey >= 1.5 && NSEvent.pressedMouseButtons == 0
     }
 
-    private static func repair(pid: pid_t, focusedWid: CGWindowID) {
-        let targets = suspects.filter { $0.value == pid && $0.key != focusedWid }.keys.compactMap { wid in Windows.list.first { $0.cgWindowId == wid } }
+    private static func repair(pid: pid_t, focusedWid: CGWindowID, retriesLeft: Int) {
+        let suspectWids = suspects.filter { $0.value == pid && $0.key != focusedWid }.map { $0.key }
+        let targets = suspectWids.compactMap { wid in Windows.list.first { $0.cgWindowId == wid } }
         suspects = suspects.filter { $0.value != pid }
         guard !targets.isEmpty, let back = Windows.list.first(where: { $0.cgWindowId == focusedWid }) else { return }
         lastRepairAt = CFAbsoluteTimeGetCurrent()
-        Diagnostics.log("KEYWIN", "repairing suspects \(targets.compactMap { $0.cgWindowId }) pid=\(pid): raise each, then hand key status back to #\(focusedWid)")
         BackgroundWork.accessibilityCommandsQueue.addOperation {
+            if let busy = appBusyReason(pid: pid, expecting: focusedWid) {
+                DispatchQueue.main.async { requeue(suspectWids, pid: pid, focusedWid: focusedWid, retriesLeft: retriesLeft, reason: busy) }
+                return
+            }
+            Diagnostics.log("KEYWIN", "repairing suspects \(suspectWids) pid=\(pid): raise each, then hand key status back to #\(focusedWid)")
             for window in targets { raise(window) }
-            raise(back)
+            handBack(to: back, pid: pid)
         }
     }
 
+    private static func requeue(_ wids: [CGWindowID], pid: pid_t, focusedWid: CGWindowID, retriesLeft: Int, reason: String) {
+        wids.forEach { suspects[$0] = pid }
+        lastRepairAt = 0
+        Diagnostics.log("KEYWIN", "repair for pid=\(pid) deferred: \(reason)")
+        retryLater(pid: pid, focusedWid: focusedWid, retriesLeft: retriesLeft)
+    }
+
+    /// A backlogged main thread applies AX requests late, out of order with the user's next
+    /// switch — exactly how phantoms form (2026-10-08 21:45: Edge ~3s behind, the hand-back
+    /// raise timed out, landed late, and split key/main across two windows). Only repair
+    /// when the app answers promptly and still reports the window we will hand back to.
+    private static func appBusyReason(pid: pid_t, expecting wid: CGWindowID) -> String? {
+        let probe = focusedWindow(pid: pid, timeout: 0.3)
+        guard let focused = probe.wid else { return String(format: "app unresponsive (probe %.0fms, no focused window)", probe.ms) }
+        if probe.ms > Double(RuntimeFlags.keyWindowSuspectMaxProbeMs) { return String(format: "app busy (probe %.0fms)", probe.ms) }
+        if focused != wid { return "focus moved to #\(focused)" }
+        return nil
+    }
+
+    private static func focusedWindow(pid: pid_t, timeout: Float) -> (wid: CGWindowID?, ms: Double) {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, timeout)
+        let start = CFAbsoluteTimeGetCurrent()
+        var value: AnyObject?
+        let err = AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &value)
+        let ms = (CFAbsoluteTimeGetCurrent() - start) * 1000
+        guard err == .success, let value else { return (nil, ms) }
+        var wid: CGWindowID = 0
+        _ = _AXUIElementGetWindow(value as! AXUIElement, &wid)
+        return (wid == 0 ? nil : wid, ms)
+    }
+
+    private static func handBack(to window: Window, pid: pid_t) {
+        guard let wid = window.cgWindowId else { return }
+        for attempt in 1...2 {
+            raise(window)
+            let focused = focusedWindow(pid: pid, timeout: 1).wid
+            Diagnostics.log("KEYWIN", "hand-back to #\(wid) attempt \(attempt): focused=#\(focused ?? 0)")
+            if focused == wid { return }
+        }
+        Diagnostics.log("ANOMALY", "key-window repair could not hand key status back to #\(wid) pid=\(pid)")
+    }
+
     /// AXRaise is `-[NSWindow makeKeyAndOrderFront:]` in AppKit: a real key transition, so
-    /// the next raise delivers the -resignKeyWindow the suspect missed. The AX call is a
-    /// synchronous round trip to the app's main thread, so the settle can stay short.
+    /// the next raise delivers the -resignKeyWindow the suspect missed. The long timeout
+    /// keeps each raise synchronous: a timed-out raise is still applied later, out of order.
     /// Side effect: the suspect ends up just below the focused window in z-order.
     private static func raise(_ window: Window) {
         guard let element = window.axUiElement else { return }
-        AXUIElementSetMessagingTimeout(element, 0.25)
+        AXUIElementSetMessagingTimeout(element, Float(RuntimeFlags.keyWindowSuspectRaiseTimeoutMs) / 1000)
         let err = AXUIElementPerformAction(element, kAXRaiseAction as CFString)
         Diagnostics.log("KEYWIN", "AXRaise #\(window.cgWindowId ?? 0) err=\(err.rawValue)")
         usleep(UInt32(RuntimeFlags.keyWindowSuspectRaiseSettleMs * 1000))

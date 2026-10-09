@@ -519,6 +519,8 @@ enum RuntimeFlags {
     static var keyWindowSuspectRepairEnabled: Bool { bool("keyWindowSuspectRepairEnabled", default: true) }
     static var keyWindowSuspectRepairDelayMs: Int { int("keyWindowSuspectRepairDelayMs", default: 800) }
     static var keyWindowSuspectRaiseSettleMs: Int { int("keyWindowSuspectRaiseSettleMs", default: 40) }
+    static var keyWindowSuspectRaiseTimeoutMs: Int { int("keyWindowSuspectRaiseTimeoutMs", default: 2000) }
+    static var keyWindowSuspectMaxProbeMs: Int { int("keyWindowSuspectMaxProbeMs", default: 150) }
     // Drop queued AX re-asserts once a newer switch or a user click superseded them.
     static var staleAxReassertGuardEnabled: Bool { bool("staleAxReassertGuardEnabled", default: true) }
     // Minimum spacing between ZENFORCE re-asserts for one native target (0 = every tick).
