@@ -1532,6 +1532,8 @@ class Winside {
     private static let helperKillerHostPath = "\(NSHomeDirectory())/.alttab/winside-kill.ps1"
     private static let helperKillerGuestPath = #"\\Mac\Home\.alttab\winside-kill.ps1"#
     private static let helperStatusHostPath = "\(NSHomeDirectory())/.alttab/winside-status.json"
+    /// Pid the next kill may touch (read by winside-kill.ps1). See killHelperInGuest.
+    private static let helperKillTargetHostPath = "\(NSHomeDirectory())/.alttab/winside-kill-target"
     /// Native Windows GUI-subsystem launcher .exe. Spawns powershell with
     /// CREATE_NO_WINDOW (native flag, neither WSH nor WMI expose it) →
     /// helper has no console at all → Parallels Coherence has no window
@@ -1612,6 +1614,12 @@ class Winside {
             if retries > 1 { Thread.sleep(forTimeInterval: 0.5) }
         }
         return lastKnownIp
+    }
+
+    private static func readStatusPid() -> Int? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: statusJsonPath)),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return obj["pid"] as? Int
     }
 
     /// Counts consecutive command failures since the last success.
@@ -2350,8 +2358,10 @@ class Winside {
     /// terminate the wait early. The kill itself runs to completion in
     /// the guest regardless.
     private static func killHelperInGuest(reason: String, timeoutSeconds: Double = 15) {
-        Diagnostics.log("WINSIDE", "killHelperInGuest (\(reason), timeout=\(timeoutSeconds)s): invoking winside-kill.ps1 (hidden) in '\(vmName)'")
+        let targetPid = readStatusPid()
+        Diagnostics.log("WINSIDE", "killHelperInGuest (\(reason), timeout=\(timeoutSeconds)s, pid=\(targetPid.map(String.init) ?? "any")): invoking winside-kill.ps1 (hidden) in '\(vmName)'")
         ensureHelperScriptOnDisk()
+        writeKillTarget(targetPid)
         let task = Process()
         task.launchPath = "/bin/sh"
         let useExe = FileManager.default.fileExists(atPath: helperLauncherExeHostPath)
@@ -2371,6 +2381,20 @@ class Winside {
             Diagnostics.log("WINSIDE", "killHelperInGuest: prlctl exec exceeded \(timeoutSeconds)s — terminating local wait (kill continues async in guest)")
             task.terminate()
         }
+    }
+
+    /// The kill runs in the guest and can land well after this side's wait gives up
+    /// (prlctl exec is slow under load), i.e. after startIfNeeded has launched the
+    /// replacement. Matching by script path alone then killed the NEW helper and
+    /// deleted its status file. Pinning the kill to the pid from the status file that
+    /// was current when the kill was requested leaves a later helper alone. No pid
+    /// (no status file) keeps the path-only sweep, for orphan cleanup.
+    private static func writeKillTarget(_ pid: Int?) {
+        guard let pid else {
+            try? FileManager.default.removeItem(atPath: helperKillTargetHostPath)
+            return
+        }
+        try? String(pid).write(toFile: helperKillTargetHostPath, atomically: true, encoding: .utf8)
     }
 
     /// Generic VBS runner. Invoked via `wscript.exe` (GUI subsystem, no
@@ -2436,6 +2460,12 @@ class Winside {
         exit $proc.ExitCode
     }
     $expected = '\\Mac\Home\.alttab\winside-helper.ps1'
+    $statusPath = '\\Mac\Home\.alttab\winside-status.json'
+    # AltTab writes the pid of the helper it means to kill. This script can run long
+    # after AltTab launched a replacement helper; without the pin it would kill that
+    # one too. Empty/missing = sweep every helper (orphan cleanup).
+    $targetPid = 0
+    try { $targetPid = [int]((Get-Content '\\Mac\Home\.alttab\winside-kill-target' -Raw -ErrorAction Stop).Trim()) } catch {}
     $procs = $null
     try {
         $procs = Get-CimInstance Win32_Process -ErrorAction Stop
@@ -2444,11 +2474,17 @@ class Winside {
     }
     $procs |
         Where-Object { ($_.Name -eq 'powershell.exe' -or $_.Name -eq 'pwsh.exe') -and $_.CommandLine -and $_.CommandLine.Contains($expected) } |
+        Where-Object { $targetPid -eq 0 -or $_.ProcessId -eq $targetPid } |
         ForEach-Object {
             Write-Output ("kill pid=" + $_.ProcessId + " cmd=" + $_.CommandLine)
             Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
         }
-    Remove-Item '\\Mac\Home\.alttab\winside-status.json' -ErrorAction SilentlyContinue
+    # Only drop the status file if it still describes the helper we killed.
+    $statusPid = 0
+    try { $statusPid = [int]((Get-Content $statusPath -Raw -ErrorAction Stop | ConvertFrom-Json).pid) } catch {}
+    if ($targetPid -eq 0 -or $statusPid -eq 0 -or $statusPid -eq $targetPid) {
+        Remove-Item $statusPath -ErrorAction SilentlyContinue
+    }
     """#
 
     /// Embedded source of `winside-helper.ps1`. Updated whenever the
@@ -2563,6 +2599,8 @@ public class WinSide {
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
   [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
   [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+  [DllImport("user32.dll")] public static extern bool IsHungAppWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, UIntPtr wParam, IntPtr lParam, uint flags, uint timeoutMs, out UIntPtr result);
   [DllImport("user32.dll", SetLastError=true)] public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, IntPtr pvParam, uint fWinIni);
   public delegate bool EnumProc(IntPtr h, IntPtr lp);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lp);
@@ -2613,6 +2651,19 @@ function Get-FG-Line {
     return "OK $($h.ToInt64()) $procId winMs=$(Get-UtcMs) $($sb.ToString())"
 }
 
+# True when the window's thread pumps messages within $TimeoutMs. A hung window
+# (no message pumping for 5s: IsHungAppWindow) or a merely busy one (e.g. Outlook
+# reopening dozens of item windows) answers false without blocking us longer
+# than the timeout.
+function Test-WindowResponsive {
+    param([IntPtr]$Hwnd, [uint32]$TimeoutMs = 100)
+    if ($Hwnd -eq [IntPtr]::Zero) { return $true }
+    if ([WinSide]::IsHungAppWindow($Hwnd)) { return $false }
+    $SMTO_ABORTIFHUNG = [uint32]0x0002
+    $result = [UIntPtr]::Zero
+    return [WinSide]::SendMessageTimeout($Hwnd, 0, [UIntPtr]::Zero, [IntPtr]::Zero, $SMTO_ABORTIFHUNG, $TimeoutMs, [ref]$result) -ne [IntPtr]::Zero
+}
+
 function Do-SetForeground {
     param([Int64]$HwndInt)
     $h = New-Object IntPtr -ArgumentList $HwndInt
@@ -2620,9 +2671,25 @@ function Do-SetForeground {
     $SWP_NOSIZE = [UInt32]0x0001
     $SWP_NOMOVE = [UInt32]0x0002
     $SWP_SHOWWINDOW = [UInt32]0x0040
+    $SWP_ASYNCWINDOWPOS = [UInt32]0x4000
     $SWP_FLAGS = $SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_SHOWWINDOW
+    $pidOut = [uint32]0
+    $curThread = [WinSide]::GetCurrentThreadId()
+    $targetThread = [WinSide]::GetWindowThreadProcessId($h, [ref]$pidOut)
+    $fgWin = [WinSide]::GetForegroundWindow()
+    $fgThread = [uint32]0
+    if ($fgWin -ne [IntPtr]::Zero) { $fgThread = [WinSide]::GetWindowThreadProcessId($fgWin, [ref]$pidOut) }
+    # Every call below that SENDS to the target or foreground window waits for that
+    # window's thread, and attaching our input queue to a thread makes even the
+    # "async" variants wait on it. On 2026-10-11 Outlook hung while AltTab focused
+    # its windows: SetWindowPos on the attached Outlook thread never returned, this
+    # single-threaded server stopped answering, and AltTab had to kill and relaunch
+    # it ("helper appears hung (3 failures)"). So never attach to an unresponsive
+    # thread, and drive an unresponsive target only through calls that post.
+    $tgtOk = Test-WindowResponsive $h
+    $fgOk = ($fgWin -eq $h) -or (Test-WindowResponsive $fgWin)
     if ([WinSide]::IsIconic($h)) {
-        [WinSide]::ShowWindow($h, 9) | Out-Null
+        if ($tgtOk) { [WinSide]::ShowWindow($h, 9) | Out-Null } else { [WinSide]::ShowWindowAsync($h, 9) | Out-Null }
     } else {
         [WinSide]::ShowWindowAsync($h, 5) | Out-Null
     }
@@ -2631,27 +2698,29 @@ function Do-SetForeground {
     # target window's thread), which makes SetForegroundWindow permitted. No
     # keypress is sent, so there is no risk of activating the menu (Alt) or any
     # other key side effect. We always detach in reverse order.
-    $pidOut = [uint32]0
-    $curThread = [WinSide]::GetCurrentThreadId()
-    $targetThread = [WinSide]::GetWindowThreadProcessId($h, [ref]$pidOut)
-    $fgWin = [WinSide]::GetForegroundWindow()
-    $fgThread = [uint32]0
-    if ($fgWin -ne [IntPtr]::Zero) { $fgThread = [WinSide]::GetWindowThreadProcessId($fgWin, [ref]$pidOut) }
     $attFg = $false
     $attTgt = $false
-    if ($fgThread -ne 0 -and $fgThread -ne $curThread) {
+    if ($fgOk -and $fgThread -ne 0 -and $fgThread -ne $curThread) {
         $attFg = [WinSide]::AttachThreadInput($curThread, $fgThread, $true)
     }
-    if ($targetThread -ne 0 -and $targetThread -ne $curThread -and $targetThread -ne $fgThread) {
+    if ($tgtOk -and $targetThread -ne 0 -and $targetThread -ne $curThread -and $targetThread -ne $fgThread) {
         $attTgt = [WinSide]::AttachThreadInput($curThread, $targetThread, $true)
     }
-    $pos = [WinSide]::SetWindowPos($h, $HWND_TOP, 0, 0, 0, 0, $SWP_FLAGS)
-    [WinSide]::BringWindowToTop($h) | Out-Null
+    if ($tgtOk) {
+        $pos = [WinSide]::SetWindowPos($h, $HWND_TOP, 0, 0, 0, 0, $SWP_FLAGS)
+        [WinSide]::BringWindowToTop($h) | Out-Null
+    } else {
+        $pos = [WinSide]::SetWindowPos($h, $HWND_TOP, 0, 0, 0, 0, ($SWP_FLAGS -bor $SWP_ASYNCWINDOWPOS))
+    }
     $r = [WinSide]::SetForegroundWindow($h)
-    [WinSide]::SwitchToThisWindow($h, $true)
+    if ($tgtOk) { [WinSide]::SwitchToThisWindow($h, $true) }
     if ($attTgt) { [WinSide]::AttachThreadInput($curThread, $targetThread, $false) | Out-Null }
     if ($attFg) { [WinSide]::AttachThreadInput($curThread, $fgThread, $false) | Out-Null }
-    return "OK $([int]$r) winMs=$(Get-UtcMs) pos=$([int]$pos)"
+    $busy = @()
+    if (-not $tgtOk) { $busy += 'target' }
+    if (-not $fgOk) { $busy += 'fg' }
+    $busyTag = if ($busy.Count) { " busy=$($busy -join ',')" } else { '' }
+    return "OK $([int]$r) winMs=$(Get-UtcMs) pos=$([int]$pos)$busyTag"
 }
 
 function Normalize-Title {
@@ -2712,7 +2781,8 @@ function Do-SetForegroundByTitle64 {
     $hwnd = $match.H.ToInt64()
     $resp = Do-SetForeground -HwndInt $hwnd
     $ok = if ($resp -match '^OK\s+(\d+)') { $Matches[1] } else { '0' }
-    return "OK $ok $hwnd $($match.Kind) winMs=$(Get-UtcMs)"
+    $busyTag = if ($resp -match '(\sbusy=\S+)') { $Matches[1] } else { '' }
+    return "OK $ok $hwnd $($match.Kind) winMs=$(Get-UtcMs)$busyTag"
 }
 
 function List-Windows {
