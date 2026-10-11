@@ -626,23 +626,31 @@ class TilesView {
         // calls that contend with the main thread for the WindowServer connection;
         // under WindowServer load that stalls the main runloop enough to time out
         // the click event tap and drop clicks. Refresh only the stalest few each
-        // tick (always including the selected window) — coverage rotates across
+        // tick (always including the selected and source windows) — coverage rotates across
         // ticks, but the instantaneous spike stays small. Tunable via
         // `visibleThumbnailRefreshMaxPerTick` (default 16).
         let maxPerTick = max(1, UserDefaults.standard.object(forKey: "visibleThumbnailRefreshMaxPerTick") as? Int ?? 16)
-        guard candidates.count > maxPerTick else { return candidates }
-        let cache = ThumbnailCache.shared
-        let byStaleness = candidates
-            .map { (window: $0, updatedAt: cache.lastUpdatedAt(wid: $0.cgWindowId ?? 0)) }
-            .sorted { $0.updatedAt < $1.updatedAt }
-            .map { $0.window }
+        // The selected window and the window being left go first (the 2-wide capture
+        // queue may not get further before the panel closes). The source changed most
+        // recently, and with "Capture windows in the background" off nothing else
+        // refreshes it: the session-source capture is skipped and the stalest-first
+        // rotation passed over it (2026-10-11 13:28: a session leaving Edge Beta
+        // left its tile 8 minutes stale).
+        let source = App.sessionSourceWid.flatMap { wid in Windows.list.first { $0.cgWindowId == wid } }
+        let priority = [selected, source].compactMap { $0 }.filter { $0.cgWindowId.map(seen.contains) ?? false }
+        let rest: [Window]
+        if candidates.count > maxPerTick {
+            let cache = ThumbnailCache.shared
+            rest = candidates
+                .map { (window: $0, updatedAt: cache.lastUpdatedAt(wid: $0.cgWindowId ?? 0)) }
+                .sorted { $0.updatedAt < $1.updatedAt }
+                .map { $0.window }
+        } else {
+            rest = candidates
+        }
         var result = [Window]()
         var added = Set<CGWindowID>()
-        if let selected, let swid = selected.cgWindowId, seen.contains(swid) {
-            result.append(selected)
-            added.insert(swid)
-        }
-        for window in byStaleness {
+        for window in priority + rest {
             guard result.count < maxPerTick else { break }
             if let wid = window.cgWindowId, added.insert(wid).inserted {
                 result.append(window)
