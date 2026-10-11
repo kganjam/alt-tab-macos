@@ -55,6 +55,13 @@ Use `bash ai/build.sh {compile|dev|install}`. Three modes, one script:
   and ran the stale bundled dylib after a reboot. Verify after any reboot:
   line 1 of the first `/tmp/alttab/*.log` must show the latest dev stamp.
 
+- `bash ai/build.sh publish` — Same build/sign/publish to
+  `~/.alttab-dev/AltTabCore.dylib` as `dev`, but leaves the running AltTab
+  alone (no stop, no launch). Use it to hand a build to whoever does the one
+  restart (e.g. after writing `focusOrderWindowIds`); the next launch, Fn+Shift+T,
+  or login picks it up. Publishing is a rename, so a running process keeps its
+  mapped copy.
+
 - `bash ai/build.sh install` — Full bundle install. Builds Release as a
   dylib, places the prebuilt shim at `Contents/MacOS/AltTab`, signs
   bottom-up (each nested dylib/framework, then `--deep --force` on the
