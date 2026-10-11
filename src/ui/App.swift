@@ -1504,7 +1504,8 @@ class App: AppCenterApplication {
         SystemScrollerStyleEvents.observe()
         InputSourceEvents.observe()
         Applications.initialDiscovery()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { Windows.restorePersistedFocusOrderAfterLaunch() }
+        let launchedAt = CFAbsoluteTimeGetCurrent()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { Windows.restorePersistedFocusOrderAfterLaunch(launchedAt: launchedAt) }
         KeyboardEvents.addEventHandlers()
         CursorEvents.observe()
         TrackpadEvents.observe()

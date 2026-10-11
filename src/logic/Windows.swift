@@ -2802,7 +2802,8 @@ class Windows {
             assignLastFocusOrderByLevel(cgWindowIds)
             return
         }
-        if restorePersistedFocusOrderIfNeeded() || restoredPersistedFocusOrder { return }
+        applyPersistedFocusOrder(final: false)
+        if restoredPersistedFocusOrder { return }
         Diagnostics.log("ORDER", "sortByLevel falling through to assignClusterSafeLastFocusOrderByLevel")
         assignClusterSafeLastFocusOrderByLevel(cgWindowIds)
     }
@@ -2826,23 +2827,46 @@ class Windows {
         let screen: String?
     }
 
-    /// Restore shortly after launch rather than on the first switcher open:
-    /// nothing is persisted until the restore runs, so a session that never
-    /// opened the switcher dropped every focus change (2026-10-07: three quick
-    /// restarts sank WhatsApp to rank 42). The frontmost window is synced after,
-    /// since an app already frontmost at launch never sends a focus event.
-    static func restorePersistedFocusOrderAfterLaunch() {
-        guard restorePersistedFocusOrderIfNeeded() else { return }
+    /// Restore after launch rather than on the first switcher open: nothing is
+    /// persisted until the restore is final, so a session that never opened the
+    /// switcher dropped every focus change (2026-10-07: three quick restarts sank
+    /// WhatsApp to rank 42).
+    /// Discovery is slow, so the restore is re-applied until it settles: under load
+    /// windows kept arriving until +22s (2026-10-11). A one-shot restore, at +8s or
+    /// at an earlier first switcher open, matched only the windows that existed
+    /// then (5/299 at +2.9s). Every window found later fell to the end, and the next
+    /// persist wrote that degraded order over last session's. So re-apply every 2s
+    /// until the window count holds for two ticks (or 60s), never under an open
+    /// switcher, and finalize only then. Finalizing unblocks persisting. The
+    /// frontmost window is synced after, since an app already frontmost at launch
+    /// never sends a focus event.
+    static func restorePersistedFocusOrderAfterLaunch(launchedAt: CFAbsoluteTime, lastCount: Int = -1, stableTicks: Int = 0) {
+        guard !didRestorePersistedFocusOrder else { return }
+        guard !App.appIsBeingUsed else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { restorePersistedFocusOrderAfterLaunch(launchedAt: launchedAt, lastCount: lastCount, stableTicks: stableTicks) }
+            return
+        }
+        let stable = list.count == lastCount ? stableTicks + 1 : 0
+        guard stable >= 2 || CFAbsoluteTimeGetCurrent() - launchedAt >= 60 else {
+            applyPersistedFocusOrder(final: false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { restorePersistedFocusOrderAfterLaunch(launchedAt: launchedAt, lastCount: list.count, stableTicks: stable) }
+            return
+        }
+        guard applyPersistedFocusOrder(final: true) else { return }
         syncFocusOrderWithLiveFrontmostWindow()
         persistFocusOrder()
     }
 
-    private static func restorePersistedFocusOrderIfNeeded() -> Bool {
+    /// Orders `list` by last session's persisted order, behind the windows focused
+    /// in this run. Provisional calls leave the persisted data and focus notes in
+    /// place for the next call; the final one ends the restore.
+    @discardableResult
+    private static func applyPersistedFocusOrder(final: Bool) -> Bool {
         guard !didRestorePersistedFocusOrder else { return false }
-        didRestorePersistedFocusOrder = true
+        if final { didRestorePersistedFocusOrder = true }
         let stored = loadPersistedFocusOrder()
         guard !stored.isEmpty else {
-            Diagnostics.log("ORDER", "restore skipped: no persisted data (loadPersistedFocusOrder returned empty)")
+            if final { Diagnostics.log("ORDER", "restore skipped: no persisted data (loadPersistedFocusOrder returned empty)") }
             return false
         }
 
@@ -2876,7 +2900,7 @@ class Windows {
 
         let liveFocused = focusedBeforeRestore.filter { focused in list.contains { $0 === focused } }
         liveFocused.forEach { _ = claim($0) }
-        focusedBeforeRestore = []
+        if final { focusedBeforeRestore = [] }
         var matchTier = [Int: Int]() // tier counts for diag: 1=wid, 2=title, 3=geom
         for key in stored {
             // Tier 1: wid (cheap, works for native macOS windows whose wids stay stable)
@@ -2911,7 +2935,7 @@ class Windows {
         }
 
         guard !ordered.isEmpty else {
-            Diagnostics.log("ORDER", "restore skipped: 0 matches out of \(stored.count) stored entries; listCount=\(list.count) firstStored=(wid=\(stored.first?.wid ?? -1) bundle=\(stored.first?.bundleId ?? "nil") title=\((stored.first?.title ?? "nil").prefix(40))) firstListWid=\(list.first?.cgWindowId ?? 0) firstListBundle=\(list.first?.application.bundleIdentifier ?? "nil")")
+            if final { Diagnostics.log("ORDER", "restore skipped: 0 matches out of \(stored.count) stored entries; listCount=\(list.count) firstStored=(wid=\(stored.first?.wid ?? -1) bundle=\(stored.first?.bundleId ?? "nil") title=\((stored.first?.title ?? "nil").prefix(40))) firstListWid=\(list.first?.cgWindowId ?? 0) firstListBundle=\(list.first?.application.bundleIdentifier ?? "nil")") }
             return false
         }
         let remaining = list
@@ -2922,7 +2946,7 @@ class Windows {
             window.lastFocusOrder = index
         }
         restoredPersistedFocusOrder = true
-        Diagnostics.log("ORDER", "restored persisted focus order liveFirst=\(liveFocused.count) matched=\(ordered.count - liveFocused.count)/\(stored.count) total=\(list.count) tier1Wid=\(matchTier[1] ?? 0) tier2Title=\(matchTier[2] ?? 0) tier3Geom=\(matchTier[3] ?? 0)")
+        Diagnostics.log("ORDER", "restored persisted focus order final=\(final) liveFirst=\(liveFocused.count) matched=\(ordered.count - liveFocused.count)/\(stored.count) total=\(list.count) tier1Wid=\(matchTier[1] ?? 0) tier2Title=\(matchTier[2] ?? 0) tier3Geom=\(matchTier[3] ?? 0)")
         return true
     }
 
@@ -2946,13 +2970,13 @@ class Windows {
         // restoration has had a chance to read what's there. Early callers
         // (syncFocusOrderWithLiveFrontmostWindow → updateLastFocusOrder, and
         // normalizeFocusOrderAtSessionStart) fire BEFORE sortByLevel calls
-        // restorePersistedFocusOrderIfNeeded. Without this guard, the
+        // applyPersistedFocusOrder. Without this guard, the
         // current-session discovery/normalize order overwrites the prior
         // session's data, and restoration then "restores" the
         // already-overwritten current order — which is exactly what the
         // user complained about ("alt tab order was again very wrong on
         // restart"). The didRestorePersistedFocusOrder flag is set at the
-        // start of restorePersistedFocusOrderIfNeeded so a single restore
+        // final applyPersistedFocusOrder so a single restore
         // attempt (success or failure) unblocks subsequent persists.
         guard didRestorePersistedFocusOrder else {
             Diagnostics.log("ORDER", "persistFocusOrder skipped (restore hasn't run yet — would clobber prior session data)")
