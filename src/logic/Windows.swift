@@ -11,6 +11,16 @@ class Windows {
     /// Windows focused in this run before the restore, most recent first. They
     /// outrank last session's order instead of being overwritten by it.
     private static var focusedBeforeRestore = [Window]()
+    /// Windows focused in this run (frontmost app only); their place comes from this
+    /// run, not last session's order.
+    private static var sessionFocusedWids = Set<CGWindowID>()
+    private static var decodedStoredFocusOrder: [PersistedWindowKey]?
+    /// Last session's entries no window has claimed yet, with their stored rank.
+    private static var pendingStoredOrder = [(rank: Int, key: PersistedWindowKey)]()
+    /// Stored rank of each window matched to last session's order.
+    private static var storedRankByWid = [CGWindowID: Int]()
+    private static var windowServerWidsCache: (at: CFAbsoluteTime, wids: Set<CGWindowID>)?
+    private static let persistedFocusOrderCap = 600
     // we use this to track if the focused window changed while alt-tab was open
     private static var lastFocusedWindowTarget: String?
     /// When AltTab initiates a focus change via SLPS + pin for a Parallels
@@ -2831,40 +2841,72 @@ class Windows {
     /// persisted until the restore is final, so a session that never opened the
     /// switcher dropped every focus change (2026-10-07: three quick restarts sank
     /// WhatsApp to rank 42).
-    /// Discovery is slow, so the restore is re-applied until it settles: under load
-    /// windows kept arriving until +22s (2026-10-11). A one-shot restore, at +8s or
-    /// at an earlier first switcher open, matched only the windows that existed
-    /// then (5/299 at +2.9s). Every window found later fell to the end, and the next
-    /// persist wrote that degraded order over last session's. So re-apply every 2s
-    /// until the window count holds for two ticks (or 60s), never under an open
-    /// switcher, and finalize only then. Finalizing unblocks persisting. The
-    /// frontmost window is synced after, since an app already frontmost at launch
-    /// never sends a focus event.
-    static func restorePersistedFocusOrderAfterLaunch(launchedAt: CFAbsoluteTime, lastCount: Int = -1, stableTicks: Int = 0) {
+    /// Discovery is slow and bursty, so the restore is re-applied until it is
+    /// complete. Under load on 2026-10-11 no real window existed until +5s, a burst
+    /// arrived, then nothing from +8s to +12s, then more until +29s. A one-shot
+    /// restore (or one gated on a stable window count) matched only what existed:
+    /// 5/299 placeholder matches at +2.9s. Every window found later fell to the
+    /// end, and the next persist saved that order over last session's (claude-39
+    /// went from rank 5 to 272). So finalize only once every stored window that
+    /// WindowServer still has is in `list` (60s cap), re-applying provisionally
+    /// every 2s until then, never under an open switcher. Finalizing unblocks
+    /// persisting. The frontmost window is synced after, since an app already
+    /// frontmost at launch never sends a focus event.
+    static func restorePersistedFocusOrderAfterLaunch(launchedAt: CFAbsoluteTime) {
         guard !didRestorePersistedFocusOrder else { return }
         guard !App.appIsBeingUsed else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { restorePersistedFocusOrderAfterLaunch(launchedAt: launchedAt, lastCount: lastCount, stableTicks: stableTicks) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { restorePersistedFocusOrderAfterLaunch(launchedAt: launchedAt) }
             return
         }
-        let stable = list.count == lastCount ? stableTicks + 1 : 0
-        guard stable >= 2 || CFAbsoluteTimeGetCurrent() - launchedAt >= 60 else {
+        let elapsed = CFAbsoluteTimeGetCurrent() - launchedAt
+        let undiscovered = undiscoveredStoredWindowCount()
+        guard undiscovered == 0 || elapsed >= 60 else {
             applyPersistedFocusOrder(final: false)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { restorePersistedFocusOrderAfterLaunch(launchedAt: launchedAt, lastCount: list.count, stableTicks: stable) }
+            Diagnostics.log("ORDER", "restore pending +\(Int(elapsed))s: \(undiscovered.map(String.init) ?? "unknown (no WindowServer list)") stored windows not discovered yet")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { restorePersistedFocusOrderAfterLaunch(launchedAt: launchedAt) }
             return
         }
-        guard applyPersistedFocusOrder(final: true) else { return }
+        applyPersistedFocusOrder(final: true)
         syncFocusOrderWithLiveFrontmostWindow()
         persistFocusOrder()
     }
 
+    /// Stored windows that WindowServer still has but `list` doesn't yet; nil when
+    /// WindowServer can't be listed (treated as "not done").
+    private static func undiscoveredStoredWindowCount() -> Int? {
+        guard let alive = windowServerWids(maxAge: 0) else { return nil }
+        let known = Set(list.compactMap { $0.cgWindowId })
+        return storedFocusOrder().filter { alive.contains(CGWindowID($0.wid)) && !known.contains(CGWindowID($0.wid)) }.count
+    }
+
+    /// Every window id WindowServer knows (all spaces, minimized, off-screen).
+    private static func windowServerWids(maxAge: CFAbsoluteTime) -> Set<CGWindowID>? {
+        let now = CFAbsoluteTimeGetCurrent()
+        if let cache = windowServerWidsCache, now - cache.at <= maxAge { return cache.wids }
+        guard let info = CGWindowListCopyWindowInfo(.optionAll, kCGNullWindowID) as? [[String: Any]], !info.isEmpty else { return nil }
+        let wids = Set(info.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value })
+        windowServerWidsCache = (now, wids)
+        return wids
+    }
+
+    /// Last session's order, decoded once per run.
+    private static func storedFocusOrder() -> [PersistedWindowKey] {
+        if let decodedStoredFocusOrder { return decodedStoredFocusOrder }
+        let stored = loadPersistedFocusOrder()
+        decodedStoredFocusOrder = stored
+        return stored
+    }
+
     /// Orders `list` by last session's persisted order, behind the windows focused
-    /// in this run. Provisional calls leave the persisted data and focus notes in
-    /// place for the next call; the final one ends the restore.
+    /// in this run. Provisional calls leave the focus notes in place for the next
+    /// call; the final one ends the restore. Windowless-app placeholders never
+    /// match: at +2.9s they were all `list` held, and their app-name titles
+    /// "matched" 5 stored windows.
     @discardableResult
     private static func applyPersistedFocusOrder(final: Bool) -> Bool {
         guard !didRestorePersistedFocusOrder else { return false }
         if final { didRestorePersistedFocusOrder = true }
-        let stored = loadPersistedFocusOrder()
+        let stored = storedFocusOrder()
         guard !stored.isEmpty else {
             if final { Diagnostics.log("ORDER", "restore skipped: no persisted data (loadPersistedFocusOrder returned empty)") }
             return false
@@ -2877,8 +2919,9 @@ class Windows {
         var byWid = [Int: Window]()
         var byBundleTitle = [String: [Window]]()       // "<bundleId>|<title>" -> [windows]
         var byBundleGeometry = [String: [Window]]()     // "<bundleId>|<screen>" -> [windows]
-        for window in list {
-            if let wid = window.cgWindowId { byWid[Int(wid)] = window }
+        for window in list where !window.isWindowlessApp {
+            guard let wid = window.cgWindowId else { continue }
+            byWid[Int(wid)] = window
             let bundleId = window.application.bundleIdentifier ?? ""
             if let title = window.title, !title.isEmpty {
                 byBundleTitle["\(bundleId)|\(title)", default: []].append(window)
@@ -2889,6 +2932,8 @@ class Windows {
 
         var ordered = [Window]()
         var seen = Set<ObjectIdentifier>()
+        var ranks = [CGWindowID: Int]()
+        var pending = [(rank: Int, key: PersistedWindowKey)]()
         let posTol: CGFloat = 8   // px — survives DPI rounding and minor user nudges
         let sizeTol: CGFloat = 16 // px — survives content-driven autosize wobble
 
@@ -2902,24 +2947,25 @@ class Windows {
         liveFocused.forEach { _ = claim($0) }
         if final { focusedBeforeRestore = [] }
         var matchTier = [Int: Int]() // tier counts for diag: 1=wid, 2=title, 3=geom
-        for key in stored {
-            // Tier 1: wid (cheap, works for native macOS windows whose wids stay stable)
-            if let w = byWid[key.wid], !seen.contains(ObjectIdentifier(w)), claim(w) {
-                matchTier[1, default: 0] += 1
+        for (rank, key) in stored.enumerated() {
+            // Tier 1: wid (cheap, works for native macOS windows whose wids stay stable).
+            // Same app required: wids restart after a reboot, so a stored wid can name
+            // an unrelated window.
+            let byId = byWid[key.wid].flatMap { key.bundleId == nil || key.bundleId == $0.application.bundleIdentifier ? $0 : nil }
+            if let w = byId, seen.contains(ObjectIdentifier(w)) {
+                ranks[CGWindowID(key.wid)] = rank // focused in this run: already placed
                 continue
             }
-            // Tier 2: bundleId + exact title
-            if let bundleId = key.bundleId, let title = key.title,
-               let candidates = byBundleTitle["\(bundleId)|\(title)"] {
-                if let w = candidates.first(where: { !seen.contains(ObjectIdentifier($0)) }), claim(w) {
-                    matchTier[2, default: 0] += 1
-                    continue
-                }
-            }
-            // Tier 3: bundleId + geometric fingerprint (+ screen if recorded)
-            if let bundleId = key.bundleId, let kx = key.x, let ky = key.y, let kw = key.w, let kh = key.h {
-                let screen = key.screen ?? ""
-                let candidates = byBundleGeometry["\(bundleId)|\(screen)"] ?? []
+            var match: (window: Window, tier: Int)?
+            if let w = byId {
+                match = (w, 1)
+            } else if let bundleId = key.bundleId, let title = key.title,
+                      let w = byBundleTitle["\(bundleId)|\(title)"]?.first(where: { !seen.contains(ObjectIdentifier($0)) }) {
+                // Tier 2: bundleId + exact title
+                match = (w, 2)
+            } else if let bundleId = key.bundleId, let kx = key.x, let ky = key.y, let kw = key.w, let kh = key.h {
+                // Tier 3: bundleId + geometric fingerprint (+ screen if recorded)
+                let candidates = byBundleGeometry["\(bundleId)|\(key.screen ?? "")"] ?? []
                 if let w = candidates.first(where: { window in
                     guard !seen.contains(ObjectIdentifier(window)),
                           let p = window.position, let s = window.size else { return false }
@@ -2927,12 +2973,19 @@ class Windows {
                         && abs(p.y - CGFloat(ky)) <= posTol
                         && abs(s.width - CGFloat(kw)) <= sizeTol
                         && abs(s.height - CGFloat(kh)) <= sizeTol
-                }), claim(w) {
-                    matchTier[3, default: 0] += 1
-                    continue
+                }) {
+                    match = (w, 3)
                 }
             }
+            guard let match, claim(match.window) else {
+                pending.append((rank, key))
+                continue
+            }
+            if let wid = match.window.cgWindowId { ranks[wid] = rank }
+            matchTier[match.tier, default: 0] += 1
         }
+        storedRankByWid = ranks
+        pendingStoredOrder = pending
 
         guard !ordered.isEmpty else {
             if final { Diagnostics.log("ORDER", "restore skipped: 0 matches out of \(stored.count) stored entries; listCount=\(list.count) firstStored=(wid=\(stored.first?.wid ?? -1) bundle=\(stored.first?.bundleId ?? "nil") title=\((stored.first?.title ?? "nil").prefix(40))) firstListWid=\(list.first?.cgWindowId ?? 0) firstListBundle=\(list.first?.application.bundleIdentifier ?? "nil")") }
@@ -2946,8 +2999,50 @@ class Windows {
             window.lastFocusOrder = index
         }
         restoredPersistedFocusOrder = true
-        Diagnostics.log("ORDER", "restored persisted focus order final=\(final) liveFirst=\(liveFocused.count) matched=\(ordered.count - liveFocused.count)/\(stored.count) total=\(list.count) tier1Wid=\(matchTier[1] ?? 0) tier2Title=\(matchTier[2] ?? 0) tier3Geom=\(matchTier[3] ?? 0)")
+        Diagnostics.log("ORDER", "restored persisted focus order final=\(final) liveFirst=\(liveFocused.count) matched=\(ordered.count - liveFocused.count)/\(stored.count) pending=\(pending.count) total=\(list.count) tier1Wid=\(matchTier[1] ?? 0) tier2Title=\(matchTier[2] ?? 0) tier3Geom=\(matchTier[3] ?? 0)")
         return true
+    }
+
+    /// A window discovered after the restore finalized takes its place from last
+    /// session's order instead of the end of the list.
+    private static func placeAtStoredRankIfRestored(_ window: Window) {
+        guard didRestorePersistedFocusOrder, !pendingStoredOrder.isEmpty, !window.isWindowlessApp,
+              let wid = window.cgWindowId, let index = pendingStoredIndex(for: window) else { return }
+        let rank = pendingStoredOrder.remove(at: index).rank
+        storedRankByWid[wid] = rank
+        let others = list.filter { $0 !== window }.sorted { $0.lastFocusOrder < $1.lastFocusOrder }
+        let at = storedRankInsertionIndex(rank, others.map { $0.cgWindowId }, storedRankByWid)
+        guard at < others.count else { return }
+        let slot = others[at].lastFocusOrder
+        for other in others where other.lastFocusOrder >= slot { other.lastFocusOrder += 1 }
+        window.lastFocusOrder = slot
+        Diagnostics.log("ORDER", "late window #\(wid) placed at stored rank \(rank) (order \(slot))")
+    }
+
+    private static func pendingStoredIndex(for window: Window) -> Int? {
+        guard let wid = window.cgWindowId else { return nil }
+        let bundleId = window.application.bundleIdentifier
+        if let i = pendingStoredOrder.firstIndex(where: { $0.key.wid == Int(wid) && ($0.key.bundleId == nil || $0.key.bundleId == bundleId) }) { return i }
+        if let title = window.title, !title.isEmpty,
+           let i = pendingStoredOrder.firstIndex(where: { $0.key.bundleId == bundleId && $0.key.title == title }) { return i }
+        guard let p = window.position, let s = window.size else { return nil }
+        let screen = window.screenId.map { $0 as String } ?? ""
+        return pendingStoredOrder.firstIndex { entry in
+            let k = entry.key
+            guard k.bundleId == bundleId, (k.screen ?? "") == screen,
+                  let kx = k.x, let ky = k.y, let kw = k.w, let kh = k.h else { return false }
+            return abs(p.x - CGFloat(kx)) <= 8 && abs(p.y - CGFloat(ky)) <= 8
+                && abs(s.width - CGFloat(kw)) <= 16 && abs(s.height - CGFloat(kh)) <= 16
+        }
+    }
+
+    /// Before the first entry ranked after `rank` in last session's order, skipping
+    /// windows focused in this run (their place comes from this run).
+    private static func storedRankInsertionIndex(_ rank: Int, _ wids: [CGWindowID?], _ ranks: [CGWindowID: Int]) -> Int {
+        wids.firstIndex { wid in
+            guard let wid, !sessionFocusedWids.contains(wid) else { return false }
+            return (ranks[wid] ?? Int.max) > rank
+        } ?? wids.count
     }
 
     private static func loadPersistedFocusOrder() -> [PersistedWindowKey] {
@@ -2969,22 +3064,19 @@ class Windows {
         // CRITICAL: don't write to UserDefaults before the previous-session
         // restoration has had a chance to read what's there. Early callers
         // (syncFocusOrderWithLiveFrontmostWindow → updateLastFocusOrder, and
-        // normalizeFocusOrderAtSessionStart) fire BEFORE sortByLevel calls
-        // applyPersistedFocusOrder. Without this guard, the
-        // current-session discovery/normalize order overwrites the prior
-        // session's data, and restoration then "restores" the
+        // normalizeFocusOrderAtSessionStart) fire BEFORE the restore. Without
+        // this guard, the current-session discovery/normalize order overwrites
+        // the prior session's data, and restoration then "restores" the
         // already-overwritten current order — which is exactly what the
         // user complained about ("alt tab order was again very wrong on
-        // restart"). The didRestorePersistedFocusOrder flag is set at the
-        // final applyPersistedFocusOrder so a single restore
-        // attempt (success or failure) unblocks subsequent persists.
+        // restart"). The final applyPersistedFocusOrder sets
+        // didRestorePersistedFocusOrder and unblocks persists.
         guard didRestorePersistedFocusOrder else {
             Diagnostics.log("ORDER", "persistFocusOrder skipped (restore hasn't run yet — would clobber prior session data)")
             return
         }
         let keys: [PersistedWindowKey] = list
             .sorted { $0.lastFocusOrder < $1.lastFocusOrder }
-            .prefix(300)
             .compactMap { window in
                 guard let wid = window.cgWindowId else { return nil }
                 return PersistedWindowKey(
@@ -2998,9 +3090,28 @@ class Windows {
                     screen: window.screenId.map { $0 as String }
                 )
             }
-        if let data = try? JSONEncoder().encode(keys) {
+        if let data = try? JSONEncoder().encode(Array(withPendingStoredOrder(keys).prefix(persistedFocusOrderCap))) {
             UserDefaults.standard.set(data, forKey: persistedFocusOrderKey)
         }
+    }
+
+    /// Persisting must never drop last session's entry for a window that still
+    /// exists but hasn't been discovered (slow or hung app): keep it at its old
+    /// relative position. Entries whose window WindowServer no longer has are dropped.
+    private static func withPendingStoredOrder(_ keys: [PersistedWindowKey]) -> [PersistedWindowKey] {
+        guard !pendingStoredOrder.isEmpty else { return keys }
+        if let alive = windowServerWids(maxAge: 10) {
+            pendingStoredOrder.removeAll { !alive.contains(CGWindowID($0.key.wid)) }
+        }
+        var merged = keys
+        var ranks = storedRankByWid
+        var present = Set(keys.map { $0.wid })
+        for entry in pendingStoredOrder.sorted(by: { $0.rank < $1.rank }) where present.insert(entry.key.wid).inserted {
+            let wid = CGWindowID(entry.key.wid)
+            merged.insert(entry.key, at: storedRankInsertionIndex(entry.rank, merged.map { CGWindowID($0.wid) }, ranks))
+            ranks[wid] = entry.rank
+        }
+        return merged
     }
 
     private static func assignLastFocusOrderByLevel(_ cgWindowIds: [CGWindowID]) {
@@ -3109,7 +3220,7 @@ class Windows {
     }
 
     static func updateLastFocusOrder(_ focusedWindow: Window) -> [Window]? {
-        noteFocusBeforeRestore(focusedWindow)
+        noteSessionFocus(focusedWindow)
         // no need to update the list is the window is already lastFocusOrder 0
         guard focusedWindow.lastFocusOrder != 0 && list.count > 1, let previousFocus = (list.first { $0.lastFocusOrder == 0 }) else {
             prewarmLikelyFocusTargets()
@@ -3133,9 +3244,10 @@ class Windows {
     /// Only the frontmost app's window counts: initial discovery replays every
     /// background app's focused window through this path, and treating those
     /// as focus changes pushed ~27 windows over last session's order.
-    private static func noteFocusBeforeRestore(_ window: Window) {
-        guard !didRestorePersistedFocusOrder,
-              window.application.pid == NSWorkspace.shared.frontmostApplication?.processIdentifier else { return }
+    private static func noteSessionFocus(_ window: Window) {
+        guard window.application.pid == NSWorkspace.shared.frontmostApplication?.processIdentifier else { return }
+        if let wid = window.cgWindowId { sessionFocusedWids.insert(wid) }
+        guard !didRestorePersistedFocusOrder else { return }
         focusedBeforeRestore.removeAll { $0 === window }
         focusedBeforeRestore.insert(window, at: 0)
     }
@@ -3175,6 +3287,7 @@ class Windows {
     static func appendWindow(_ window: Window) {
         window.lastFocusOrder = list.count
         list.append(window)
+        placeAtStoredRankIfRestored(window)
         if list.count > TilesView.recycledViews.count {
             TilesView.recycledViews.append(TileView())
         }

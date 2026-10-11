@@ -19,6 +19,12 @@
 #            ALTTAB_DEV_NO_STARTUP=1 skips publishing (throwaway experiments:
 #            the override then points at this checkout's dev/ until login).
 #
+#   publish  Same build, sign and publish as dev, but the running AltTab is
+#            left alone: no stop, no launch. For a hand-off where someone else
+#            restarts at a moment they choose (e.g. after writing state AltTab
+#            reads at launch). The running process keeps mapping the old file,
+#            since publishing replaces the directory entry.
+#
 #   startup  Make the published dev build the login version: install the
 #            ai/alttab-startup-agent.plist login launcher, turn off AltTab's
 #            own "Start at login" (it raced the override and would
@@ -40,8 +46,8 @@ cd "$(dirname "$0")/.."
 
 MODE="${1:-}"
 case "$MODE" in
-    compile|dev|install|startup) ;;
-    *) echo "usage: $0 {compile|dev|install|startup}" >&2; exit 2 ;;
+    compile|dev|publish|install|startup) ;;
+    *) echo "usage: $0 {compile|dev|publish|install|startup}" >&2; exit 2 ;;
 esac
 
 STARTUP_DYLIB="$HOME/.alttab-dev/AltTabCore.dylib"
@@ -92,7 +98,7 @@ fi
 APP_SWIFT="src/ui/App.swift"
 SIGN_ID="Local Self-Signed"
 BUILD_DATE="$(date '+%Y-%m-%d %H:%M')"
-if [ "$MODE" = "dev" ]; then BUILD_DATE="$BUILD_DATE dev"; fi
+if [ "$MODE" = "dev" ] || [ "$MODE" = "publish" ]; then BUILD_DATE="$BUILD_DATE dev"; fi
 
 sed -i.bak "s/BUILD_DATE_PLACEHOLDER/${BUILD_DATE}/" "$APP_SWIFT"
 trap 'mv "${APP_SWIFT}.bak" "$APP_SWIFT" 2>/dev/null || true' EXIT
@@ -118,11 +124,13 @@ fi
 
 APP_DIR=DerivedData/Build/Products/Release/AltTab.app
 
-# === STOP RUNNING INSTANCE ===
-osascript -e 'tell application id "com.lwouis.alt-tab-macos" to quit' 2>/dev/null || true
-pkill -f 'AltTab\.app/Contents/MacOS/AltTab' 2>/dev/null || true
-sleep 1
-pkill -9 -f 'AltTab\.app/Contents/MacOS/AltTab' 2>/dev/null || true
+# === STOP RUNNING INSTANCE (not in publish mode) ===
+if [ "$MODE" != "publish" ]; then
+    osascript -e 'tell application id "com.lwouis.alt-tab-macos" to quit' 2>/dev/null || true
+    pkill -f 'AltTab\.app/Contents/MacOS/AltTab' 2>/dev/null || true
+    sleep 1
+    pkill -9 -f 'AltTab\.app/Contents/MacOS/AltTab' 2>/dev/null || true
+fi
 
 # NOTE: defensive helper-kill removed — it caused an extra Coherence flash
 # on every dev-build. AltTab's startIfNeeded now handles all cases:
@@ -131,8 +139,8 @@ pkill -9 -f 'AltTab\.app/Contents/MacOS/AltTab' 2>/dev/null || true
 #   - PING failed (orphan after crash)       → kill + relaunch.
 # Graceful AltTab quit kills the helper via socket EXIT (no flash).
 
-# === DEV MODE: rebuild dylib, override env-var launch ===
-if [ "$MODE" = "dev" ]; then
+# === DEV / PUBLISH MODE: rebuild dylib, publish, (dev only) override env-var launch ===
+if [ "$MODE" = "dev" ] || [ "$MODE" = "publish" ]; then
     DEST=/Applications/AltTab.app
     if [ ! -f "$DEST/Contents/MacOS/AltTab" ]; then
         echo "ERROR: $DEST not installed. Run '$0 install' first." >&2
@@ -144,7 +152,7 @@ if [ "$MODE" = "dev" ]; then
     codesign --force --sign "$SIGN_ID" --options runtime --timestamp=none "$DEV_DYLIB"
     echo "  dev dylib cdhash: $(codesign -dvvv "$DEV_DYLIB" 2>&1 | awk -F= '/^CDHash=/{print $2; exit}')"
     OVERRIDE_DYLIB="$DEV_DYLIB"
-    if [ "${ALTTAB_DEV_NO_STARTUP:-0}" != "1" ]; then
+    if [ "${ALTTAB_DEV_NO_STARTUP:-0}" != "1" ] || [ "$MODE" = "publish" ]; then
         # Publish atomically (cp to a sibling + mv): AltTab was stopped above, and
         # replacing the directory entry never rewrites a file a process still maps.
         mkdir -p "$(dirname "$STARTUP_DYLIB")"
@@ -159,6 +167,11 @@ if [ "$MODE" = "dev" ]; then
     LSREG=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
     "$LSREG" -u "$APP_DIR" 2>/dev/null || true
     rm -rf "$APP_DIR"
+    if [ "$MODE" = "publish" ]; then
+        echo "Published, AltTab NOT restarted: $OVERRIDE_DYLIB"
+        echo "  build stamp (latest.log line 1 after the next launch): CUSTOM BUILD ($BUILD_DATE)"
+        exit 0
+    fi
     # LaunchServices owns the long-running process. A direct background exec
     # from this script can receive SIGHUP/terminate when the wrapper exits,
     # leaving AltTab dead after a successful dev build. Use launchctl to pass
