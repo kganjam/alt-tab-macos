@@ -75,6 +75,10 @@ You can run CLI commands directly on the executable inside the .app bundle (e.g.
 * `AltTab --show=shortcut_index` will show AltTab UI, as if the corresponding shortcut was pressed
 * `AltTab --focus=window_id` will focus the window with the specified ID (get it from --list)
 * `AltTab --focusUsingLastFocusOrder=focus_order` will focus the window with the specified focus-order (get it from --detailed-list)
+* `AltTab --close=window_id` will close the window with the specified ID, like its close button
+* `AltTab --minimize=window_id` / `AltTab --deminimize=window_id` will minimize / restore the window with the specified ID
+
+The window commands print nothing and exit 0 once the action is sent; they exit 1 if the ID is unknown or the window can't do that (e.g. a tabbed window can't be minimized). Unsaved documents still ask before closing.
 
 For this to work, you need AltTab.app to be running, to keep track of the state of windows, and execute the commands
 

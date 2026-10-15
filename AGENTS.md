@@ -101,6 +101,13 @@ capture correctness is NOT unit-tested — that is the `ai/` eval harness's job.
 - Missing-window checks must compare WindowServer-visible windows against
   AltTab `--detailed-list` displayability. Include Parallels Desktop console
   windows as well as Coherence apps, Teams/Meet/OBS meeting windows.
+- CLI verbs live in `src/logic/events/CliEvents.swift` (`CliServer`, plus the
+  `CliClient` allow-list; window verbs come from the one `windowCommands`
+  table). The *client* is whatever dylib the shim loads, so a verb newer than
+  the installed bundle (`--dump-thumbnails=`, `--close=`, `--minimize=`,
+  `--deminimize=`) must run with `ALTTAB_DYLIB_OVERRIDE` set to the live dylib
+  (`~/.alttab-dev/AltTabCore.dylib`). An argument the client doesn't know
+  starts a second AltTab instead of failing.
 - `ai/build.sh` is the only supported build/install/dev loop. Use
   `compile` after edits, `dev` for TCC-safe runtime tests, and `install`
   only for rare full bundle/signing changes.
