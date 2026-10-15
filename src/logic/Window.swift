@@ -310,17 +310,21 @@ class Window {
     }
 
     func minDemin() {
+        setMinimized(!isMinimized)
+    }
+
+    func setMinimized(_ minimized: Bool) {
         if !canBeMinDeminOrFullscreened() {
             NSSound.beep()
             return
         }
         if let altTabWindow = altTabWindow() {
-            isMinimized ? altTabWindow.deminiaturize(nil) : altTabWindow.miniaturize(nil)
+            minimized ? altTabWindow.miniaturize(nil) : altTabWindow.deminiaturize(nil)
             return
         }
         BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
             guard let self else { return }
-            if self.isFullscreen {
+            if minimized && self.isFullscreen {
                 try? self.axUiElement!.setAttribute(kAXFullscreenAttribute, false)
                 // minimizing is ignored if sent immediatly; we wait for the de-fullscreen animation to be over
                 BackgroundWork.accessibilityCommandsQueue.addOperationAfter(deadline: .now() + .seconds(1)) { [weak self] in
@@ -328,7 +332,7 @@ class Window {
                     try? self.axUiElement!.setAttribute(kAXMinimizedAttribute, true)
                 }
             } else {
-                try? self.axUiElement!.setAttribute(kAXMinimizedAttribute, !self.isMinimized)
+                try? self.axUiElement!.setAttribute(kAXMinimizedAttribute, minimized)
             }
         }
     }

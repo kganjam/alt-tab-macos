@@ -143,12 +143,33 @@ class CliServer {
         if rawValue.hasPrefix("--dump-thumbnails=") {
             return dumpThumbnails(to: String(rawValue.dropFirst("--dump-thumbnails=".count)))
         }
+        if let output = runWindowCommand(rawValue) {
+            return output
+        }
         if rawValue.hasPrefix("--show="),
            let shortcutIndex = Int(rawValue.dropFirst("--show=".count)), (0..<Preferences.shortcutCount).contains(shortcutIndex) {
             App.showUi(shortcutIndex)
             return noOutput
         }
         return error
+    }
+
+    /// `--close=<wid>`, `--minimize=<wid>`, `--deminimize=<wid>`: act on one window by id, like
+    /// the switcher's close/minimize shortcuts. The AX action is queued, so `noOutput` means
+    /// accepted; `error` means the id is unknown or the window can't take that action.
+    static let windowCommands: [(prefix: String, canRun: (Window) -> Bool, run: (Window) -> Void)] = [
+        ("--close=", { $0.canBeClosed() }, { App.closeWindow($0, reason: "cli-close") }),
+        ("--minimize=", { $0.canBeMinDeminOrFullscreened() }, { App.setWindowMinimized($0, true, reason: "cli-minimize") }),
+        ("--deminimize=", { $0.canBeMinDeminOrFullscreened() }, { App.setWindowMinimized($0, false, reason: "cli-deminimize") }),
+    ]
+
+    private static func runWindowCommand(_ rawValue: String) -> Codable? {
+        guard let command = (windowCommands.first { rawValue.hasPrefix($0.prefix) }) else { return nil }
+        guard let id = CGWindowID(rawValue.dropFirst(command.prefix.count)),
+              let window = (Windows.list.first { $0.cgWindowId == id }),
+              command.canRun(window) else { return error }
+        command.run(window)
+        return noOutput
     }
 
     /// Diagnostic: write every cached thumbnail as `<wid>.png` plus `index.json`
@@ -274,14 +295,18 @@ class CliServer {
 }
 
 class CliClient {
+    // An argument missing from these lists launches a second AltTab instead of reaching the server
+    private static let exactCommands: Set<String> = ["--list", "--detailed-list", "--selection-state", "--hide", "--focus-target"]
+    private static let prefixCommands = ["--select=", "--select-index=", "--select-and-focus=", "--focus=", "--focus-newest=", "--newest-wid=", "--focusUsingLastFocusOrder=", "--show=", "--dump-thumbnails="] + CliServer.windowCommands.map { $0.prefix }
+
     static func detectCommand() -> String? {
         let args = CommandLine.arguments
-        if args.count == 2 && !args[1].starts(with: "--logs=") {
-            if args[1] == "--list" || args[1] == "--detailed-list" || args[1] == "--selection-state" || args[1] == "--hide" || args[1] == "--focus-target" || args[1].hasPrefix("--select=") || args[1].hasPrefix("--select-index=") || args[1].hasPrefix("--select-and-focus=") || args[1].hasPrefix("--focus=") || args[1].hasPrefix("--focus-newest=") || args[1].hasPrefix("--newest-wid=") || args[1].hasPrefix("--focusUsingLastFocusOrder=") || args[1].hasPrefix("--show=") || args[1].hasPrefix("--dump-thumbnails=") {
-                return args[1]
-            }
-        }
-        return nil
+        guard args.count == 2, isKnownCommand(args[1]) else { return nil }
+        return args[1]
+    }
+
+    private static func isKnownCommand(_ arg: String) -> Bool {
+        exactCommands.contains(arg) || prefixCommands.contains { arg.hasPrefix($0) }
     }
 
     static func sendCommandAndProcessResponse(_ command: String) {

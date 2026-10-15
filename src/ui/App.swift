@@ -562,15 +562,27 @@ class App: AppCenterApplication {
     }
 
     static func closeSelectedWindow() {
-        let window = Windows.selectedWindow()
+        closeWindow(Windows.selectedWindow(), reason: "alttab-close")
+    }
+
+    static func closeWindow(_ window: Window?, reason: String) {
         window?.close()
-        Windows.requestZOrderReview(reason: "alttab-close", wid: window?.cgWindowId ?? 0, invalidate: window?.cgWindowId != nil, fullDelayMs: 500)
+        requestZOrderReviewAfterWindowCommand(window, reason)
     }
 
     static func minDeminSelectedWindow() {
         let window = Windows.selectedWindow()
         window?.minDemin()
-        Windows.requestZOrderReview(reason: "alttab-min-demin", wid: window?.cgWindowId ?? 0, invalidate: window?.cgWindowId != nil, fullDelayMs: 500)
+        requestZOrderReviewAfterWindowCommand(window, "alttab-min-demin")
+    }
+
+    static func setWindowMinimized(_ window: Window, _ minimized: Bool, reason: String) {
+        window.setMinimized(minimized)
+        requestZOrderReviewAfterWindowCommand(window, reason)
+    }
+
+    private static func requestZOrderReviewAfterWindowCommand(_ window: Window?, _ reason: String) {
+        Windows.requestZOrderReview(reason: reason, wid: window?.cgWindowId ?? 0, invalidate: window?.cgWindowId != nil, fullDelayMs: 500)
     }
 
     static func toggleFullscreenSelectedWindow() {
