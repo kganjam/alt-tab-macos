@@ -381,7 +381,7 @@ class Window {
             }
             manuallyUpdateFocusOrderForDirectFocus()
             Windows.previewSelectedWindowIfNeeded()
-        } else if isParallelsCoherenceWindow && !isParallelsHostPanel && ParallelsKeyRouting.needsKeySafeActivation(application) {
+        } else if isParallelsCoherenceWindow && !isParallelsHostPanel && ParallelsKeyRouting.needsKeySafeActivation(application, alreadyFront: isSameProcessAsCurrentFrontmost()) {
             focusParallelsCoherenceWindow(keySafe: true)
         } else if isParallelsCoherenceWindow && isSameProcessAsCurrentFrontmost() {
             focusParallelsCoherenceWindowSameProcess()
@@ -610,7 +610,20 @@ class Window {
 
     private func postSkyLightFocusClick(_ targetWid: CGWindowID) -> Bool {
         guard let bounds = skyLightClickBounds() else { return false }
-        let point = skyLightClickPoint(bounds)
+        return postSkyLightClick(targetWid, bounds, skyLightClickPoint(bounds))
+    }
+
+    /// REL-114: the click that re-arms a Parallels helper trapped by its launcher panel, posted to
+    /// the helper while it is inactive. Aimed at the middle of the window's top pixel rows: the
+    /// resize band of a normal guest window, or bare caption (Outlook's sits between its search box
+    /// and account picture), never a control. A point outside the window doesn't activate the helper.
+    func postSkyLightCaptionClick() -> CGPoint? {
+        guard let cgWindowId, let bounds = skyLightClickBounds() else { return nil }
+        let point = CGPoint(x: bounds.midX, y: bounds.minY + 3)
+        return postSkyLightClick(cgWindowId, bounds, point) ? point : nil
+    }
+
+    private func postSkyLightClick(_ targetWid: CGWindowID, _ bounds: CGRect, _ point: CGPoint) -> Bool {
         let localPoint = CGPoint(x: point.x - bounds.minX, y: point.y - bounds.minY)
         guard let down = skyLightMouseEvent(.leftMouseDown, targetWid, point, localPoint, 1),
               let up = skyLightMouseEvent(.leftMouseUp, targetWid, point, localPoint, 1) else { return false }
