@@ -145,6 +145,7 @@ class AccessibilityEvents {
 
     private static func applicationActivated(_ app: Application, _ pid: pid_t, _ type: String, _ appFocusedWindow: AXUIElement?, _ wid: CGWindowID?) {
         Diagnostics.log("AXEVENT", "applicationActivated pid=\(pid) app=\(app.bundleIdentifier ?? "?") guardActive=\(CFAbsoluteTimeGetCurrent() < Windows.altTabFocusTargetUntil) target=\(Windows.altTabFocusTarget?.debugId ?? "nil")")
+        ParallelsKeyRouting.noteActivation(of: app)
         if Windows.releaseZOrderEnforcementForExternalForegroundOwner(wid: wid, pid: pid, label: type) {
             Windows.requestZOrderTopReview(reason: type, wid: wid ?? 0)
         }

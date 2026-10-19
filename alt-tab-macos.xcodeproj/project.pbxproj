@@ -95,6 +95,10 @@
 		AA974BA929B7D84C0099A29E /* PreviewPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA974BA829B7D84C0099A29E /* PreviewPanel.swift */; };
 		BB0000000000000000000002 /* TabGroup.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000001 /* TabGroup.swift */; };
 		BB0000000000000000000004 /* KeyWindowSuspects.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000003 /* KeyWindowSuspects.swift */; };
+		BB0000000000000000000006 /* ParallelsKeyRouting.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000005 /* ParallelsKeyRouting.swift */; };
+		BB0000000000000000000008 /* ParallelsHostPanelTestable.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000007 /* ParallelsHostPanelTestable.swift */; };
+		BB0000000000000000000009 /* ParallelsHostPanelTestable.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000007 /* ParallelsHostPanelTestable.swift */; };
+		BB000000000000000000000B /* ParallelsHostPanelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000000000000000000000A /* ParallelsHostPanelTests.swift */; };
 		BF0C803A13C409E7F01FBCAB /* SkyLight.framework.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF0C8B94D7994AB9007F6391 /* SkyLight.framework.swift */; };
 		BF0C80484AA63306D0DB4DB2 /* SpacesEvents.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF0C8DF008F1EB5F23291A13 /* SpacesEvents.swift */; };
 		BF0C8052AE41B1B10E42BFCE /* InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = BF0C875C983226CB16DBD90F /* InfoPlist.strings */; };
@@ -435,6 +439,9 @@
 		AA974BA829B7D84C0099A29E /* PreviewPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewPanel.swift; sourceTree = "<group>"; };
 		BB0000000000000000000001 /* TabGroup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabGroup.swift; sourceTree = "<group>"; };
 		BB0000000000000000000003 /* KeyWindowSuspects.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyWindowSuspects.swift; sourceTree = "<group>"; };
+		BB0000000000000000000005 /* ParallelsKeyRouting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParallelsKeyRouting.swift; sourceTree = "<group>"; };
+		BB0000000000000000000007 /* ParallelsHostPanelTestable.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParallelsHostPanelTestable.swift; sourceTree = "<group>"; };
+		BB000000000000000000000A /* ParallelsHostPanelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParallelsHostPanelTests.swift; sourceTree = "<group>"; };
 		BF0C800363086A5ED019FE11 /* google_translate_all_terms_locally.py */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.script.python; path = google_translate_all_terms_locally.py; sourceTree = "<group>"; };
 		BF0C804765D0E6A92C6646CC /* gu */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.strings; name = gu; path = InfoPlist.strings; sourceTree = "<group>"; };
 		BF0C8070A1BBA8B425C8EF34 /* IOKit.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IOKit.swift; sourceTree = "<group>"; };
@@ -1183,6 +1190,7 @@
 				BF0C84933936C6FE676CD33C /* AppearanceTests.swift */,
 				BF0C899905524253DC170B56 /* KeyboardEventsTests.swift */,
 				BF0CAAAA0000000000000001 /* SearchAcronymTests.swift */,
+				BB000000000000000000000A /* ParallelsHostPanelTests.swift */,
 				BF0C829EAA93A4C4ADB42CF8 /* Mocks.swift */,
 				BF0C8C6810FF50908E637A48 /* ConcurrentScreenshots.swift */,
 				BF0C855CD9DBCAEFE48F9EA5 /* AXUIElementTests.swift */,
@@ -1438,6 +1446,8 @@
 				D04BA282BB16C1554595A968 /* Applications.swift */,
 				BB0000000000000000000001 /* TabGroup.swift */,
 				BB0000000000000000000003 /* KeyWindowSuspects.swift */,
+				BB0000000000000000000005 /* ParallelsKeyRouting.swift */,
+				BB0000000000000000000007 /* ParallelsHostPanelTestable.swift */,
 				D04BAB74451B79FE18B8BEDF /* BackgroundWork.swift */,
 				420AE3A5BF1C4FAE88705214 /* ThumbnailCache.swift */,
 				C4C3F34F2D3E469D8DE8ABE5 /* BackgroundThumbnailRefresher.swift */,
@@ -2557,6 +2567,8 @@
 				5F4753072CEE5A2E002C6C5E /* AppearanceTestable.swift in Sources */,
 				BF0C8B787C76D9B961CC2F45 /* KeyboardEventsTests.swift in Sources */,
 				BF0CAAAA0000000000001001 /* SearchAcronymTests.swift in Sources */,
+				BB000000000000000000000B /* ParallelsHostPanelTests.swift in Sources */,
+				BB0000000000000000000009 /* ParallelsHostPanelTestable.swift in Sources */,
 				BF0C8C5FA4B401A8C0F75B7A /* KeyboardEventsTestable.swift in Sources */,
 				F00DCAFE0000000000001103 /* SearchTestable.swift in Sources */,
 				BF0C875A28B98904F8F4A66A /* ATShortcut.swift in Sources */,
@@ -2593,6 +2605,8 @@
 				D04BA2A6FF9DDDC5A1A68E36 /* Applications.swift in Sources */,
 				BB0000000000000000000002 /* TabGroup.swift in Sources */,
 				BB0000000000000000000004 /* KeyWindowSuspects.swift in Sources */,
+				BB0000000000000000000006 /* ParallelsKeyRouting.swift in Sources */,
+				BB0000000000000000000008 /* ParallelsHostPanelTestable.swift in Sources */,
 				AA974BA929B7D84C0099A29E /* PreviewPanel.swift in Sources */,
 				D04BA3CF766857381519B892 /* BackgroundWork.swift in Sources */,
 				A1B600A20DF04A308DCB6E04 /* ThumbnailCache.swift in Sources */,

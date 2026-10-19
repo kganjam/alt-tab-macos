@@ -12,6 +12,21 @@ class Applications {
     static let windowListUpdateThrottler = ThrottlerWithKey(delayInMs: 200)
     static let badgesThrottler = Throttler(delayInMs: 1000)
 
+    /// The app's own focused window, read fresh from its AX element (any thread), and how long the
+    /// read took: a slow answer means the app's main thread is behind.
+    static func axFocusedWindowId(pid: pid_t, timeout: Float) -> (wid: CGWindowID?, ms: Double) {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, timeout)
+        let start = CFAbsoluteTimeGetCurrent()
+        var value: AnyObject?
+        let err = AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &value)
+        let ms = (CFAbsoluteTimeGetCurrent() - start) * 1000
+        guard err == .success, let value else { return (nil, ms) }
+        var wid: CGWindowID = 0
+        _ = _AXUIElementGetWindow(value as! AXUIElement, &wid)
+        return (wid == 0 ? nil : wid, ms)
+    }
+
     static func initialDiscovery() {
         addInitialRunningApplications()
         RunningApplicationsEvents.observe()

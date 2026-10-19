@@ -135,31 +135,18 @@ enum KeyWindowSuspects {
     /// raise timed out, landed late, and split key/main across two windows). Only repair
     /// when the app answers promptly and still reports the window we will hand back to.
     private static func appBusyReason(pid: pid_t, expecting wid: CGWindowID) -> String? {
-        let probe = focusedWindow(pid: pid, timeout: 0.3)
+        let probe = Applications.axFocusedWindowId(pid: pid, timeout: 0.3)
         guard let focused = probe.wid else { return String(format: "app unresponsive (probe %.0fms, no focused window)", probe.ms) }
         if probe.ms > Double(RuntimeFlags.keyWindowSuspectMaxProbeMs) { return String(format: "app busy (probe %.0fms)", probe.ms) }
         if focused != wid { return "focus moved to #\(focused)" }
         return nil
     }
 
-    private static func focusedWindow(pid: pid_t, timeout: Float) -> (wid: CGWindowID?, ms: Double) {
-        let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, timeout)
-        let start = CFAbsoluteTimeGetCurrent()
-        var value: AnyObject?
-        let err = AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &value)
-        let ms = (CFAbsoluteTimeGetCurrent() - start) * 1000
-        guard err == .success, let value else { return (nil, ms) }
-        var wid: CGWindowID = 0
-        _ = _AXUIElementGetWindow(value as! AXUIElement, &wid)
-        return (wid == 0 ? nil : wid, ms)
-    }
-
     private static func handBack(to window: Window, pid: pid_t) {
         guard let wid = window.cgWindowId else { return }
         for attempt in 1...2 {
             raise(window)
-            let focused = focusedWindow(pid: pid, timeout: 1).wid
+            let focused = Applications.axFocusedWindowId(pid: pid, timeout: 1).wid
             Diagnostics.log("KEYWIN", "hand-back to #\(wid) attempt \(attempt): focused=#\(focused ?? 0)")
             if focused == wid { return }
         }

@@ -17,7 +17,9 @@ class Application: NSObject {
     var hasBeenActiveOnce: Bool
     var icon: CGImage?
     var dockLabel: String?
-    var focusedWindow: Window? = nil
+    var focusedWindow: Window? = nil {
+        didSet { ParallelsKeyRouting.noteFocusedWindow(of: self) }
+    }
     var alreadyRequestedToQuit = false
     var debugId: String
     /// Parallels Desktop publishes each Coherence (Windows) app as its own macOS

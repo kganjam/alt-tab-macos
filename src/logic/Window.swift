@@ -42,6 +42,13 @@ class Window {
     var isOnAllSpaces = false
     var isWindowlessApp: Bool { get { cgWindowId == nil } }
     var isParallelsCoherenceWindow: Bool { application.isParallelsCoherence }
+    /// A Parallels helper's own AppKit window, not the proxy of a Windows window: the stuck
+    /// "<App> — Starting…" launcher panel (REL-114, see `ParallelsKeyRouting`). The CG lookup only
+    /// runs for Coherence windows without a title of their own.
+    var isParallelsHostPanel: Bool {
+        guard isParallelsCoherenceWindow, let cgWindowId, ParallelsHostPanelTestable.hasNoOwnTitle(title, application.localizedName) else { return false }
+        return ParallelsHostPanelTestable.isHostPanel(isCoherenceApp: true, title: title, appName: application.localizedName, sharingState: cgWindowId.sharingState())
+    }
     var position: CGPoint?
     var size: CGSize?
     var spaceIds = [CGSSpaceID.max]
@@ -374,10 +381,12 @@ class Window {
             }
             manuallyUpdateFocusOrderForDirectFocus()
             Windows.previewSelectedWindowIfNeeded()
+        } else if isParallelsCoherenceWindow && !isParallelsHostPanel && ParallelsKeyRouting.needsKeySafeActivation(application) {
+            focusParallelsCoherenceWindow(keySafe: true)
         } else if isParallelsCoherenceWindow && isSameProcessAsCurrentFrontmost() {
             focusParallelsCoherenceWindowSameProcess()
         } else if isParallelsCoherenceWindow {
-            focusParallelsCoherenceWindow()
+            focusParallelsCoherenceWindow(keySafe: false)
         } else if isOutboundFromParallelsCoherence() {
             focusMacOsWindowOverParallelsCoherence()
         } else {
@@ -1337,8 +1346,10 @@ class Window {
     /// activation of that specific Coherence window. Without
     /// makeKeyWindow, keyboard continues to go to the previous app
     /// (e.g. Terminal).
-    private func atomicallyPinAndActivate() {
-        Diagnostics.log("FOCUS", "enter atomicallyPinAndActivate target=\(debugId ?? "?")")
+    /// `keySafe` (REL-114): the helper's launcher panel holds its key window, so the activation is
+    /// left to `ParallelsKeyRouting`, which re-activates the helper from the target window.
+    private func atomicallyPinAndActivate(keySafe: Bool) {
+        Diagnostics.log("FOCUS", "enter atomicallyPinAndActivate target=\(debugId ?? "?") keySafe=\(keySafe)")
         guard let targetWid = cgWindowId else { return }
         let generation = Windows.currentZOrderFocusGeneration()
         let preZ = Windows.zOrderSnapshotForFocus()
@@ -1347,6 +1358,17 @@ class Window {
         if guestPrefocusQueued {
             usleep(useconds_t(max(0, min(RuntimeFlags.parGuestPrefocusHostDelayMs, 100)) * 1000))
         }
+        if keySafe {
+            ParallelsKeyRouting.activate(self, generation: generation, reason: "altTabFocus")
+        } else {
+            activateParallelsTarget(targetWid: targetWid, generation: generation)
+        }
+        manuallyUpdateFocusOrderForParallelsTransition()
+        Windows.restoreExpectedZOrderForFocus(targetWid: targetWid, targetPid: application.pid, preZ: preZ)
+        repokeFrontmostForCachedListeners(generation: generation)
+    }
+
+    private func activateParallelsTarget(targetWid: CGWindowID, generation: Int64) {
         var psn = ProcessSerialNumber()
         GetProcessForPID(application.pid, &psn)
         let startedAt = CFAbsoluteTimeGetCurrent()
@@ -1374,9 +1396,6 @@ class Window {
             let finishedAt = CFAbsoluteTimeGetCurrent()
             Diagnostics.log("AXFOCUS", String(format: "wid=%u source=macToParAsync front=%.1fms raise=%.1fms total=%.1fms frontErr=%d", targetWid, (frontAt - axStartedAt) * 1000, (finishedAt - frontAt) * 1000, (finishedAt - axStartedAt) * 1000, frontErr.rawValue))
         }
-        manuallyUpdateFocusOrderForParallelsTransition()
-        Windows.restoreExpectedZOrderForFocus(targetWid: targetWid, targetPid: application.pid, preZ: preZ)
-        repokeFrontmostForCachedListeners(generation: generation)
     }
 
     @discardableResult
@@ -1602,14 +1621,16 @@ class Window {
     /// mac→Par CROSS PROCESS. Target is a Parallels Coherence window but
     /// the source is a different app. Need full SLPS + makeKeyWindow to
     /// activate the Parallels process and signal keyboard forwarding.
-    private func focusParallelsCoherenceWindow() {
+    /// Also taken for any window of a helper trapped by its launcher panel
+    /// (`keySafe`), same process or not: see `ParallelsKeyRouting`.
+    private func focusParallelsCoherenceWindow(keySafe: Bool) {
         let generation = Windows.currentZOrderFocusGeneration()
-        atomicallyPinAndActivate()
+        atomicallyPinAndActivate(keySafe: keySafe)
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(60)) { [weak self] in
             guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
             guard let self else { return }
             BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
-                guard Windows.isCurrentZOrderFocusGeneration(generation) else { return }
+                guard Windows.isCurrentZOrderFocusGeneration(generation), !keySafe else { return }
                 guard let self else { return }
                 try? self.axUiElement!.focusWindow()
             }

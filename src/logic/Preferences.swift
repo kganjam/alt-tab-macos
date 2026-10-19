@@ -521,6 +521,13 @@ enum RuntimeFlags {
     static var keyWindowSuspectRaiseSettleMs: Int { int("keyWindowSuspectRaiseSettleMs", default: 40) }
     static var keyWindowSuspectRaiseTimeoutMs: Int { int("keyWindowSuspectRaiseTimeoutMs", default: 2000) }
     static var keyWindowSuspectMaxProbeMs: Int { int("keyWindowSuspectMaxProbeMs", default: 150) }
+    // REL-114 (ParallelsKeyRouting): keep a Parallels helper's stuck "Starting…" launcher panel out
+    // of the switcher, and enter a helper whose panel held its key window by re-activating it from
+    // the target window (so Parallels routes keystrokes into the guest again).
+    static var parallelsHostPanelHidingEnabled: Bool { bool("parallelsHostPanelHidingEnabled", default: true) }
+    static var parallelsKeySafeActivationEnabled: Bool { bool("parallelsKeySafeActivationEnabled", default: true) }
+    // How long the helper gets to activate itself from the focus click before AltTab SLPS-activates it.
+    static var parallelsKeySafeSelfActivationWaitMs: Int { int("parallelsKeySafeSelfActivationWaitMs", default: 200) }
     // Drop queued AX re-asserts once a newer switch or a user click superseded them.
     static var staleAxReassertGuardEnabled: Bool { bool("staleAxReassertGuardEnabled", default: true) }
     // Minimum spacing between ZENFORCE re-asserts for one native target (0 = every tick).

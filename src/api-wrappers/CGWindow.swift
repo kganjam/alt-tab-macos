@@ -46,6 +46,10 @@ extension CGWindow {
         return value(kCGWindowName, String.self)
     }
 
+    func sharingState() -> Int? {
+        return value(kCGWindowSharingState, Int.self)
+    }
+
     private func value<T>(_ key: CFString, _ type: T.Type) -> T? {
         return self[key] as? T
     }

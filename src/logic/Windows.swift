@@ -1874,6 +1874,7 @@ class Windows {
 
     private static func reassertFrontmostToTarget(targetWid: CGWindowID, targetPid: pid_t, frontPid: pid_t?, source: String) {
         guard let target = list.first(where: { $0.cgWindowId == targetWid }) else { return }
+        if target.application.isParallelsCoherence && ParallelsKeyRouting.interceptReassert(target, source: source) { return }
         var psn = ProcessSerialNumber()
         GetProcessForPID(targetPid, &psn)
         if target.application.isParallelsCoherence {
@@ -2517,6 +2518,7 @@ class Windows {
             if Preferences.spacesToShow[App.shortcutIndex] == .nonVisible && isInVisibleSpace { reasons.append("inVisibleSpace") }
             if Preferences.screensToShow[App.shortcutIndex] == .showingAltTab && !window.isOnScreen(NSScreen.preferred) { reasons.append("notOnAltTabScreen") }
             if !Preferences.showTabsAsWindows && window.isTabbed { reasons.append("tabbed") }
+            if ParallelsKeyRouting.shouldHideFromSwitcher(window) { reasons.append("parallelsHostPanel") }
         }
         if includeSearch && Preferences.onlyShowApplications() && !window.shouldShowTheUser && reasons.isEmpty { reasons.append("applicationGrouped") }
         if includeSearch && !Search.matches(window, query: searchQuery) { reasons.append("searchMismatch") }

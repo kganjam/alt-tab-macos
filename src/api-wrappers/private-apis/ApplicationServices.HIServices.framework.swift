@@ -39,4 +39,17 @@ func GetProcessInformation(_ psn: UnsafeMutablePointer<ProcessSerialNumber>, _ i
 @_silgen_name("GetProcessForPID") @discardableResult
 func GetProcessForPID(_ pid: pid_t, _ psn: UnsafeMutablePointer<ProcessSerialNumber>) -> OSStatus
 
+/// this function from ApplicationServices.HIServices.Processes has been deprecated and removed, with no replacement
+/// returns the psn of the front process, synchronously and from any thread (NSWorkspace's frontmostApplication
+/// only updates on the main run loop)
+/// * macOS 10.9+ (officially removed in 10.9, but available as a private API still)
+@_silgen_name("GetFrontProcess") @discardableResult
+func GetFrontProcess(_ psn: UnsafeMutablePointer<ProcessSerialNumber>) -> OSStatus
+
+/// this function from ApplicationServices.HIServices.Processes has been deprecated and removed, with no replacement
+/// returns the pid for a given psn
+/// * macOS 10.9+ (officially removed in 10.9, but available as a private API still)
+@_silgen_name("GetProcessPID") @discardableResult
+func GetProcessPID(_ psn: UnsafeMutablePointer<ProcessSerialNumber>, _ pid: UnsafeMutablePointer<pid_t>) -> OSStatus
+
 

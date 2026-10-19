@@ -11,6 +11,15 @@ extension CGWindowID {
         return level
     }
 
+    /// `kCGWindowSharingState` from WindowServer's description of this one window (no Screen
+    /// Recording needed); nil once the window is gone.
+    func sharingState() -> Int? {
+        var id = UnsafeRawPointer(bitPattern: UInt(self))
+        guard let ids = CFArrayCreate(kCFAllocatorDefault, &id, 1, nil),
+              let window = (CGWindowListCreateDescriptionFromArray(ids) as? [CGWindow])?.first else { return nil }
+        return window.sharingState()
+    }
+
     func spaces() -> [CGSSpaceID] {
         return CGSCopySpacesForWindows(CGS_CONNECTION, CGSSpaceMask.all.rawValue, [self] as CFArray) as! [CGSSpaceID]
     }
