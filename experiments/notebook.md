@@ -929,3 +929,35 @@ Separate concrete bug in the same log window: after clicking Karabiner `#178148`
 Fix: `Windows.repairClickAfterMismatch` now reasserts the clicked window when `CLICKAFTER` detects a different frontmost app and the clicked window is a recent AltTab target/intent. This keeps the repair bounded to recent AltTab handoffs and avoids interfering with arbitrary user clicks.
 
 Validation: `bash ai/build.sh compile` passed after the patch. Full runtime validation still needs a dev restart and a real click sequence check.
+
+## 2026-10-18 — REL-114: stuck Parallels launcher panel, Outlook keyboard dead
+
+Report: "i couldn't type in the outlook search bar until i switched away to another app and then back". Evidence (AltTab log `/tmp/alttab/20261014-172431.26911.log`, WindowServer Focus log, helper unified log):
+
+- 12:41 Outlook crashed in the VM; Windows restarted it, so its Coherence windows were owned by the VM helper (pid 68786) and macOS never made "Outlook (classic)" frontmost until 16:17.
+- 16:17:06.7 fn+o; `alttab-focus-by-title` found no Outlook window; `focus-window --launch` started the Mac stub: helper pid 93648 front at 16:17:08.159 (own connection, launch). 16:17:08.411 panel #253336 created and focused (`focused-window wid=253336`); 08.6-08.9 Outlook's windows re-created under 93648.
+- 16:17:14.433 user clicked Outlook #253346; 14.445 OneNote's helper made itself front (12 ms later); 14.779 AltTab's XPROC restore `SLPS(userGenerated)+makeKey(253346)` from AltTab's connection (WS `4c4603[SetFrontProcess]`; 4c4603 = AltTab pid 26911, it disappears at the 16:21:39 restart).
+- 16:17:17.7 second fn+o → `cli-focus` same-process path (AX + guest SETTITLE OK). 16:17:21-27 clicks navigated Outlook; 29.1/32.6 clicks into the search box, typing failed (helper's first NSBeep sound path initialised MobileGestalt at 29.971). 33.1-33.8 alt-tab between Outlook windows: Winside FG correct, AX `sysFocus=253344`.
+- 16:17:37.07 Chrome click; 38.78 click on Outlook → helper logged `SetFrontProcess: options=1` (own connection 4cd907) → typing worked (the search box later held "reservation").
+- 16:20:03 the user alt-tabbed to #253336 itself (`ERR no-hwnd` from Winside); 16:21:39 Fn+Shift+T restart of AltTab. At 16:42 the panel was still the helper's key window (AXFocused=1).
+
+Panel anatomy (read through a probe dylib loaded by AltTab's TCC-trusted shim): AXWindow/AXDialog, title '', AXIdentifier `_NS:87`, AXDescription "alert", no close/minimize/zoom, settable only AXPosition, hidden default button "OK" at 230×30 mostly outside the panel, children AXImage, "Outlook (classic)", AXBusyIndicator, "Starting...". CG: sharing state 1 (every guest proxy across 11 helpers is 2), empty kCGWindowName.
+
+Keyboard-routing oracle: Shift down/up posted through the shim (CGEventPost needs AltTab's AX grant), then the guest's `GetLastInputInfo` read in the user session via `prlctl exec --current-user wscript hidden.vbs` (no window), Mac/guest skew from Winside `PING` (guest ~-500 ms). Results 17:11-17:31 PDT:
+
+| Entry into trapped Outlook | Shift reached guest |
+|---|---|
+| AltTab cli-focus (first key-safe build: makeKey(-1,-1) while inactive, then SLPS) | no |
+| AltTab cli-focus, normal path (SLPS userGenerated + makeKey + AX), after AX already showed the Outlook window focused | no (×4) |
+| AXFrontmost=true (helper activates itself via AppKit) | no |
+| real HID click on Outlook's status bar while Outlook active | no |
+| makeKey event record at (500,1030) inside the window while inactive (no activation), then AltTab activation | no |
+| SkyLight click (SLEventPostToPid) at (-1,-1) while inactive | no activation |
+| AXRaise panel + real click on the panel while inactive, then AX focus on Outlook | no |
+| deactivate, then real HID click on Outlook's status bar | yes |
+| deactivate, then SkyLight click at the top caption row (1300,4) / (960,3) ×2 | yes (helper `SetFrontProcess options=1`, ~70 ms) |
+| then AX switch to another Outlook window and back | yes (×2) |
+| control: File Explorer helper (no panel), plain AltTab activation | yes |
+
+Deployed build (2026-10-18 17:29 dev): V1/V3/V4 cross-process and V5 same-process-after-AXFrontmost all logged `activatedBy=helper(click) → armed` and reached the guest; V2 same-process armed took the normal path and reached it; `eval-log-anomalies --strict` failures=0 (5 pre-existing `CGSOrderWindow err=1000` warnings on Par→Mac). One run (V3) saw OneNote's helper activate itself 100 ms after the arm (as at 16:17:14.445); the COUNTER restore put Outlook back and the Shift still reached the guest.
+

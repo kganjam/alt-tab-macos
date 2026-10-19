@@ -17,7 +17,8 @@ original project, see **`UPSTREAM.md`**. Subsystems and where they live:
   thread only; `Applications.removeZombieWindows()` GCs windows closed without an AX event.
 - Focus / z-order / recency: `src/logic/Windows.swift`, `Window.focus()`,
   `src/logic/events/AccessibilityEvents.swift` (see "Per-window focus behavior").
-- Parallels Coherence: `src/logic/Window.swift`, `src/ui/App.swift`.
+- Parallels Coherence: `src/logic/Window.swift`, `src/ui/App.swift`,
+  `src/logic/ParallelsKeyRouting.swift` (helper launcher panels, keyboard re-arm; REL-114).
 - Thumbnail capture & IOSurface budget: `src/logic/events/WindowCaptureEvents.swift`,
   `src/logic/ThumbnailCache.swift`, `src/logic/BackgroundThumbnailRefresher.swift`
   (see "Thumbnail capture & IOSurface budget" below).
@@ -198,7 +199,10 @@ capture correctness is NOT unit-tested — that is the `ai/` eval harness's job.
   opt-in environment flags.
 - To verify keyboard focus without typing into the target, post Shift
   down/up only. It exercises focus delivery without inserting text or
-  sending Enter/Tab into the user's active Terminal.
+  sending Enter/Tab into the user's active Terminal. For Parallels Coherence
+  targets AX focus is no evidence that keystrokes reach the guest (REL-114):
+  compare the guest's `GetLastInputInfo` before/after the Shift (notebook
+  2026-10-18 has the recipe, including the Mac/guest clock skew).
 - Do not re-enable automatic stuck-permission-popup flushing casually.
   `flushStuckAuthPopupsThreshold=0` is the safe default; enabling it can
   create repeated UserNotificationCenter/usernotificationsd kill loops if
