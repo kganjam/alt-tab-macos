@@ -42,6 +42,7 @@ enum ParallelsKeyRouting {
     private static var lastActivationLogAt = [pid_t: CFAbsoluteTime]()
     private static var panelFirstSeen = [CGWindowID: CFAbsoluteTime]()
     private static var stuckPanelsLogged = Set<CGWindowID>()
+    private static var captionClicks = 0
     private static let reassertSourcesWithUserIntent: Set<String> = ["XPROC", "CLICKAFTER"]
     private static let maxConsecutiveFailures = 3
 
@@ -139,7 +140,8 @@ enum ParallelsKeyRouting {
         let before = Applications.axFocusedWindowId(pid: request.pid, timeout: 0.15).wid
         let deactivated = deactivateIfFront(request.pid)
         let inactive = frontPid() != request.pid
-        let clickPoint = inactive ? request.target.postSkyLightCaptionClick() : nil
+        captionClicks += 1
+        let clickPoint = inactive ? request.target.postSkyLightCaptionClick(shifted: captionClicks % 2 == 0) : nil
         let selfActivated = clickPoint != nil && waitFor(milliseconds: RuntimeFlags.parallelsKeySafeSelfActivationWaitMs) { frontPid() == request.pid }
         if !selfActivated {
             activateFromOutside(request)

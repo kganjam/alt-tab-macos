@@ -617,9 +617,11 @@ class Window {
     /// the helper while it is inactive. Aimed at the middle of the window's top pixel rows: the
     /// resize band of a normal guest window, or bare caption (Outlook's sits between its search box
     /// and account picture), never a control. A point outside the window doesn't activate the helper.
-    func postSkyLightCaptionClick() -> CGPoint? {
+    /// `shifted` moves it 24 px right, so two clicks in quick succession are never one guest
+    /// double-click (which would maximize the window).
+    func postSkyLightCaptionClick(shifted: Bool) -> CGPoint? {
         guard let cgWindowId, let bounds = skyLightClickBounds() else { return nil }
-        let point = CGPoint(x: bounds.midX, y: bounds.minY + 3)
+        let point = CGPoint(x: bounds.midX + (shifted ? 24 : 0), y: bounds.minY + 3)
         return postSkyLightClick(cgWindowId, bounds, point) ? point : nil
     }
 
