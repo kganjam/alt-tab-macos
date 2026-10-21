@@ -112,19 +112,31 @@ class TilesPanel: NSPanel {
         DispatchQueue.main.async { self.logRunningAnimations("after scroller flash") }
     }
 
-    /// Running animations; those added in the show's transaction delay `panel render complete`.
+    /// Running animations in any of AltTab's windows; those added in the show's transaction delay
+    /// `panel render complete`. An empty probe transaction tells a held completion from a late one.
     private func logRunningAnimations(_ moment: String) {
-        guard Diagnostics.shouldLog("REFRESH"), let root = contentView?.superview?.layer ?? contentView?.layer else { return }
+        guard Diagnostics.shouldLog("REFRESH") else { return }
+        let found = NSApp.windows.flatMap { Self.runningAnimations($0) }
+        Diagnostics.log("REFRESH", "panel animations \(moment): \(found.isEmpty ? "none" : found.prefix(8).joined(separator: ", "))")
+        let probeAt = CFAbsoluteTimeGetCurrent()
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { Diagnostics.log("REFRESH", String(format: "panel animations \(moment): empty probe transaction completed after %.0fms", (CFAbsoluteTimeGetCurrent() - probeAt) * 1000)) }
+        CATransaction.commit()
+    }
+
+    private static func runningAnimations(_ window: NSWindow) -> [String] {
+        guard var root = window.contentView?.layer else { return [] }
+        while let parent = root.superlayer { root = parent }
         var found = [String]()
         var stack = [root]
-        while let layer = stack.popLast(), found.count < 8 {
+        while let layer = stack.popLast() {
             for key in layer.animationKeys() ?? [] {
                 let duration = layer.animation(forKey: key).map { String(format: "%.2fs", $0.duration) } ?? "?"
-                found.append("\(type(of: layer)).\(layer.name ?? "-"):\(key)=\(duration)")
+                found.append("\(type(of: window))/\(type(of: layer)):\(key)=\(duration)")
             }
             stack.append(contentsOf: layer.sublayers ?? [])
         }
-        Diagnostics.log("REFRESH", "panel animations \(moment): \(found.isEmpty ? "none" : found.joined(separator: ", "))")
+        return found
     }
 
     static func maxThumbnailsWidth(_ screen: NSScreen = NSScreen.preferred) -> CGFloat {
