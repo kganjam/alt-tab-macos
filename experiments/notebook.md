@@ -998,3 +998,16 @@ Results (CLI bench, user idle, same poller): keypress → on screen 210 ms media
 (n=828 real shows) before, **11 / 14 ms** after. Of the remaining ~180 ms, 100 ms is
 `windowDisplayDelay`, ~12 ms show prep, ~15 ms build and order-front, ~40-60 ms first commit + WindowServer.
 `panel render complete` is unchanged (~0.5 s), as expected from the above.
+
+Real use after the deploy (build 2026-10-21 02:35, pid 40642, 26 shows 09:16-09:56 PDT, info level), by
+display-delay group (`ai/panel-latency-stats.py`; before = old build, 959 shows):
+
+| Group | build before → after (median / p90) | `panel on screen` sinceShowStart after | poller keypress → on screen before → after |
+|---|---|---|---|
+| normal 100 ms | 34 / 49 → 12 / 31 ms | 225 / 290 ms (n=9) | 224 / 372 (n=14) → 219 / 423 ms (n=10) |
+| Coherence 300 ms to Parallels | 45 / 63 → 20 / 23 ms | 402 / 416 ms (n=10) | — → 386 / 399 ms (n=10) |
+
+Real use is noisy (a Zoom meeting, the first shows after 7 h idle) and the gain (~20 ms of build) is
+within it; the controlled bench shows it. `sinceShowStart` counts from the latest hotkey press, so a
+re-press during the delay shortens it. Remaining tail: REL-115 (z-order enforcement after a switch
+blocking the next show, 0.3-0.85 s, ~2% of shows).
