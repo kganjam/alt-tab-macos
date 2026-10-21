@@ -90,53 +90,19 @@ class TilesPanel: NSPanel {
     func show(_ showStartedAt: CFAbsoluteTime) {
         updateAppearance()
         alphaValue = 1
-        let alreadyOnScreen = isVisible && occlusionState.contains(.visible)
-        pendingShow = alreadyOnScreen ? nil : (showStartedAt, CFAbsoluteTimeGetCurrent())
+        pendingShow = isVisible && occlusionState.contains(.visible) ? nil : (showStartedAt, CFAbsoluteTimeGetCurrent())
         makeKeyAndOrderFront(nil)
         ContextMenuEvents.toggle(true)
         CursorEvents.toggle(true)
-        if alreadyOnScreen {
-            DispatchQueue.main.async { TilesView.scrollView.flashScrollers() }
-        }
+        DispatchQueue.main.async { TilesView.scrollView.flashScrollers() }
     }
 
-    /// The panel reached the screen: log the latency, then flash the scrollers. Flashed in the show's
-    /// own transaction (as before), any animation the flash adds holds that transaction's completion
-    /// (`panel render complete`) until it ends.
-    private func shownOnScreen(_ shown: (startedAt: CFAbsoluteTime, orderedFrontAt: CFAbsoluteTime)) {
+    /// The user-visible latency. `panel render complete` (App.buildUiAndShowPanel) comes ~0.45s
+    /// after this, with the panel already fully drawn (2026-10-21, experiments/notebook.md).
+    private func logShownOnScreen(_ shown: (startedAt: CFAbsoluteTime, orderedFrontAt: CFAbsoluteTime)) {
         let now = CFAbsoluteTimeGetCurrent()
         let sinceShowStart = shown.startedAt > 0 ? (now - shown.startedAt) * 1000 : -1
         Diagnostics.log("PANEL", String(format: "panel on screen: sinceShowStart=%.0fms sinceOrderFront=%.0fms windows=%d", sinceShowStart, (now - shown.orderedFrontAt) * 1000, Windows.list.count))
-        logRunningAnimations("on screen")
-        TilesView.scrollView.flashScrollers()
-        DispatchQueue.main.async { self.logRunningAnimations("after scroller flash") }
-    }
-
-    /// Running animations in any of AltTab's windows; those added in the show's transaction delay
-    /// `panel render complete`. An empty probe transaction tells a held completion from a late one.
-    private func logRunningAnimations(_ moment: String) {
-        guard Diagnostics.shouldLog("REFRESH") else { return }
-        let found = NSApp.windows.flatMap { Self.runningAnimations($0) }
-        Diagnostics.log("REFRESH", "panel animations \(moment): \(found.isEmpty ? "none" : found.prefix(8).joined(separator: ", "))")
-        let probeAt = CFAbsoluteTimeGetCurrent()
-        CATransaction.begin()
-        CATransaction.setCompletionBlock { Diagnostics.log("REFRESH", String(format: "panel animations \(moment): empty probe transaction completed after %.0fms", (CFAbsoluteTimeGetCurrent() - probeAt) * 1000)) }
-        CATransaction.commit()
-    }
-
-    private static func runningAnimations(_ window: NSWindow) -> [String] {
-        guard var root = window.contentView?.layer else { return [] }
-        while let parent = root.superlayer { root = parent }
-        var found = [String]()
-        var stack = [root]
-        while let layer = stack.popLast() {
-            for key in layer.animationKeys() ?? [] {
-                let duration = layer.animation(forKey: key).map { String(format: "%.2fs", $0.duration) } ?? "?"
-                found.append("\(type(of: window))/\(type(of: layer)):\(key)=\(duration)")
-            }
-            stack.append(contentsOf: layer.sublayers ?? [])
-        }
-        return found
     }
 
     static func maxThumbnailsWidth(_ screen: NSScreen = NSScreen.preferred) -> CGFloat {
@@ -185,7 +151,7 @@ extension TilesPanel: NSWindowDelegate {
     func windowDidChangeOcclusionState(_ notification: Notification) {
         guard occlusionState.contains(.visible), let shown = pendingShow else { return }
         pendingShow = nil
-        shownOnScreen(shown)
+        logShownOnScreen(shown)
     }
 
     func windowDidResignKey(_ notification: Notification) {

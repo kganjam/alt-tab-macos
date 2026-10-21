@@ -1466,10 +1466,9 @@ class App: AppCenterApplication {
         TilesView.startVisibleThumbnailRefreshTimer()
         let builtAt = CFAbsoluteTimeGetCurrent()
         Diagnostics.log("REFRESH", String(format: "show build: appearance=%.1fms refreshUi=%.1fms orderFront=%.1fms previewAndInput=%.1fms visibleThumbnails=%.1fms total=%.1fms", (afterAppearanceAt - enteredAt) * 1000, (buildStartedAt - afterAppearanceAt) * 1000, (afterOrderFrontAt - buildStartedAt) * 1000, (beforeThumbnailsAt - afterOrderFrontAt) * 1000, (builtAt - beforeThumbnailsAt) * 1000, (builtAt - enteredAt) * 1000))
-        // Fires once this show's CoreAnimation transaction is committed and any animation added in it
-        // has finished. `sinceShowStart` is from the keypress; `build+render` starts at `showPanel`.
-        // Any animation added in that transaction stretches it, so the time the panel reaches the
-        // screen is the separate `panel on screen` line (TilesPanel), and the scroller flash starts then.
+        // Fires once this show's CoreAnimation transaction completes. `sinceShowStart` is from the
+        // keypress; `build+render` starts at `showPanel`. It comes ~0.45s after the panel is fully on
+        // screen (no animation or fade holds it), so the user-visible latency is `panel on screen`.
         CATransaction.setCompletionBlock {
             let now = CFAbsoluteTimeGetCurrent()
             let sinceShow = showStartRef > 0 ? (now - showStartRef) * 1000 : -1
