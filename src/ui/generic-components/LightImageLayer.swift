@@ -6,6 +6,8 @@ class LightImageLayer: CALayer {
     private var outlineLayer: CAShapeLayer!
     private var handRaisedLayer: CALayer!
     private let withTransparencyChecks: Bool
+    private var transparencyCheckedImage: CGImage?
+    private var transparencyCheckedResult = false
 
     init(withTransparencyChecks: Bool = false) {
         self.withTransparencyChecks = withTransparencyChecks
@@ -86,12 +88,14 @@ class LightImageLayer: CALayer {
         var fullyTransparent = false
         switch caLayerContents {
         case .cgImage(let image?):
-            contents = image
+            // Each show re-applies every tile's image; re-setting the same one makes CoreAnimation prepare it again.
+            if contents as AnyObject? !== image { contents = image }
             if withTransparencyChecks {
-                fullyTransparent = image.isFullyTransparent()
+                fullyTransparent = isFullyTransparent(image)
             }
         case .pixelBuffer(let pixelBuffer?):
             contents = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue()
+            transparencyCheckedImage = nil
         default: break
         }
         if frame.size != size {
@@ -103,7 +107,17 @@ class LightImageLayer: CALayer {
         }
     }
 
+    /// The check copies the image's bytes; an image never changes, so check each one once.
+    private func isFullyTransparent(_ image: CGImage) -> Bool {
+        if transparencyCheckedImage !== image {
+            transparencyCheckedImage = image
+            transparencyCheckedResult = image.isFullyTransparent()
+        }
+        return transparencyCheckedResult
+    }
+
     func releaseImage() {
         contents = nil
+        transparencyCheckedImage = nil
     }
 }

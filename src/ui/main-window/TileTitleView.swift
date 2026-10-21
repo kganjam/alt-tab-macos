@@ -37,6 +37,13 @@ class TileTitleView: NSTextField {
         frame.size.width = width
     }
 
+    /// Every show re-applies each tile's title; an unchanged one must not dirty the label, or the
+    /// show's first commit redraws the text of every tile, on screen or not.
+    func setAttributedStringIfChanged(_ value: NSAttributedString) {
+        guard !attributedStringValue.isEqual(to: value) else { return }
+        attributedStringValue = value
+    }
+
     func updateTruncationModeIfNeeded() {
         let newLineBreakMode = getTruncationMode()
         if lineBreakMode != newLineBreakMode {

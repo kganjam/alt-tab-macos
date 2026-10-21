@@ -99,6 +99,9 @@
 		BB0000000000000000000008 /* ParallelsHostPanelTestable.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000007 /* ParallelsHostPanelTestable.swift */; };
 		BB0000000000000000000009 /* ParallelsHostPanelTestable.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000007 /* ParallelsHostPanelTestable.swift */; };
 		BB000000000000000000000B /* ParallelsHostPanelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000000000000000000000A /* ParallelsHostPanelTests.swift */; };
+		CC0000000000000000000A02 /* TileLayoutTestable.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000A01 /* TileLayoutTestable.swift */; };
+		CC0000000000000000000A03 /* TileLayoutTestable.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000A01 /* TileLayoutTestable.swift */; };
+		CC0000000000000000000A05 /* TileLayoutTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000A04 /* TileLayoutTests.swift */; };
 		BF0C803A13C409E7F01FBCAB /* SkyLight.framework.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF0C8B94D7994AB9007F6391 /* SkyLight.framework.swift */; };
 		BF0C80484AA63306D0DB4DB2 /* SpacesEvents.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF0C8DF008F1EB5F23291A13 /* SpacesEvents.swift */; };
 		BF0C8052AE41B1B10E42BFCE /* InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = BF0C875C983226CB16DBD90F /* InfoPlist.strings */; };
@@ -442,6 +445,8 @@
 		BB0000000000000000000005 /* ParallelsKeyRouting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParallelsKeyRouting.swift; sourceTree = "<group>"; };
 		BB0000000000000000000007 /* ParallelsHostPanelTestable.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParallelsHostPanelTestable.swift; sourceTree = "<group>"; };
 		BB000000000000000000000A /* ParallelsHostPanelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParallelsHostPanelTests.swift; sourceTree = "<group>"; };
+		CC0000000000000000000A01 /* TileLayoutTestable.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TileLayoutTestable.swift; sourceTree = "<group>"; };
+		CC0000000000000000000A04 /* TileLayoutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TileLayoutTests.swift; sourceTree = "<group>"; };
 		BF0C800363086A5ED019FE11 /* google_translate_all_terms_locally.py */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.script.python; path = google_translate_all_terms_locally.py; sourceTree = "<group>"; };
 		BF0C804765D0E6A92C6646CC /* gu */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.strings; name = gu; path = InfoPlist.strings; sourceTree = "<group>"; };
 		BF0C8070A1BBA8B425C8EF34 /* IOKit.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IOKit.swift; sourceTree = "<group>"; };
@@ -1191,6 +1196,7 @@
 				BF0C899905524253DC170B56 /* KeyboardEventsTests.swift */,
 				BF0CAAAA0000000000000001 /* SearchAcronymTests.swift */,
 				BB000000000000000000000A /* ParallelsHostPanelTests.swift */,
+				CC0000000000000000000A04 /* TileLayoutTests.swift */,
 				BF0C829EAA93A4C4ADB42CF8 /* Mocks.swift */,
 				BF0C8C6810FF50908E637A48 /* ConcurrentScreenshots.swift */,
 				BF0C855CD9DBCAEFE48F9EA5 /* AXUIElementTests.swift */,
@@ -1758,6 +1764,7 @@
 				D04BA258B56193958D60978A /* TileView.swift */,
 				5F7B6AFB2F3BAB98003E25E8 /* StatusIconsView.swift */,
 				D04BAA998119CAA8B70A2B67 /* TilesView.swift */,
+				CC0000000000000000000A01 /* TileLayoutTestable.swift */,
 				D04BAFC0A1B2C3D4E5F60001 /* TileOverView.swift */,
 				D04BAFC2A1B2C3D4E5F60003 /* TileUnderLayer.swift */,
 			);
@@ -2569,6 +2576,8 @@
 				BF0CAAAA0000000000001001 /* SearchAcronymTests.swift in Sources */,
 				BB000000000000000000000B /* ParallelsHostPanelTests.swift in Sources */,
 				BB0000000000000000000009 /* ParallelsHostPanelTestable.swift in Sources */,
+				CC0000000000000000000A03 /* TileLayoutTestable.swift in Sources */,
+				CC0000000000000000000A05 /* TileLayoutTests.swift in Sources */,
 				BF0C8C5FA4B401A8C0F75B7A /* KeyboardEventsTestable.swift in Sources */,
 				F00DCAFE0000000000001103 /* SearchTestable.swift in Sources */,
 				BF0C875A28B98904F8F4A66A /* ATShortcut.swift in Sources */,
@@ -2607,6 +2616,7 @@
 				BB0000000000000000000004 /* KeyWindowSuspects.swift in Sources */,
 				BB0000000000000000000006 /* ParallelsKeyRouting.swift in Sources */,
 				BB0000000000000000000008 /* ParallelsHostPanelTestable.swift in Sources */,
+				CC0000000000000000000A02 /* TileLayoutTestable.swift in Sources */,
 				AA974BA929B7D84C0099A29E /* PreviewPanel.swift in Sources */,
 				D04BA3CF766857381519B892 /* BackgroundWork.swift in Sources */,
 				A1B600A20DF04A308DCB6E04 /* ThumbnailCache.swift in Sources */,

@@ -218,14 +218,14 @@ class TileView: FlippedView {
                 // Render the cached thumbnail directly. It was decompressed
                 // off-main during the display delay (`preDecompressForShow`), so
                 // it's resident → cheap to composite even after a long idle.
-                thumbnail.updateContents(screenshot, TileView.thumbnailSize(element.size, false))
+                thumbnail.updateContents(screenshot, TileView.thumbnailFrameSize(element))
             } else {
                 // No usable thumbnail (never captured, or capture rejected): show
                 // the app icon aspect-fit into the window's thumbnail dimensions
                 // (when known) so the cell keeps its size and the icon isn't
                 // stretched to the window's rectangle. Must match
                 // showAppIconOnVisibleTileIfNeeded so async rejects don't flicker.
-                thumbnail.updateContents(.cgImage(element.icon), element.iconPlaceholderThumbnailSize(), .resizeAspect)
+                thumbnail.updateContents(.cgImage(element.icon), TileView.thumbnailFrameSize(element), .resizeAspect)
             }
         }
         let title = getAppOrAndWindowTitle()
@@ -268,7 +268,7 @@ class TileView: FlippedView {
         let attributes = baseTitleAttributes()
         let query = Search.normalizedQuery(Windows.searchQuery)
         if query.isEmpty {
-            label.attributedStringValue = NSAttributedString(string: fullTitle, attributes: attributes)
+            label.setAttributedStringIfChanged(NSAttributedString(string: fullTitle, attributes: attributes))
             return
         }
         let clippingAttributes = baseTitleAttributes(true)
@@ -288,7 +288,7 @@ class TileView: FlippedView {
             attributed.addAttribute(TileTitleView.searchHighlightBackgroundKey, value: Appearance.searchMatchHighlightColor, range: range)
             attributed.addAttribute(.foregroundColor, value: Appearance.searchMatchForegroundColor, range: range)
         }
-        label.attributedStringValue = attributed
+        label.setAttributedStringIfChanged(attributed)
     }
 
     private func baseTitleAttributes(_ forceClipping: Bool = false) -> [NSAttributedString.Key: Any] {
@@ -512,20 +512,27 @@ class TileView: FlippedView {
     }
 
     private func setFrameWidthHeight(_ newHeight: CGFloat) {
-        var contentWidth = CGFloat(0)
-        if Preferences.appearanceStyle == .thumbnails {
-            // Preferred to the width of the image, and the minimum width may be set to be large.
-            contentWidth = thumbnail.frame.size.width
-        } else if Preferences.appearanceStyle == .titles {
-            contentWidth = TileView.maxThumbnailWidth() - Appearance.edgeInsetsSize * 2
-        } else {
-            contentWidth = Appearance.iconSize
-        }
-        let frameWidth = (contentWidth + Appearance.edgeInsetsSize * 2).rounded()
-        let widthMin = TileView.minThumbnailWidth()
-        let width = max(frameWidth, widthMin).rounded()
-        assignIfDifferent(&frame.size.width, width)
+        // Preferred to the width of the image, and the minimum width may be set to be large.
+        let contentWidth = Preferences.appearanceStyle == .thumbnails ? thumbnail.frame.size.width : TileView.nonThumbnailContentWidth()
+        assignIfDifferent(&frame.size.width, TileView.frameWidth(contentWidth))
         assignIfDifferent(&frame.size.height, newHeight)
+    }
+
+    /// The width `updateRecycledCellWithNewContent` gives the tile showing `window` at the current size.
+    static func width(_ window: Window) -> CGFloat {
+        frameWidth(Preferences.appearanceStyle == .thumbnails ? thumbnailFrameSize(window).width : nonThumbnailContentWidth())
+    }
+
+    static func thumbnailFrameSize(_ window: Window) -> NSSize {
+        window.thumbnail != nil ? thumbnailSize(window.size, false) : window.iconPlaceholderThumbnailSize()
+    }
+
+    private static func nonThumbnailContentWidth() -> CGFloat {
+        Preferences.appearanceStyle == .titles ? maxThumbnailWidth() - Appearance.edgeInsetsSize * 2 : Appearance.iconSize
+    }
+
+    private static func frameWidth(_ contentWidth: CGFloat) -> CGFloat {
+        TileLayoutTestable.tileWidth(contentWidth: contentWidth, edgeInsets: Appearance.edgeInsetsSize, widthMin: minThumbnailWidth())
     }
 
     private func getAccessibilityHelp(_ appName: String?, _ dockLabel: String?) -> String {

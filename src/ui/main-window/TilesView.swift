@@ -377,35 +377,23 @@ class TilesView {
         }
     }
 
+    /// Grid height at the current size, computed from each window's tile width without updating the tile views.
     private static func dryRunLayoutTileViews(_ widthMax: CGFloat) -> CGFloat {
-        let labelHeight = Self.layoutCache.labelHeight
-        let height = TileView.height(labelHeight)
+        let height = TileView.height(layoutCache.labelHeight)
+        let widths = Windows.list.prefix(recycledViews.count).map { Windows.shouldDisplay($0) ? TileView.width($0) : nil }
+        updateFirstTileForCachedSizes(height)
         let isLeftToRight = App.shared.userInterfaceLayoutDirection == .leftToRight
-        let startingX = isLeftToRight ? Appearance.interCellPadding : widthMax - Appearance.interCellPadding
-        var currentX = startingX
-        var currentY = Appearance.interCellPadding
-        var maxY = currentY + height + Appearance.interCellPadding
-        var index = 0
-        while index < TilesView.recycledViews.count {
-            guard App.appIsBeingUsed else { return maxY }
-            defer { index += 1 }
-            let view = TilesView.recycledViews[index]
-            guard index < Windows.list.count else { break }
-            let window = Windows.list[index]
-            guard Windows.shouldDisplay(window) else { view.frame = .zero; continue }
-            view.updateRecycledCellWithNewContent(window, index, height)
-            let width = view.frame.size.width
-            let projectedX = projectedWidth(currentX, width).rounded(.down)
-            if needNewLine(projectedX, widthMax) {
-                currentX = startingX
-                currentY = (currentY + height + Appearance.interCellPadding).rounded(.down)
-                currentX = projectedWidth(currentX, width).rounded(.down)
-                maxY = max(currentY + height + Appearance.interCellPadding, maxY)
-            } else {
-                currentX = projectedX
-            }
+        return TileLayoutTestable.packedHeight(widths, tileHeight: height, padding: Appearance.interCellPadding, widthMax: widthMax, leftToRight: isLeftToRight)
+    }
+
+    /// `updateCachedSizes` measures the first tile, so it gets this size's content, as the full pass that the dry run replaced gave it.
+    private static func updateFirstTileForCachedSizes(_ height: CGFloat) {
+        guard let view = recycledViews.first, let window = Windows.list.first else { return }
+        guard Windows.shouldDisplay(window) else {
+            view.frame = .zero
+            return
         }
-        return maxY
+        view.updateRecycledCellWithNewContent(window, 0, height)
     }
 
     private static func layoutTileViews(_ widthMax: CGFloat) -> (CGFloat, CGFloat, CGFloat, [Int])? {
@@ -469,17 +457,11 @@ class TilesView {
     }
 
     private static func needNewLine(_ projectedX: CGFloat, _ widthMax: CGFloat) -> Bool {
-        if App.shared.userInterfaceLayoutDirection == .leftToRight {
-            return projectedX > widthMax
-        }
-        return projectedX < 0
+        TileLayoutTestable.overflows(projectedX, widthMax, App.shared.userInterfaceLayoutDirection == .leftToRight)
     }
 
     private static func projectedWidth(_ currentX: CGFloat, _ width: CGFloat) -> CGFloat {
-        if App.shared.userInterfaceLayoutDirection == .leftToRight {
-            return currentX + width + Appearance.interCellPadding
-        }
-        return currentX - width - Appearance.interCellPadding
+        TileLayoutTestable.projected(currentX, width, Appearance.interCellPadding, App.shared.userInterfaceLayoutDirection == .leftToRight)
     }
 
     private static func localizedCurrentX(_ currentX: CGFloat, _ width: CGFloat) -> CGFloat {
