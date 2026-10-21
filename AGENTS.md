@@ -71,10 +71,15 @@ Use `bash ai/build.sh {compile|dev|install}`. Three modes, one script:
   re-grant prompts.** Use only when `shim/main.c`, Pods, framework deps,
   or entitlements change — rare.
 
-Unit tests (pure-logic, 24 cases): `xcodebuild test -workspace alt-tab-macos.xcworkspace
+On a shared, memory-tight Mac, `ALTTAB_BUILD_JOBS=4` caps compile jobs and
+`ALTTAB_BUILD_WRAP="lockf -k /tmp/claude-heavy-build.lock taskpolicy -m 8192"` makes
+xcodebuild take turns with other heavy builds (any `ai/build.sh` mode).
+
+Unit tests (pure-logic, 37 cases): `xcodebuild test -workspace alt-tab-macos.xcworkspace
 -scheme Test -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO`. They cover
-Appearance / shortcut-recorder / keyboard-utils / search acronyms. Focus / z-order /
-capture correctness is NOT unit-tested — that is the `ai/` eval harness's job.
+Appearance / shortcut-recorder / keyboard-utils / search acronyms / Parallels host panels /
+tile row packing. Focus / z-order / capture correctness is NOT unit-tested — that is the
+`ai/` eval harness's job.
 
 # Working notes and accessory docs
 
@@ -114,6 +119,11 @@ capture correctness is NOT unit-tested — that is the `ai/` eval harness's job.
   only for rare full bundle/signing changes.
 - `ai/profile.sh` contains profiling helpers for Time Profiler / system
   tracing. Prefer it when latency claims need real profiler evidence.
+- Switcher show latency: `python3 ai/panel-latency-stats.py [log]`. The
+  user-visible number is `panel on screen` (WindowServer reports the panel
+  visible). `panel render complete` comes ~0.45 s after the panel is fully
+  drawn (a CATransaction completion; not an animation or fade), so never
+  use it as "time to show" (notebook 2026-10-21).
 - `ai/run.sh` is a lightweight local run helper for development workflows.
 - `ai/tcc.sh` inspects or repairs Accessibility/Screen Recording grants.
   Use it only when TCC state is part of the problem; don't reset TCC as

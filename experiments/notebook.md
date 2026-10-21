@@ -961,3 +961,40 @@ Keyboard-routing oracle: Shift down/up posted through the shim (CGEventPost need
 
 Deployed build (2026-10-18 17:29 dev): V1/V3/V4 cross-process and V5 same-process-after-AXFrontmost all logged `activatedBy=helper(click) → armed` and reached the guest; V2 same-process armed took the normal path and reached it; `eval-log-anomalies --strict` failures=0 (5 pre-existing `CGSOrderWindow err=1000` warnings on Par→Mac). One run (V3) saw OneNote's helper activate itself 100 ms after the arm (as at 16:17:14.445); the COUNTER restore put Outlook back and the Shift still reached the guest.
 
+
+## 2026-10-21 — Switcher show latency: the 0.5 s "build+render" is not on screen
+
+Report: the panel takes ~0.67 s to appear; `panel render complete` said `build+render≈520ms` in ~80% of
+959 shows (2026-10-18..21, 185 windows, appearance thumbnails + auto size, `windowDisplayDelay=100`).
+
+Measurements (old build 2026-10-18 17:33, pid 84010):
+
+- External poller of the panel window's `kCGWindowIsOnscreen` (one `CGWindowListCreateDescriptionFromArray`
+  every 2 ms during each show): on screen **65 ms** (median, n=15) after `showPanel`, **209 ms** after the
+  keypress ("new session" line), while the same shows logged `build+render` 522 ms.
+- Shows hidden 6-19 ms after `showPanel` still logged `render complete` ~500 ms later: the wait does not
+  depend on the panel being up.
+- `sample` of real and CLI (`--show=0`/`--hide`, user idle) shows: the main thread is idle for most of the
+  0.5 s. What it did do: `refreshUi` with auto size ran the full tile update for all tiles three extra
+  times (large/medium/small dry runs) and re-set every title, so the commit redrew every label (~120 ms of
+  `TileTitleView.draw` when an AX title change re-ran it with the panel open); z-order enforcement
+  `SLWindowListCopyWindowInfo` from the previous switch (one show, ~600 ms of main thread in 1.2 s);
+  thumbnail completions (`contentSignature`, CA `copy_image` colour conversion) after the 300 ms deferred
+  refresh.
+- New build with diagnostics: when WindowServer reports the panel visible, no AltTab window has any
+  CoreAnimation animation, an empty probe transaction completes in 0 ms, and `render complete` still
+  follows ~0.42 s later, also with the scroller flash moved out of the show's transaction. A
+  ScreenCaptureKit luminance probe of the panel area showed the panel appear fully in one frame (no fade).
+  The cause of the late completion is unknown; it is not user-visible.
+
+Changes (branch `panel-show-latency`): the auto-size dry run packs pure tile widths
+(`TileLayoutTestable.packedHeight`) and only refreshes the first tile (which `updateCachedSizes`
+measures); titles are re-set only when changed; image layers skip re-setting the same image and check
+each image's transparency once; new `panel on screen` (info) and `show build` (perf) lines;
+`ai/panel-latency-stats.py`.
+
+Results (CLI bench, user idle, same poller): keypress → on screen 210 ms median / 384 p90 (n=12) before,
+**180 / 217 ms** (n=20) after; tile build (`display delay` → `showPanel` minus 100 ms) 34 / 49 ms
+(n=828 real shows) before, **11 / 14 ms** after. Of the remaining ~180 ms, 100 ms is
+`windowDisplayDelay`, ~12 ms show prep, ~15 ms build and order-front, ~40-60 ms first commit + WindowServer.
+`panel render complete` is unchanged (~0.5 s), as expected from the above.
