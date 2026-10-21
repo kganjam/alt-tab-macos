@@ -7,6 +7,8 @@ class TilesPanel: NSPanel {
     static var shared: TilesPanel!
     private var frozenTopCenter: NSPoint?
     private var highWaterHeight: CGFloat = 0
+    /// A show waiting for WindowServer to report the panel visible (`windowDidChangeOcclusionState`).
+    private var pendingShow: (startedAt: CFAbsoluteTime, orderedFrontAt: CFAbsoluteTime)?
 
     convenience init() {
         self.init(contentRect: .zero, styleMask: .nonactivatingPanel, backing: .buffered, defer: false)
@@ -70,6 +72,7 @@ class TilesPanel: NSPanel {
     }
 
     override func orderOut(_ sender: Any?) {
+        pendingShow = nil
         TilesView.clearNeedsLayout()
         if Preferences.fadeOutAnimation {
             NSAnimationContext.runAnimationGroup(
@@ -83,13 +86,45 @@ class TilesPanel: NSPanel {
         }
     }
 
-    func show() {
+    /// `showStartedAt`: when the keypress that led to this show was handled.
+    func show(_ showStartedAt: CFAbsoluteTime) {
         updateAppearance()
         alphaValue = 1
+        let alreadyOnScreen = isVisible && occlusionState.contains(.visible)
+        pendingShow = alreadyOnScreen ? nil : (showStartedAt, CFAbsoluteTimeGetCurrent())
         makeKeyAndOrderFront(nil)
         ContextMenuEvents.toggle(true)
         CursorEvents.toggle(true)
-        DispatchQueue.main.async { TilesView.scrollView.flashScrollers() }
+        if alreadyOnScreen {
+            DispatchQueue.main.async { TilesView.scrollView.flashScrollers() }
+        }
+    }
+
+    /// The panel reached the screen: log the latency, then flash the scrollers. Flashed in the show's
+    /// own transaction (as before), any animation the flash adds holds that transaction's completion
+    /// (`panel render complete`) until it ends.
+    private func shownOnScreen(_ shown: (startedAt: CFAbsoluteTime, orderedFrontAt: CFAbsoluteTime)) {
+        let now = CFAbsoluteTimeGetCurrent()
+        let sinceShowStart = shown.startedAt > 0 ? (now - shown.startedAt) * 1000 : -1
+        Diagnostics.log("PANEL", String(format: "panel on screen: sinceShowStart=%.0fms sinceOrderFront=%.0fms windows=%d", sinceShowStart, (now - shown.orderedFrontAt) * 1000, Windows.list.count))
+        logRunningAnimations("on screen")
+        TilesView.scrollView.flashScrollers()
+        DispatchQueue.main.async { self.logRunningAnimations("after scroller flash") }
+    }
+
+    /// Running animations; those added in the show's transaction delay `panel render complete`.
+    private func logRunningAnimations(_ moment: String) {
+        guard Diagnostics.shouldLog("REFRESH"), let root = contentView?.superview?.layer ?? contentView?.layer else { return }
+        var found = [String]()
+        var stack = [root]
+        while let layer = stack.popLast(), found.count < 8 {
+            for key in layer.animationKeys() ?? [] {
+                let duration = layer.animation(forKey: key).map { String(format: "%.2fs", $0.duration) } ?? "?"
+                found.append("\(type(of: layer)).\(layer.name ?? "-"):\(key)=\(duration)")
+            }
+            stack.append(contentsOf: layer.sublayers ?? [])
+        }
+        Diagnostics.log("REFRESH", "panel animations \(moment): \(found.isEmpty ? "none" : found.joined(separator: ", "))")
     }
 
     static func maxThumbnailsWidth(_ screen: NSScreen = NSScreen.preferred) -> CGFloat {
@@ -135,6 +170,12 @@ class TilesPanel: NSPanel {
 }
 
 extension TilesPanel: NSWindowDelegate {
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        guard occlusionState.contains(.visible), let shown = pendingShow else { return }
+        pendingShow = nil
+        shownOnScreen(shown)
+    }
+
     func windowDidResignKey(_ notification: Notification) {
         // other windows can steal key focus from alt-tab; we make sure that if it's active, if keeps key focus
         // dispatching to the main queue is necessary to introduce a delay in scheduling the makeKey; otherwise it is ignored

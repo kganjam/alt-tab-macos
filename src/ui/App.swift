@@ -1433,8 +1433,10 @@ class App: AppCenterApplication {
 
     static func buildUiAndShowPanel() {
         guard appIsBeingUsed else { return }
+        let enteredAt = CFAbsoluteTimeGetCurrent()
         Appearance.update()
         guard appIsBeingUsed else { return }
+        let afterAppearanceAt = CFAbsoluteTimeGetCurrent()
         refreshUi()
         guard appIsBeingUsed else { return }
         Diagnostics.log("PANEL", "showPanel (window count=\(Windows.list.count))")
@@ -1443,7 +1445,8 @@ class App: AppCenterApplication {
         // log the true render-complete time (a quick-tap focus handoff can starve this commit for seconds).
         let buildStartedAt = CFAbsoluteTimeGetCurrent()
         let showStartRef = lastShowStartedAt
-        TilesPanel.shared.show()
+        TilesPanel.shared.show(showStartRef)
+        let afterOrderFrontAt = CFAbsoluteTimeGetCurrent()
         // Enable the scroll-wheel CGEventTap while the panel is up. Without
         // this, mouse-wheel scroll events leak through to whichever app sits
         // under the cursor; some of those apps respond to scroll by raising
@@ -1458,12 +1461,15 @@ class App: AppCenterApplication {
             TilesView.enableSearchEditing()
         }
         KeyRepeatTimer.startRepeatingKeyNextWindow()
+        let beforeThumbnailsAt = CFAbsoluteTimeGetCurrent()
         TilesView.refreshVisibleThumbnailsIfNeeded("show", force: true)
         TilesView.startVisibleThumbnailRefreshTimer()
-        // Fires when the current CoreAnimation transaction (this panel show + tile layout) finishes
-        // compositing — i.e. when the list is actually visible. `sinceShowStart` is the user-perceived
-        // latency from keypress; `build+render` isolates the build/first-frame cost from any
-        // pre-show scheduling delay (visible as showPanel-time minus show-prep-time in the log).
+        let builtAt = CFAbsoluteTimeGetCurrent()
+        Diagnostics.log("REFRESH", String(format: "show build: appearance=%.1fms refreshUi=%.1fms orderFront=%.1fms previewAndInput=%.1fms visibleThumbnails=%.1fms total=%.1fms", (afterAppearanceAt - enteredAt) * 1000, (buildStartedAt - afterAppearanceAt) * 1000, (afterOrderFrontAt - buildStartedAt) * 1000, (beforeThumbnailsAt - afterOrderFrontAt) * 1000, (builtAt - beforeThumbnailsAt) * 1000, (builtAt - enteredAt) * 1000))
+        // Fires once this show's CoreAnimation transaction is committed and any animation added in it
+        // has finished. `sinceShowStart` is from the keypress; `build+render` starts at `showPanel`.
+        // Any animation added in that transaction stretches it, so the time the panel reaches the
+        // screen is the separate `panel on screen` line (TilesPanel), and the scroller flash starts then.
         CATransaction.setCompletionBlock {
             let now = CFAbsoluteTimeGetCurrent()
             let sinceShow = showStartRef > 0 ? (now - showStartRef) * 1000 : -1
