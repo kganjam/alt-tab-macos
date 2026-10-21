@@ -7,7 +7,9 @@
   `sinceShowStart` is from the keypress; it lags the real first frame by ~25 ms (notification delivery).
 - render complete: `panel render complete`, a CATransaction completion that comes ~0.45 s after the
   panel is fully drawn (experiments/notebook.md, 2026-10-21). Kept for comparison with older logs.
-- build: `display delay: ... (normal)` to `showPanel` minus the delay: the tile build (refreshUi).
+- build: `display delay` to `showPanel` minus the delay: the tile build (refreshUi).
+Each show is grouped by its display delay (`windowDisplayDelay`, or the longer Parallels Coherence ones),
+which `sinceShowStart` includes.
 """
 import argparse
 import re
@@ -20,7 +22,7 @@ METRICS = {
     'render complete sinceShowStart': (re.compile(r'panel render complete: sinceShowStart=(-?\d+)ms'), 1),
     'render complete build+render': (re.compile(r'panel render complete: .*build\+render=(-?\d+)ms'), 1),
 }
-DELAY = re.compile(r'display delay: milliseconds\((\d+)\) \(normal\)')
+DELAY = re.compile(r'display delay: (?:milliseconds\((\d+)\) \(normal\)|(\d+)ms \((coherence) src=(\w+) tgt=(\w+) same=(\w+)\))')
 
 
 def p90(values):
@@ -28,26 +30,37 @@ def p90(values):
     return ordered[round(0.9 * (len(ordered) - 1))]
 
 
+def delay_group(match):
+    if match.group(1):
+        return int(match.group(1)), f'normal {match.group(1)}ms'
+    kind = 'same-boundary' if match.group(6) == 'true' else ('from Parallels' if match.group(4) == 'true' else 'to Parallels')
+    return int(match.group(2)), f'coherence {match.group(2)}ms {kind}'
+
+
 def collect(paths, since):
-    found = {name: [] for name in list(METRICS) + ['build']}
+    found = {}
     for path in paths:
-        delay_at = None
+        delay = None
         with open(path, errors='replace') as log:
             for line in log:
                 stamp = UTC.search(line)
                 if not stamp or int(stamp.group(1)) < since:
                     continue
                 at = int(stamp.group(1))
-                delay = DELAY.search(line)
-                if delay:
-                    delay_at = (at, int(delay.group(1)))
-                elif 'showPanel (window count' in line and delay_at:
-                    found['build'].append(at - delay_at[0] - delay_at[1])
-                    delay_at = None
-                for name, (pattern, group) in METRICS.items():
-                    match = pattern.search(line)
-                    if match and int(match.group(group)) >= 0:
-                        found[name].append(int(match.group(group)))
+                match = DELAY.search(line)
+                if match:
+                    delay = (at,) + delay_group(match)
+                    continue
+                if delay is None:
+                    continue
+                group = found.setdefault(delay[2], {name: [] for name in ['build'] + list(METRICS)})
+                if 'showPanel (window count' in line and delay[0] > 0:
+                    group['build'].append(at - delay[0] - delay[1])
+                    delay = (0,) + delay[1:]
+                for name, (pattern, index) in METRICS.items():
+                    metric = pattern.search(line)
+                    if metric and int(metric.group(index)) >= 0:
+                        group[name].append(int(metric.group(index)))
     return found
 
 
@@ -56,9 +69,11 @@ def main():
     parser.add_argument('--since-utc-ms', type=int, default=0)
     parser.add_argument('logs', nargs='*', default=['/tmp/alttab/latest.log'])
     args = parser.parse_args()
-    for name, values in collect(args.logs, args.since_utc_ms).items():
-        if values:
-            print(f'{name:32s} n={len(values):4d} median={statistics.median(values):6.0f}ms p90={p90(values):6d}ms')
+    for group, metrics in sorted(collect(args.logs, args.since_utc_ms).items()):
+        print(group)
+        for name, values in metrics.items():
+            if values:
+                print(f'  {name:32s} n={len(values):4d} median={statistics.median(values):6.0f}ms p90={p90(values):6d}ms')
 
 
 if __name__ == '__main__':
