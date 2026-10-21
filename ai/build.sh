@@ -50,6 +50,12 @@ case "$MODE" in
     *) echo "usage: $0 {compile|dev|publish|install|startup}" >&2; exit 2 ;;
 esac
 
+# Optional limits for a shared, memory-tight machine. ALTTAB_BUILD_JOBS caps parallel
+# compile jobs (-jobs N). ALTTAB_BUILD_WRAP prefixes xcodebuild, e.g.
+# "lockf -k /tmp/claude-heavy-build.lock taskpolicy -m 8192" to take turns with other
+# heavy builds and cap xcodebuild's own memory (its compiler children are not capped).
+XCODEBUILD=(${ALTTAB_BUILD_WRAP:-} xcodebuild ${ALTTAB_BUILD_JOBS:+-jobs "$ALTTAB_BUILD_JOBS"})
+
 STARTUP_DYLIB="$HOME/.alttab-dev/AltTabCore.dylib"
 STARTUP_AGENT=com.kganjam.alttab-dev-override
 
@@ -75,7 +81,7 @@ fi
 # every launch of the installed copy. Just verify the build then nuke the
 # bundle artifact — we only need to know the source compiles.
 if [ "$MODE" = "compile" ]; then
-    xcodebuild \
+    "${XCODEBUILD[@]}" \
         -workspace alt-tab-macos.xcworkspace \
         -scheme Debug \
         -configuration Debug \
@@ -104,7 +110,7 @@ sed -i.bak "s/BUILD_DATE_PLACEHOLDER/${BUILD_DATE}/" "$APP_SWIFT"
 trap 'mv "${APP_SWIFT}.bak" "$APP_SWIFT" 2>/dev/null || true' EXIT
 
 set +e
-xcodebuild \
+"${XCODEBUILD[@]}" \
     -workspace alt-tab-macos.xcworkspace \
     -scheme Release \
     -configuration Release \
