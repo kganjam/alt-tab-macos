@@ -730,6 +730,21 @@ enum RuntimeFlags {
     // trailing call per interval. The event is still queued (the trailing call
     // re-reads live geometry) — just not processed at high frequency.
     static var axWindowGeometryThrottleMs: Int { int("axWindowGeometryThrottleMs", default: 500) }
+    /// Shortcut `index` shows only the windows sharing this attribute with the window in front
+    /// (WindowGroups); "" = not grouped. E.g. `defaults write com.lwouis.alt-tab-macos windowGroupAttribute3 machine`.
+    static func windowGroupAttribute(_ index: Int) -> String {
+        string(Preferences.indexToName("windowGroupAttribute", index), default: "").trimmingCharacters(in: .whitespaces)
+    }
+    /// The JSON files window attributes are read from (WindowGroups): an array, or one string of paths
+    /// separated by newlines or commas; `~` is expanded.
+    static var windowAttributesFiles: [String] {
+        let value = UserDefaults.standard.object(forKey: "windowAttributesFiles")
+        let paths = (value as? [String]) ?? (value as? String).map { $0.components(separatedBy: CharacterSet(charactersIn: "\n,")) } ?? []
+        return paths.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+    /// fn is shortcut `index`'s hold key, in place of its recorded Hold shortcut (a recorded shortcut
+    /// cannot carry fn). Read when the shortcuts are applied (launch, or a shortcut change in Settings).
+    static func holdKeyIsFn(_ index: Int) -> Bool { bool(Preferences.indexToName("holdKeyIsFn", index), default: false) }
 
     private static func bool(_ key: String, default defaultValue: Bool) -> Bool {
         guard let value = UserDefaults.standard.object(forKey: key) else { return defaultValue }
@@ -737,6 +752,10 @@ enum RuntimeFlags {
         if let numberValue = value as? NSNumber { return numberValue.boolValue }
         if let stringValue = value as? String { return Bool(stringValue) ?? defaultValue }
         return defaultValue
+    }
+
+    private static func string(_ key: String, default defaultValue: String) -> String {
+        UserDefaults.standard.string(forKey: key) ?? defaultValue
     }
 
     private static func int(_ key: String, default defaultValue: Int) -> Int {

@@ -690,8 +690,8 @@ class ControlsTab {
         SettingsWindow.shared.beginSheetWithSearchHighlight(additionalControlsSheet)
     }
 
-    private static func addShortcut(_ triggerPhase: ShortcutTriggerPhase, _ scope: ShortcutScope, _ shortcut: Shortcut, _ controlId: String, _ index: Int?) {
-        let atShortcut = ATShortcut(shortcut, controlId, scope, triggerPhase, index)
+    private static func addShortcut(_ triggerPhase: ShortcutTriggerPhase, _ scope: ShortcutScope, _ shortcut: Shortcut, _ controlId: String, _ index: Int?, requiresFn: Bool = false) {
+        let atShortcut = ATShortcut(shortcut, controlId, scope, triggerPhase, index, requiresFn: requiresFn)
         removeShortcutIfExists(controlId)
         shortcuts[controlId] = atShortcut
         if scope == .global {
@@ -722,6 +722,10 @@ class ControlsTab {
         }
         if controlId.hasPrefix("holdShortcut") {
             let i = Preferences.nameToIndex(controlId)
+            if RuntimeFlags.holdKeyIsFn(i) {
+                applyHoldShortcutPreference(controlId)
+                return
+            }
             guard let shortcut = Preferences.shortcut(controlId) else {
                 removeShortcutIfExists(controlId)
                 return
@@ -756,10 +760,15 @@ class ControlsTab {
     static func combineHoldAndNextWindow(_ controlId: String, _ sender: NSControl) -> Shortcut? {
         guard let baseShortcut = (sender as! RecorderControl).objectValue else { return nil }
         if controlId.starts(with: "nextWindowShortcut") {
-            let holdShortcut = Preferences.shortcut(Preferences.indexToName("holdShortcut", Preferences.nameToIndex(controlId)))
-            return combineShortcuts(holdShortcut, baseShortcut)
+            return combineShortcuts(holdShortcutToCombine(Preferences.nameToIndex(controlId)), baseShortcut)
         }
         return baseShortcut
+    }
+
+    /// The hold shortcut a select-next shortcut is registered with: none when fn is the hold key
+    /// (`holdKeyIsFn`), since a registered hot key cannot include fn.
+    private static func holdShortcutToCombine(_ index: Int) -> Shortcut? {
+        RuntimeFlags.holdKeyIsFn(index) ? nil : Preferences.shortcut(Preferences.indexToName("holdShortcut", index))
     }
 
     @objc static func arrowKeysEnabledCallback(_ sender: NSControl) {
@@ -867,6 +876,10 @@ class ControlsTab {
 
     private static func applyHoldShortcutPreference(_ controlId: String) {
         let i = Preferences.nameToIndex(controlId)
+        if RuntimeFlags.holdKeyIsFn(i) {
+            addShortcut(.up, .global, Preferences.emptyShortcut, controlId, i, requiresFn: true)
+            return
+        }
         guard let shortcut = Preferences.shortcut(controlId) else {
             removeShortcutIfExists(controlId)
             return
@@ -877,8 +890,7 @@ class ControlsTab {
     private static func combinedShortcut(_ controlId: String) -> Shortcut? {
         guard let baseShortcut = Preferences.shortcut(controlId) else { return nil }
         if controlId.starts(with: "nextWindowShortcut") {
-            let holdShortcut = Preferences.shortcut(Preferences.indexToName("holdShortcut", Preferences.nameToIndex(controlId)))
-            return combineShortcuts(holdShortcut, baseShortcut)
+            return combineShortcuts(holdShortcutToCombine(Preferences.nameToIndex(controlId)), baseShortcut)
         }
         return baseShortcut
     }

@@ -10,13 +10,25 @@ class ATShortcut {
     var triggerPhase: ShortcutTriggerPhase
     var state: ShortcutState = .up
     var index: Int?
+    /// A hold shortcut whose key is fn (`holdKeyIsFn`). A Shortcut cannot carry fn, so `shortcut` is
+    /// then empty and fn is checked on the event's Cocoa flags.
+    let requiresFn: Bool
 
-    init(_ shortcut: Shortcut, _ id: String, _ scope: ShortcutScope, _ triggerPhase: ShortcutTriggerPhase, _ index: Int? = nil) {
+    init(_ shortcut: Shortcut, _ id: String, _ scope: ShortcutScope, _ triggerPhase: ShortcutTriggerPhase, _ index: Int? = nil, requiresFn: Bool = false) {
         self.shortcut = shortcut
         self.id = id
         self.scope = scope
         self.triggerPhase = triggerPhase
         self.index = index
+        self.requiresFn = requiresFn
+    }
+
+    /// For a hold shortcut: its modifiers (at least) are down in `modifiers`, fn included when it needs fn.
+    func holdModifiersAreDown(_ modifiers: NSEvent.ModifierFlags) -> Bool {
+        let holdModifiers = shortcut.carbonModifierFlags.cleaned()
+        guard holdModifiers != 0 || requiresFn else { return false }
+        let fnMatches = !requiresFn || modifiers.contains(.function)
+        return fnMatches && cocoaToCarbonFlags(modifiers).cleaned() & holdModifiers == holdModifiers
     }
 
     func matches(_ id: Int?, _ shortcutState: ShortcutState?, _ keyCode: UInt32?, _ modifiers: NSEvent.ModifierFlags?) -> Bool {
@@ -29,7 +41,7 @@ class ATShortcut {
             }
         }
         if let modifiers {
-            let modifiersMatch_ = modifiersMatch(cocoaToCarbonFlags(modifiers))
+            let modifiersMatch_ = modifiersMatch(modifiers)
             let newState: ShortcutState = ((shortcut.keyCode == .none || keyCode == shortcut.carbonKeyCode) && modifiersMatch_) ? .down : .up
             let flipped = state != newState
             state = newState
@@ -41,12 +53,12 @@ class ATShortcut {
         return false
     }
 
-    private func modifiersMatch(_ modifiers: CarbonModifierFlags) -> Bool {
-        let modifiersCleaned = modifiers.cleaned()
+    private func modifiersMatch(_ cocoaModifiers: NSEvent.ModifierFlags) -> Bool {
+        let modifiersCleaned = cocoaToCarbonFlags(cocoaModifiers).cleaned()
         let shortcutModifiersCleaned = shortcut.carbonModifierFlags.cleaned()
         // holdShortcut: contains at least
         if id.hasPrefix("holdShortcut") {
-            return modifiersCleaned == (modifiersCleaned | shortcutModifiersCleaned)
+            return modifiersCleaned == (modifiersCleaned | shortcutModifiersCleaned) && (!requiresFn || cocoaModifiers.contains(.function))
         }
         // other shortcuts: contains exactly or exactly + holdShortcut modifiers
         let holdModifiersCleaned = ControlsTab.shortcuts[Preferences.indexToName("holdShortcut", App.shortcutIndex)]?.shortcut.carbonModifierFlags.cleaned() ?? 0
@@ -136,7 +148,7 @@ enum ShortcutScope {
 
 extension NSEvent.ModifierFlags {
     // NSEvent.addLocalMonitorForEvents may return events with broken modifiers (e.g. [.NSEventModifierFlagOption, .NSEventModifierFlagFunction, 0x120])
-    // we filter modifiers to only include valid modifiers; which doesn't include fn as we don't support it as a modifier
+    // we filter modifiers to only include valid modifiers; which doesn't include fn: fn is only a hold key (ATShortcut.requiresFn), checked apart
     func cleaned() -> Self {
         return self.intersection([.command, .shift, .option, .control, .capsLock])
     }
@@ -146,7 +158,7 @@ typealias CarbonModifierFlags = UInt32
 
 extension CarbonModifierFlags {
     // cocoaToCarbonFlags may remove NSEventModifierFlagFunction
-    // we filter modifiers to only include valid modifiers; which doesn't include fn as we don't support it as a modifier
+    // we filter modifiers to only include valid modifiers; which doesn't include fn: fn is only a hold key (ATShortcut.requiresFn), checked apart
     func cleaned() -> Self {
         return self & (UInt32(cmdKey) | UInt32(shiftKey) | UInt32(optionKey) | UInt32(controlKey) | UInt32(alphaLock))
     }

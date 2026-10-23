@@ -1364,6 +1364,7 @@ class App: AppCenterApplication {
             let afterInitialSortAt = CFAbsoluteTimeGetCurrent()
             isFirstSummon = false
             App.shortcutIndex = shortcutIndex
+            WindowGroups.begin(shortcutIndex, sessionSourceWid)
             let shouldStartInSearchMode = Preferences.shortcutStyle == .searchOnRelease
             TilesView.startSearchSession(shouldStartInSearchMode)
             if shouldStartInSearchMode {

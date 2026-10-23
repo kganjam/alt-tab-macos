@@ -184,6 +184,56 @@ final class KeyboardEventsUtilsTests: XCTestCase {
         XCTAssertTrue(KeyboardEventsTestable.modifierOnlyEventCanReleaseZOrder([.command, .control, .option, .shift]))
     }
 
+    // fn-down > F18-down > F18-up > F18-down > F18-up > fn-up, with fn as shortcut 3's hold key
+    // (a remapper sends fn+` as F18 with fn kept down)
+    func testFnHoldKeyCyclesUntilFnIsReleased() throws {
+        resetState()
+        useFnHoldShortcut3()
+        defer { ControlsTab.shortcuts = ControlsTab.defaultShortcuts }
+        ModifierFlags.current = [.function]
+        handleKeyboardEvent(nil, nil, nil, [.function], false)
+        XCTAssertEqual(ControlsTab.shortcutsActionsTriggered, [])
+        handleKeyboardEvent(KeyboardEventsTestable.globalShortcutsIds["nextWindowShortcut3"], .down, nil, nil, false)
+        handleKeyboardEvent(KeyboardEventsTestable.globalShortcutsIds["nextWindowShortcut3"], .up, nil, nil, false)
+        handleKeyboardEvent(KeyboardEventsTestable.globalShortcutsIds["nextWindowShortcut3"], .down, nil, nil, false)
+        handleKeyboardEvent(KeyboardEventsTestable.globalShortcutsIds["nextWindowShortcut3"], .up, nil, nil, false)
+        XCTAssertEqual(ControlsTab.shortcutsActionsTriggered, ["nextWindowShortcut3", "nextWindowShortcut3"])
+        ModifierFlags.current = []
+        handleKeyboardEvent(nil, nil, nil, [], false)
+        XCTAssertEqual(ControlsTab.shortcutsActionsTriggered, ["nextWindowShortcut3", "nextWindowShortcut3", "holdShortcut3"])
+    }
+
+    // F18 with fn not held (e.g. a real F18 key): the switch happens on the key's release
+    func testFnHoldKeyNotDownReleasesOnKeyUp() throws {
+        resetState()
+        useFnHoldShortcut3()
+        defer { ControlsTab.shortcuts = ControlsTab.defaultShortcuts }
+        ModifierFlags.current = [.option]
+        handleKeyboardEvent(KeyboardEventsTestable.globalShortcutsIds["nextWindowShortcut3"], .down, nil, nil, false)
+        handleKeyboardEvent(KeyboardEventsTestable.globalShortcutsIds["nextWindowShortcut3"], .up, nil, nil, false)
+        XCTAssertEqual(ControlsTab.shortcutsActionsTriggered, ["nextWindowShortcut3", "holdShortcut3"])
+    }
+
+    func testHoldModifiersAreDown() throws {
+        let fnHold = ATShortcut(Shortcut(code: .none, modifierFlags: [], characters: nil, charactersIgnoringModifiers: nil), "holdShortcut3", .global, .up, 2, requiresFn: true)
+        XCTAssertTrue(fnHold.holdModifiersAreDown([.function]))
+        XCTAssertTrue(fnHold.holdModifiersAreDown([.function, .shift]))
+        XCTAssertFalse(fnHold.holdModifiersAreDown([.option]))
+        XCTAssertFalse(fnHold.holdModifiersAreDown([]))
+        let optionHold = ATShortcut(Shortcut(keyEquivalent: "⌥")!, "holdShortcut", .global, .up, 0)
+        XCTAssertTrue(optionHold.holdModifiersAreDown([.option]))
+        XCTAssertTrue(optionHold.holdModifiersAreDown([.option, .function]))
+        XCTAssertFalse(optionHold.holdModifiersAreDown([.function]))
+        let emptyHold = ATShortcut(Shortcut(code: .none, modifierFlags: [], characters: nil, charactersIgnoringModifiers: nil), "holdShortcut2", .global, .up, 1)
+        XCTAssertFalse(emptyHold.holdModifiersAreDown([.option]))
+    }
+
+    private func useFnHoldShortcut3() {
+        let empty = Shortcut(code: .none, modifierFlags: [], characters: nil, charactersIgnoringModifiers: nil)
+        ControlsTab.shortcuts["holdShortcut3"] = ATShortcut(empty, "holdShortcut3", .global, .up, 2, requiresFn: true)
+        ControlsTab.shortcuts["nextWindowShortcut3"] = ATShortcut(Shortcut(code: .f18, modifierFlags: [], characters: nil, charactersIgnoringModifiers: nil), "nextWindowShortcut3", .global, .down)
+    }
+
     private func resetState() {
         App.app.appIsBeingUsed = false
         App.app.shortcutIndex = 0

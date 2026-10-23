@@ -25,11 +25,8 @@ class KeyboardEventsTestable {
 
     static func activeHoldModifierIsDown(_ modifiers: NSEvent.ModifierFlags? = nil) -> Bool {
         guard App.appIsBeingUsed,
-              let holdShortcut = ControlsTab.shortcuts[Preferences.indexToName("holdShortcut", App.shortcutIndex)]?.shortcut else { return false }
-        let current = modifiers ?? ModifierFlags.current
-        let currentModifiers = cocoaToCarbonFlags(current).cleaned()
-        let holdModifiers = holdShortcut.carbonModifierFlags.cleaned()
-        return holdModifiers != 0 && currentModifiers & holdModifiers == holdModifiers
+              let holdShortcut = ControlsTab.shortcuts[Preferences.indexToName("holdShortcut", App.shortcutIndex)] else { return false }
+        return holdShortcut.holdModifiersAreDown(modifiers ?? ModifierFlags.current)
     }
 
     static func modifierOnlyEventCanReleaseZOrder(_ modifiers: NSEvent.ModifierFlags?) -> Bool {

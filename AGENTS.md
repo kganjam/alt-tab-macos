@@ -24,6 +24,11 @@ original project, see **`UPSTREAM.md`**. Subsystems and where they live:
   (see "Thumbnail capture & IOSurface budget" below).
 - Diagnostics: `src/api-wrappers/Logger.swift` (`Diagnostics`), level-gated, logs to
   `/tmp/alttab/latest.log`.
+- Window groups (a shortcut shows only the windows sharing an attribute with the front
+  window; the attributes come from JSON files other tools write) and fn as a hold key:
+  `src/logic/WindowGroups.swift`, `RuntimeFlags.windowGroupAttribute` /
+  `windowAttributesFiles` / `holdKeyIsFn`, `ATShortcut.requiresFn`. User docs:
+  `docs/introduction.md` ("Window groups and fn as a hold key"). Log tag `GROUP`.
 - Preferences / runtime flags: `src/logic/Preferences.swift` (`Preferences`, `RuntimeFlags`).
 - Eval harness & release gate: `ai/eval-*.sh`, `experiments/release-issue-monitor.md`,
   `experiments/release-risk-code-review.md`, `experiments/focus-hypotheses.md`,

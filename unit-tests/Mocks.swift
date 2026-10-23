@@ -44,6 +44,8 @@ class App {
 
 enum RuntimeFlags {
     static let inputCapturePassthroughMs = 2500
+    static func windowGroupAttribute(_ index: Int) -> String { "" }
+    static var windowAttributesFiles: [String] { [] }
 }
 
 class Windows {

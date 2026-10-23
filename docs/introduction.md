@@ -49,6 +49,27 @@ Change the shortcut keys, switch to a Windows theme and more, using the Settings
     <a href="public/demo/preferences-policies.jpg"><img loading="lazy" src="public/demo/preferences-policies.jpg" alt="Screenshot: Policies preferences" width="672" height="353" style="width:100%; height:auto; max-width:330px;" /></a>
 </div>
 
+### Window groups and fn as a hold key (no Settings control yet)
+
+These are set with `defaults write com.lwouis.alt-tab-macos …` (`N` is the shortcut's number, left out for the first). `holdKeyIsFn<N>` takes effect when AltTab starts; the other two at the next use of the shortcut:
+
+* `windowGroupAttribute<N>` (string): shortcut `N` shows only the windows that share this attribute with the window in front when it is pressed, e.g. `machine` for the terminal windows on the same machine. The attributes come from JSON files that another tool writes:
+  ```json
+  {"windows": {"<window id>": {"machine": "box-1", "project": ["A", "B"]}}}
+  ```
+  A value is a string or a list of strings. A window is in the group when one of its values is the front window's (its first). A window without the attribute is in no group; when the front window has none, the shortcut shows what its other settings say (e.g. *Show windows from: Active app*). Each session reads the files again if one changed.
+* `windowAttributesFiles` (array, or a string of paths separated by newlines or commas; `~` is expanded): where those files are. When several files give a window the same attribute, the later file's value wins.
+* `holdKeyIsFn<N>` (bool): fn is shortcut `N`'s hold key, in place of the recorded *Hold* shortcut (a recorded shortcut cannot hold fn, and a hot key cannot include it). Pair it with a *Select next window* key that a remapper sends for fn+key with fn kept down. For example, Karabiner-Elements `from: grave_accent_and_tilde + fn` → `to: f18` with modifiers `[fn]`, and shortcut `N`'s next key set to F18: hold fn and press ` to cycle, and release fn to switch.
+
+Example: fn+` cycles through the windows of the front app that are on the same machine (shortcut 3):
+
+```bash
+defaults write com.lwouis.alt-tab-macos windowAttributesFiles -array "~/.local/state/gestalt/window-attributes.json"
+defaults write com.lwouis.alt-tab-macos windowGroupAttribute3 -string machine
+defaults write com.lwouis.alt-tab-macos holdKeyIsFn3 -bool true
+defaults write com.lwouis.alt-tab-macos appsToShow3 -string 1   # Active app
+```
+
 ## Compatibility
 
 * __macOS version:__ from 12.0 to latest (this fork: Xcode 27 no longer accepts a 10.12 deployment target)

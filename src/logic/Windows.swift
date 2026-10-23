@@ -2507,6 +2507,7 @@ class Windows {
         let appsPreference = Preferences.appsToShow[App.shortcutIndex]
         if appsPreference == .active && window.application.pid != Applications.frontmostPid { reasons.append("notActiveApp") }
         if appsPreference == .nonActive && window.application.pid == Applications.frontmostPid { reasons.append("activeAppHidden") }
+        if App.appIsBeingUsed && !WindowGroups.admits(window.cgWindowId) { reasons.append("notInWindowGroup") }
         if Preferences.showHiddenWindows[App.shortcutIndex] == .hide && window.isHidden { reasons.append("hidden") }
         if window.isWindowlessApp {
             if Preferences.showWindowlessApps[App.shortcutIndex] == .hide { reasons.append("windowlessApp") }
