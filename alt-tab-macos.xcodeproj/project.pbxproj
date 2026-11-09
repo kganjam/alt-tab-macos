@@ -90,6 +90,10 @@
 		5FEFDF2F2F181E120065BAA3 /* Localizable.strings in Resources */ = {isa = PBXBuildFile; fileRef = 5FEFDF2D2F181E120065BAA3 /* Localizable.strings */; };
 		5FEFDF322F181E250065BAA3 /* InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = 5FEFDF312F181E250065BAA3 /* InfoPlist.strings */; };
 		68844F30786B3EFF40C44F61 /* WindowGroupsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBBE04962C343C68498C2DC6 /* WindowGroupsTests.swift */; };
+		5D1E0A7B3C2F4E6A9B8D1C11 /* ForeignCaptureDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D1E0A7B3C2F4E6A9B8D1C01 /* ForeignCaptureDetector.swift */; };
+		5D1E0A7B3C2F4E6A9B8D1C12 /* ScreenCaptureGuard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D1E0A7B3C2F4E6A9B8D1C02 /* ScreenCaptureGuard.swift */; };
+		5D1E0A7B3C2F4E6A9B8D1C13 /* ForeignCaptureDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D1E0A7B3C2F4E6A9B8D1C01 /* ForeignCaptureDetector.swift */; };
+		5D1E0A7B3C2F4E6A9B8D1C14 /* ForeignCaptureDetectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D1E0A7B3C2F4E6A9B8D1C03 /* ForeignCaptureDetectorTests.swift */; };
 		76D02BB22BFE7C9E0056008D /* Pods_alt_tab_macos.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C0712B3BEA2B3780398C0999 /* Pods_alt_tab_macos.framework */; };
 		7C2AA4753030CFF4C99B13CD /* WindowGroups.swift in Sources */ = {isa = PBXBuildFile; fileRef = 65FEC79FE4BFDEA4A5C17788 /* WindowGroups.swift */; };
 		8C16C655D6F12E799A83F268 /* WindowGroups.swift in Sources */ = {isa = PBXBuildFile; fileRef = 65FEC79FE4BFDEA4A5C17788 /* WindowGroups.swift */; };
@@ -440,6 +444,9 @@
 		5FEFDF2C2F181E120065BAA3 /* be */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = be; path = Localizable.strings; sourceTree = "<group>"; };
 		5FEFDF302F181E250065BAA3 /* InfoPlist.strings */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; path = InfoPlist.strings; sourceTree = "<group>"; };
 		65FEC79FE4BFDEA4A5C17788 /* WindowGroups.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WindowGroups.swift; sourceTree = "<group>"; };
+		5D1E0A7B3C2F4E6A9B8D1C01 /* ForeignCaptureDetector.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ForeignCaptureDetector.swift; sourceTree = "<group>"; };
+		5D1E0A7B3C2F4E6A9B8D1C02 /* ScreenCaptureGuard.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ScreenCaptureGuard.swift; sourceTree = "<group>"; };
+		5D1E0A7B3C2F4E6A9B8D1C03 /* ForeignCaptureDetectorTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ForeignCaptureDetectorTests.swift; sourceTree = "<group>"; };
 		672F94799CC7C90282AEB3EA /* Pods-alt-tab-macos.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-alt-tab-macos.debug.xcconfig"; path = "Target Support Files/Pods-alt-tab-macos/Pods-alt-tab-macos.debug.xcconfig"; sourceTree = "<group>"; };
 		7451B8433E47C444A6F489FF /* Pods-unit-tests.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-unit-tests.debug.xcconfig"; path = "Target Support Files/Pods-unit-tests/Pods-unit-tests.debug.xcconfig"; sourceTree = "<group>"; };
 		AA0C8A000000000000000001 /* AXCallScheduler.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = AXCallScheduler.swift; sourceTree = "<group>"; };
@@ -1210,6 +1217,7 @@
 				BF0C8308B436837FA3EDED86 /* CustomRecorderControlTests.swift */,
 				BF0C89231FD53C4D55E3CF9A /* Helpers.swift */,
 				FBBE04962C343C68498C2DC6 /* WindowGroupsTests.swift */,
+				5D1E0A7B3C2F4E6A9B8D1C03 /* ForeignCaptureDetectorTests.swift */,
 			);
 			path = "unit-tests";
 			sourceTree = "<group>";
@@ -1477,6 +1485,8 @@
 				AA0C8A000000000000000001 /* AXCallScheduler.swift */,
 				AA0C8B000000000000000002 /* UsageStats.swift */,
 				65FEC79FE4BFDEA4A5C17788 /* WindowGroups.swift */,
+				5D1E0A7B3C2F4E6A9B8D1C01 /* ForeignCaptureDetector.swift */,
+				5D1E0A7B3C2F4E6A9B8D1C02 /* ScreenCaptureGuard.swift */,
 			);
 			path = logic;
 			sourceTree = "<group>";
@@ -2597,6 +2607,8 @@
 				BF0C87B5EDCFC573CE220137 /* Helpers.swift in Sources */,
 				8C16C655D6F12E799A83F268 /* WindowGroups.swift in Sources */,
 				68844F30786B3EFF40C44F61 /* WindowGroupsTests.swift in Sources */,
+				5D1E0A7B3C2F4E6A9B8D1C13 /* ForeignCaptureDetector.swift in Sources */,
+				5D1E0A7B3C2F4E6A9B8D1C14 /* ForeignCaptureDetectorTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -2721,6 +2733,8 @@
 				BF0C82E9AB495AAAA182764A /* CursorEvents.swift in Sources */,
 				BF0C8F8F1B7A3C4D5E6F7082 /* ContextMenuEvents.swift in Sources */,
 				7C2AA4753030CFF4C99B13CD /* WindowGroups.swift in Sources */,
+				5D1E0A7B3C2F4E6A9B8D1C11 /* ForeignCaptureDetector.swift in Sources */,
+				5D1E0A7B3C2F4E6A9B8D1C12 /* ScreenCaptureGuard.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -2381,6 +2381,13 @@ class Windows {
             releaseBackgroundInFlight(windows, source)
             return
         }
+        // Another app is screen-recording / sharing: don't add capture load to the WindowServer
+        // that is compositing its stream (ScreenCaptureGuard, 2026-11-09 incident). Cached
+        // thumbnails stay on screen; only the selected window may still be refreshed.
+        let requested = windows
+        let windows = ScreenCaptureGuard.shared.admit(requested, source: source)
+        if windows.count < requested.count { releaseBackgroundInFlight(requested.filter { r in !windows.contains { $0 === r } }, source) }
+        guard !windows.isEmpty || windowRemoved else { return }
         // Coherence captures hit CGSHWCaptureWindowList → WindowServer
         // compositor → guest pixel blit. On macOS 15 this can flicker the
         // mouse cursor when fired at high rates. The user-level kill switch

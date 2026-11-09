@@ -87,6 +87,12 @@ class Preferences {
             "bgThumbnailOverloadCooldownMs": "15000",
             "bgThumbnailOverloadProbeTimeoutMs": "25000",
             "bgThumbnailDisplayOffHoldEnabled": "true",
+            "screenCaptureGuardEnabled": "true",
+            "screenCaptureGuardConfirmMs": "1000",
+            "screenCaptureGuardReleaseMs": "3000",
+            "screenCaptureGuardSelectedMinIntervalMs": "2000",
+            "screenCaptureGuardCatchUpMs": "30000",
+            "screenCaptureGuardCatchUpPerTick": "2",
             "zOrderDegradedRecoveryEnabled": "true",
             "inAppFocusEventsEnabled": "true",
             "bgThumbnailCoherenceEnabled": "true",
@@ -708,6 +714,24 @@ enum RuntimeFlags {
     // compositing then, so captures strand server-side and flush as a herd on
     // wake — the 2026-07-15 unlock beachball.
     static var bgThumbnailDisplayOffHoldEnabled: Bool { bool("bgThumbnailDisplayOffHoldEnabled", default: true) }
+    // Stop AltTab's own window captures while ANOTHER app is screen-recording / sharing (a held
+    // ScreenCaptureKit stream, seen as WindowServer's "screen watcher present" byte; see
+    // ScreenCaptureGuard). 2026-11-09: OBS recording a Teams call (display stream + window stream)
+    // while every switcher open fired ~16 visible + ~250 deferred captures (40-55/s through
+    // replayd, each with a TCC check) — ~2,000 `timed out fence` errors in WindowServer, a laggy
+    // mouse and beachballs. The capture breaker never tripped (captures still completed), so this
+    // is a separate net. Active: no background / session-source captures, on-show captures only
+    // for the selected window (at most once per SelectedMinIntervalMs), cached thumbnails
+    // otherwise. The byte must read true for ConfirmMs (samples overlapping our own captures are
+    // ignored: our SCK screenshots blip it) and false for ReleaseMs before captures resume; for
+    // CatchUpMs after that, background captures are capped at CatchUpPerTick per 500ms tick
+    // (every window is overdue). Needs the background refresher's tick for the confirmation.
+    static var screenCaptureGuardEnabled: Bool { bool("screenCaptureGuardEnabled", default: true) }
+    static var screenCaptureGuardConfirmMs: Int { int("screenCaptureGuardConfirmMs", default: 1000) }
+    static var screenCaptureGuardReleaseMs: Int { int("screenCaptureGuardReleaseMs", default: 3000) }
+    static var screenCaptureGuardSelectedMinIntervalMs: Int { int("screenCaptureGuardSelectedMinIntervalMs", default: 2000) }
+    static var screenCaptureGuardCatchUpMs: Int { int("screenCaptureGuardCatchUpMs", default: 30000) }
+    static var screenCaptureGuardCatchUpPerTick: Int { int("screenCaptureGuardCatchUpPerTick", default: 2) }
     // When CGSOrderWindow fails to raise a native target above a different app
     // frozen on top (a degraded WindowServer, e.g. post-watchdog-kill), escalate
     // to NSRunningApplication.activate — an independent path that can succeed when

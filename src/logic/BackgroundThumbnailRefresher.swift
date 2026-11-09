@@ -192,6 +192,10 @@ final class BackgroundThumbnailRefresher {
         // the switcher. Runs regardless of the capture gating below.
         maybeReconcile()
 
+        // Sample WindowServer's screen-watcher byte even when nothing below captures, so the
+        // on-show path (which can't wait out a confirmation) already knows another app records.
+        let foreignCaptureActive = ScreenCaptureGuard.shared.sample(now: now)
+
         // Panel-open: the in-panel `visibleThumbnailRefreshTimer` (1200ms
         // default) takes over. Skip to avoid double-refreshing.
         if App.appIsBeingUsed { return }
@@ -243,8 +247,15 @@ final class BackgroundThumbnailRefresher {
         // with a single capture before resuming full volume, so a stranded-thread
         // leak grows O(1) not O(time) — the failure that beachballed (2026-07-15)
         // and watchdog-killed (2026-07-28) WindowServer.
-        let captureBudget = captureBudgetThisTick(now: now)
+        // Another app is screen-recording / sharing (ScreenCaptureGuard): no background captures
+        // at all, and no popDue — it would mark entries in flight for captures that can't run.
+        guard !foreignCaptureActive else { return }
+
+        var captureBudget = captureBudgetThisTick(now: now)
         guard captureBudget > 0 else { return }
+        if let catchUpCap = ScreenCaptureGuard.shared.backgroundCatchUpCap(now: now) {
+            captureBudget = min(captureBudget, catchUpCap)
+        }
 
         tierRecomputeCounter += 1
         if tierRecomputeCounter >= 8 {
@@ -392,7 +403,7 @@ final class BackgroundThumbnailRefresher {
         DispatchQueue.main.async {
             if Diagnostics.shouldLog("THUMBCACHE") {
                 let captures = CaptureBackendCounters.snapshot()
-                Diagnostics.log("THUMBCACHE", "windows=\(Windows.list.count) \(ThumbnailCache.shared.statsLine()) activeCaptures=\(ActiveWindowCaptures.value()) \(ActiveWindowCaptures.pressureLine()) cgsCaptures=\(captures.cgs) sckCaptures=\(captures.sck) selfRss=\(selfResidentMB())MB panelOpen=\(App.appIsBeingUsed)")
+                Diagnostics.log("THUMBCACHE", "windows=\(Windows.list.count) \(ThumbnailCache.shared.statsLine()) activeCaptures=\(ActiveWindowCaptures.value()) \(ActiveWindowCaptures.pressureLine()) \(ScreenCaptureGuard.shared.statusLine) cgsCaptures=\(captures.cgs) sckCaptures=\(captures.sck) selfRss=\(selfResidentMB())MB panelOpen=\(App.appIsBeingUsed)")
             }
             Applications.removeZombieWindows()
             // Self-heal the AX↔WindowServer bridge if a WindowServer crash left it

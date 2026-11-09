@@ -155,6 +155,15 @@ For REL-102 the health signals on the same line are `inFlight` (must NOT stay pi
 `ws-mem-watch.sh` trends these plus the replayd thread count every 5 min.
 Tunables: `bgThumbnail*` in `src/logic/Preferences.swift`.
 
+**Another app screen-recording (REL-116).** `ScreenCaptureGuard` reads `CGSIsScreenWatcherPresent`
+(WindowServer's shared scoreboard byte: true while any client holds a display/content stream; no
+round trip) on the refresher's 500ms tick and before every capture request, and
+`ForeignCaptureDetector` (pure, unit-tested) ignores samples that overlap AltTab's own SCK
+screenshots (they blip the byte ~30ms). While another app streams: no background captures, and
+`Windows.refreshThumbnailsAsync` admits only the selected window (once per 2s) for requests made
+with the switcher open. Health on the `THUMBCACHE` line: `foreignCapture=` / `guardSuppressed=`.
+Tunables: `screenCaptureGuard*`.
+
 Full incident write-up and the other capture-path fixes: `experiments/release-issue-monitor.md`
 (REL-100/REL-101/REL-102) and `experiments/release-risk-code-review.md` (Thumbnail/capture row).
 

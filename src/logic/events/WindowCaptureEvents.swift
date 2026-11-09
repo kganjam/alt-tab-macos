@@ -438,6 +438,9 @@ class ActiveWindowCaptures {
     private static var ewmaLatencyMs: Double = 0
     private static var completedTotal: UInt64 = 0
     private static var expiredTotal: UInt64 = 0
+    /// When the last capture completed, so `ScreenCaptureGuard` can tell our own captures'
+    /// effect on WindowServer's screen-watcher byte (it lags the completion) from another app's.
+    private static var lastEndedAt: CFAbsoluteTime = 0
     /// Timestamps of recent expiries, trimmed to `expiryWindowSec`. Its size is
     /// the "how many captures WindowServer dropped on the floor lately" signal.
     private static var expiryTimes = [CFAbsoluteTime]()
@@ -458,6 +461,14 @@ class ActiveWindowCaptures {
         // EWMA (alpha 0.2): smooths per-capture noise while tracking the trend.
         ewmaLatencyMs = ewmaLatencyMs == 0 ? latencyMs : ewmaLatencyMs * 0.8 + latencyMs * 0.2
         completedTotal &+= 1
+        lastEndedAt = CFAbsoluteTimeGetCurrent()
+    }
+
+    /// Our captures in flight right now and when the last one ended.
+    static func ownActivity() -> (inFlight: Int, lastEndedAt: CFAbsoluteTime) {
+        lock.lock(); defer { lock.unlock() }
+        pruneExpiredLocked(CFAbsoluteTimeGetCurrent())
+        return (inFlight.count, lastEndedAt)
     }
 
     static func value() -> Int {
