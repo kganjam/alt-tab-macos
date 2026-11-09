@@ -25,6 +25,7 @@ final class ScreenCaptureGuard {
     private var detector = ForeignCaptureDetector()
     private var engagedAt: CFAbsoluteTime = 0
     private var releasedAt: CFAbsoluteTime = 0
+    private var announcedArmed = false
     private var suppressedRequests = 0
     private var suppressedWindows = 0
     private var lastSelectedCapture: (wid: CGWindowID, at: CFAbsoluteTime)?
@@ -37,17 +38,32 @@ final class ScreenCaptureGuard {
     /// capturing. Called by the background tick (every 500ms) and by every capture request.
     @discardableResult
     func sample(now: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()) -> Bool {
-        guard RuntimeFlags.screenCaptureGuardEnabled, let watcherPresent else { return false }
+        guard RuntimeFlags.screenCaptureGuardEnabled else { return false }
+        guard let watcherPresent else { return announceUnavailableOnce() }
         let own = ActiveWindowCaptures.ownActivity()
         lock.lock()
         detector.confirmSec = Double(RuntimeFlags.screenCaptureGuardConfirmMs) / 1000
         detector.releaseSec = Double(RuntimeFlags.screenCaptureGuardReleaseMs) / 1000
-        let change = detector.observe(watcherPresent: watcherPresent(), ownInFlight: own.inFlight > 0, ownLastEndedAt: own.lastEndedAt, now: now)
+        let present = watcherPresent()
+        let armed = announcedArmed ? nil : "screen-capture guard armed: CGSIsScreenWatcherPresent=\(present)"
+        announcedArmed = true
+        let change = detector.observe(watcherPresent: present, ownInFlight: own.inFlight > 0, ownLastEndedAt: own.lastEndedAt, now: now)
         let active = detector.active
         let summary = record(change, now: now)
         lock.unlock()
+        if let armed { Diagnostics.log("CAPTURE", armed) }
         if let summary { Diagnostics.log("CAPTURE", summary) }
         return active
+    }
+
+    /// The symbol is private: if a future macOS drops it the guard is simply off. Said once.
+    private func announceUnavailableOnce() -> Bool {
+        lock.lock()
+        let first = !announcedArmed
+        announcedArmed = true
+        lock.unlock()
+        if first { Diagnostics.log("CAPTURE", "screen-capture guard UNAVAILABLE: CGSIsScreenWatcherPresent not found") }
+        return false
     }
 
     /// Caller holds `lock`. Returns the line to log for a transition.
